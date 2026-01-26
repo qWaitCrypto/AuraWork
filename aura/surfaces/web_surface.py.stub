@@ -1,0 +1,12 @@
+"""Web Surface implementation guide (stub).
+
+Suggested stack: FastAPI + WebSocket.
+
+Core ideas:
+- WebSocket receives user input messages.
+- Server calls `await engine.arun(...)`.
+- Events are forwarded to the client as JSON.
+- When a `run_paused` event is emitted, the client returns decisions,
+  then the server calls `await engine.continue_run(run_id=..., decisions=...)`.
+"""
+

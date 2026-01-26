@@ -1,0 +1,30 @@
+{
+  "meta": {
+    "id": "append_table_rows_example"
+  },
+  "operations": [
+    {
+      "op": "append_table_rows",
+      "sheet": "Sheet1",
+      "table": {
+        "header_row": 5,
+        "start_col": 1,
+        "end_col": 6
+      },
+      "rows": [
+        {
+          "Item": "A",
+          "Qty": 2,
+          "Price": 9.9
+        },
+        {
+          "Item": "B",
+          "Qty": 1,
+          "Price": 5.0
+        }
+      ],
+      "style_from": "last_row",
+      "copy_formulas": true
+    }
+  ]
+}

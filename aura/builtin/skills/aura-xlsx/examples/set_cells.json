@@ -1,0 +1,21 @@
+{
+  "meta": {
+    "id": "set_cells_example"
+  },
+  "operations": [
+    {
+      "op": "set_cells",
+      "sheet": "Sheet1",
+      "cells": [
+        {
+          "cell": "B2",
+          "value": 123
+        },
+        {
+          "cell": "C2",
+          "value": "Hello"
+        }
+      ]
+    }
+  ]
+}

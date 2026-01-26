@@ -1,0 +1,14 @@
+{
+  "meta": {
+    "id": "fill_named_ranges_example"
+  },
+  "operations": [
+    {
+      "op": "fill_named_ranges",
+      "values": {
+        "ClientName": "ACME",
+        "QuoteDate": "2026-01-21"
+      }
+    }
+  ]
+}

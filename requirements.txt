@@ -1,0 +1,35 @@
+# AuraWork requirements (single-file)
+#
+# This file aims to cover the common runtime + office skills + tests.
+# Keep optional/heavy deps commented.
+
+# Core runtime
+agno>=2.3
+pydantic>=2.10
+httpx>=0.28
+openai>=1.100
+anthropic>=0.75
+strictyaml>=1.6
+mcp
+prompt_toolkit>=3.0
+
+# Office skills bundle (DOCX/XLSX/PPTX/PDF)
+lxml>=5
+python-docx>=1.2
+openpyxl>=3.1
+python-pptx>=1.0
+pypdf>=3
+pdfplumber>=0.11
+Pillow>=10
+pytesseract>=0.3
+pdf2image>=1.16
+reportlab>=4
+
+# Tests
+pytest>=8
+pytest-asyncio>=1
+
+# Optional: local AIGC detector tool (large deps)
+# torch>=2.6
+# torchvision
+# transformers

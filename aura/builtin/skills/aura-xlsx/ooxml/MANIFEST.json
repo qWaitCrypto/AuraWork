@@ -1,0 +1,246 @@
+{
+  "files": [
+    {
+      "bytes": 2005,
+      "path": "ooxml/INDEX.yml",
+      "sha256": "bb801808c0fced2e8f113bf579382a19bfd002c9304323b4adaf055f87dca263"
+    },
+    {
+      "bytes": 2105,
+      "path": "ooxml/README.md",
+      "sha256": "8ff4c16be57f6c54e1632aeabf93f6af9eea243bee8ce7ca8f5633ee20553ec8"
+    },
+    {
+      "bytes": 1163,
+      "path": "ooxml/THIRD_PARTY_NOTICES.md",
+      "sha256": "59f8a99cc73ee66e93c23db7a49ba425cc4864a053682c0128a24a16d88566ac"
+    },
+    {
+      "bytes": 1108,
+      "path": "ooxml/rules/docx_wordprocessingml.md",
+      "sha256": "9f1427098bd529d0e91d1621f372bffb09e8e0af1a1cb529bec3ea1008f98bec"
+    },
+    {
+      "bytes": 702,
+      "path": "ooxml/rules/drawingml_quickref.md",
+      "sha256": "fdc0ff5430c7104c9b734e7ea4b42d0785a61d64c9c815d96eaf5d8e97413d33"
+    },
+    {
+      "bytes": 611,
+      "path": "ooxml/rules/mce_markup_compatibility.md",
+      "sha256": "fa6c8e79875c45ed3a6b5976242d5e1237f2dc309daafabf03730aac6ebf31ba"
+    },
+    {
+      "bytes": 1297,
+      "path": "ooxml/rules/opc_packaging.md",
+      "sha256": "10a8573a90c701e549cde8012714ce99bc0f71abdb69d52b76d10b02f9f6643d"
+    },
+    {
+      "bytes": 1254,
+      "path": "ooxml/rules/xlsx_spreadsheetml.md",
+      "sha256": "bf33950c116e961fb576ad048b7cfb0a119936cfd7da33fcbc4c31ce440845b8"
+    },
+    {
+      "bytes": 3127,
+      "path": "ooxml/schemas/mce/mc.xsd",
+      "sha256": "3a37e461ecf5a8670fdec34029703401f8728ab9c96ec1739a6ae58d55212413"
+    },
+    {
+      "bytes": 26535,
+      "path": "ooxml/schemas/microsoft/wml-2010.xsd",
+      "sha256": "58c6c10ea836c645504e71ff5876b068631668df9bef8345732b2b4d71343597"
+    },
+    {
+      "bytes": 3717,
+      "path": "ooxml/schemas/microsoft/wml-2012.xsd",
+      "sha256": "5216b86174e7380fd2f51b82a77f7f8177bdc4861d36ab0da4b77b561bb4e93c"
+    },
+    {
+      "bytes": 887,
+      "path": "ooxml/schemas/microsoft/wml-2018.xsd",
+      "sha256": "59d6d99e27c6bb73aa986cb52375811855d274a1493ebbead7e3febed82eacee"
+    },
+    {
+      "bytes": 1750,
+      "path": "ooxml/schemas/microsoft/wml-cex-2018.xsd",
+      "sha256": "62d2c026616e88386e60604dfae161a87c03a832088bcc105edaba989ba77dad"
+    },
+    {
+      "bytes": 988,
+      "path": "ooxml/schemas/microsoft/wml-cid-2016.xsd",
+      "sha256": "b9250bf602410098cf995edb5ffb808c2955144f3ded84d8f57a2f1eaf2b6c68"
+    },
+    {
+      "bytes": 586,
+      "path": "ooxml/schemas/microsoft/wml-sdtdatahash-2020.xsd",
+      "sha256": "694adff426a0488abc4de81119189bbbae1af6e03778d0459164d94cb6561048"
+    },
+    {
+      "bytes": 731,
+      "path": "ooxml/schemas/microsoft/wml-symex-2015.xsd",
+      "sha256": "26e499bea410064b95699bda657bf3c816b93cc5954742d9b7ae05967afe8944"
+    },
+    {
+      "bytes": 74984,
+      "path": "ooxml/schemas/ooxml/dml-chart.xsd",
+      "sha256": "41b93bd8857cc68b1e43be2806a872d736a9bdd6566900062d8fdb57d7bbb354"
+    },
+    {
+      "bytes": 6956,
+      "path": "ooxml/schemas/ooxml/dml-chartDrawing.xsd",
+      "sha256": "3fd0586f2637b98bb9886f0e0b67d89e1cc987c2d158cc7deb5f5b9890ced412"
+    },
+    {
+      "bytes": 51302,
+      "path": "ooxml/schemas/ooxml/dml-diagram.xsd",
+      "sha256": "29b254ee0d10414a8504b5a08149c7baec35a60d5ff607d6b3f492aa36815f40"
+    },
+    {
+      "bytes": 624,
+      "path": "ooxml/schemas/ooxml/dml-lockedCanvas.xsd",
+      "sha256": "5cb76dabd8b97d1e9308a1700b90c20139be4d50792d21a7f09789f5cccd6026"
+    },
+    {
+      "bytes": 152039,
+      "path": "ooxml/schemas/ooxml/dml-main.xsd",
+      "sha256": "5375417f0f5394b8dd1a7035b9679151f19a6b65df309dec10cfb4a420cb00e9"
+    },
+    {
+      "bytes": 1231,
+      "path": "ooxml/schemas/ooxml/dml-picture.xsd",
+      "sha256": "5d389d42befbebd91945d620242347caecd3367f9a3a7cf8d97949507ae1f53c"
+    },
+    {
+      "bytes": 8862,
+      "path": "ooxml/schemas/ooxml/dml-spreadsheetDrawing.xsd",
+      "sha256": "b4532b6d258832953fbb3ee4c711f4fe25d3faf46a10644b2505f17010d01e88"
+    },
+    {
+      "bytes": 14795,
+      "path": "ooxml/schemas/ooxml/dml-wordprocessingDrawing.xsd",
+      "sha256": "bdad416b096b61d37b71603b2c949484f9070c830bdaeba93bf35e15c8900614"
+    },
+    {
+      "bytes": 83612,
+      "path": "ooxml/schemas/ooxml/pml.xsd",
+      "sha256": "d173c3e5d61e42e2e3a97226c632fd2ab7cc481fc4e492365b87024ab546daff"
+    },
+    {
+      "bytes": 1269,
+      "path": "ooxml/schemas/ooxml/shared-additionalCharacteristics.xsd",
+      "sha256": "3c6709101c6aaa82888df5d8795c33f9e857196790eb320d9194e64be2b6bdd8"
+    },
+    {
+      "bytes": 7328,
+      "path": "ooxml/schemas/ooxml/shared-bibliography.xsd",
+      "sha256": "0b364451dc36a48dd6dae0f3b6ada05fd9b71e5208211f8ee5537d7e51a587e2"
+    },
+    {
+      "bytes": 6382,
+      "path": "ooxml/schemas/ooxml/shared-commonSimpleTypes.xsd",
+      "sha256": "e2abacbb9a55ce1365f8961bc1b1395bbc811e512b111000d8c333f98458dece"
+    },
+    {
+      "bytes": 1248,
+      "path": "ooxml/schemas/ooxml/shared-customXmlDataProperties.xsd",
+      "sha256": "0ef4bb354ff44b923564c4ddbdda5987919d220225129ec94614a618ceafc281"
+    },
+    {
+      "bytes": 880,
+      "path": "ooxml/schemas/ooxml/shared-customXmlSchemaProperties.xsd",
+      "sha256": "0d103b99a4a8652f8871552a69d42d2a3760ac6a5e3ef02d979c4273257ff6a4"
+    },
+    {
+      "bytes": 2608,
+      "path": "ooxml/schemas/ooxml/shared-documentPropertiesCustom.xsd",
+      "sha256": "9c085407751b9061c1f996f6c39ce58451be22a8d334f09175f0e89e42736285"
+    },
+    {
+      "bytes": 3507,
+      "path": "ooxml/schemas/ooxml/shared-documentPropertiesExtended.xsd",
+      "sha256": "bc92e36ccd233722d4c5869bec71ddc7b12e2df56059942cce5a39065cc9c368"
+    },
+    {
+      "bytes": 7507,
+      "path": "ooxml/schemas/ooxml/shared-documentPropertiesVariantTypes.xsd",
+      "sha256": "7b5b7413e2c895b1e148e82e292a117d53c7ec65b0696c992edca57b61b4a74b"
+    },
+    {
+      "bytes": 23313,
+      "path": "ooxml/schemas/ooxml/shared-math.xsd",
+      "sha256": "3213ef1631606250f5010b42cad7ef716f7c59426367798e33c374c0ec391d3a"
+    },
+    {
+      "bytes": 1367,
+      "path": "ooxml/schemas/ooxml/shared-relationshipReference.xsd",
+      "sha256": "12264f3c03d738311cd9237d212f1c07479e70f0cbe1ae725d29b36539aef637"
+    },
+    {
+      "bytes": 242277,
+      "path": "ooxml/schemas/ooxml/sml.xsd",
+      "sha256": "beffeed56945c22a77440122c8bdc426f3fcbe7f3b12ea0976c770d1f8d54578"
+    },
+    {
+      "bytes": 26148,
+      "path": "ooxml/schemas/ooxml/vml-main.xsd",
+      "sha256": "f5ee623b08b6a66935e5aced2f5d8ad0fc71bf9e8e833cd490150c0fa94b8763"
+    },
+    {
+      "bytes": 25279,
+      "path": "ooxml/schemas/ooxml/vml-officeDrawing.xsd",
+      "sha256": "585bedc1313b40888dcc544cb74cd939a105ee674f3b1d3aa1cc6d34f70ff155"
+    },
+    {
+      "bytes": 535,
+      "path": "ooxml/schemas/ooxml/vml-presentationDrawing.xsd",
+      "sha256": "133c9f64a5c5d573b78d0a474122b22506d8eadb5e063f67cdbbb8fa2f161d0e"
+    },
+    {
+      "bytes": 5712,
+      "path": "ooxml/schemas/ooxml/vml-spreadsheetDrawing.xsd",
+      "sha256": "6bdeb169c3717eb01108853bd9fc5a3750fb1fa5b82abbdd854d49855a40f519"
+    },
+    {
+      "bytes": 4010,
+      "path": "ooxml/schemas/ooxml/vml-wordprocessingDrawing.xsd",
+      "sha256": "475dcae1e7d1ea46232db6f8481040c15e53a52a3c256831d3df204212b0e831"
+    },
+    {
+      "bytes": 171367,
+      "path": "ooxml/schemas/ooxml/wml.xsd",
+      "sha256": "c2dd9f61f892deae6acd8d20771ea79b12018af25f3bf8d06639c8542d218cfd"
+    },
+    {
+      "bytes": 4646,
+      "path": "ooxml/schemas/ooxml/xml.xsd",
+      "sha256": "a539aa2fb154fa50e0f5cc97e6ad7cbc66f8ec3e3746f61ec6a8b0d5d15ecdf2"
+    },
+    {
+      "bytes": 1963,
+      "path": "ooxml/schemas/opc/opc-contentTypes.xsd",
+      "sha256": "9e0b7209fc69ab11987900404540969976000c5ebe4d4f58c43dc3842886bf3a"
+    },
+    {
+      "bytes": 2515,
+      "path": "ooxml/schemas/opc/opc-coreProperties.xsd",
+      "sha256": "451958454e8588dfc7cd945981ada142ca06ff3307937f5700df059c2b307fa8"
+    },
+    {
+      "bytes": 2856,
+      "path": "ooxml/schemas/opc/opc-digSig.xsd",
+      "sha256": "6de111e11403f7cd49027400755bae0ea1cabef2815f09bd40a24f0017613b24"
+    },
+    {
+      "bytes": 1344,
+      "path": "ooxml/schemas/opc/opc-relationships.xsd",
+      "sha256": "f565adfef5a502044abc3a9153e157edc25af78304d335994afb958874b15e26"
+    },
+    {
+      "bytes": 2574,
+      "path": "ooxml/tools/validate_part.py",
+      "sha256": "bb6b554156c9da3cfa63c995d044c9e4989b3e8c7455eba5337f6e0741646aad"
+    }
+  ],
+  "generated_at": "2026-01-21T07:10:41Z",
+  "root": "ooxml"
+}

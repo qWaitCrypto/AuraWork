@@ -1,0 +1,10 @@
+"""Cloud/Server Surface implementation guide (stub).
+
+Suggested stack: FastAPI + SSE.
+
+Key constraints:
+- Stateless scaling: each request can rebuild engine from `.aura/`.
+- Cross-process resume: approvals may be handled by a different instance.
+- Use run snapshots under `.aura/runs/<run_id>/snapshot.json` to resume.
+"""
+

@@ -1,0 +1,81 @@
+# Task-oriented index for OOXML schemas and quick references
+# Versioned to allow stable references from skills/tooling.
+version: 1
+
+paths:
+  schemas:
+    opc: ooxml/schemas/opc
+    ooxml: ooxml/schemas/ooxml
+    mce: ooxml/schemas/mce
+    microsoft: ooxml/schemas/microsoft
+  rules: ooxml/rules
+
+# High-level mapping: common operations -> which schemas/rules are most relevant.
+tasks:
+  opc:
+    package_basics:
+      rules:
+        - rules/opc_packaging.md
+      schemas:
+        - schemas/opc/opc-contentTypes.xsd
+        - schemas/opc/opc-relationships.xsd
+        - schemas/opc/opc-coreProperties.xsd
+
+  docx:
+    validate_main_document:
+      rules:
+        - rules/opc_packaging.md
+        - rules/docx_wordprocessingml.md
+        - rules/mce_markup_compatibility.md
+      schemas:
+        - schemas/ooxml/wml.xsd
+        - schemas/mce/mc.xsd
+
+    comments_consistency:
+      rules:
+        - rules/docx_wordprocessingml.md
+      schemas:
+        - schemas/ooxml/wml.xsd
+
+    tracked_changes:
+      rules:
+        - rules/docx_wordprocessingml.md
+        - rules/mce_markup_compatibility.md
+      schemas:
+        - schemas/ooxml/wml.xsd
+        - schemas/mce/mc.xsd
+
+  xlsx:
+    validate_worksheet:
+      rules:
+        - rules/opc_packaging.md
+        - rules/xlsx_spreadsheetml.md
+      schemas:
+        - schemas/ooxml/sml.xsd
+
+    cell_types_and_values:
+      rules:
+        - rules/xlsx_spreadsheetml.md
+      schemas:
+        - schemas/ooxml/sml.xsd
+
+    drawings_and_charts:
+      rules:
+        - rules/drawingml_quickref.md
+      schemas:
+        - schemas/ooxml/dml-main.xsd
+        - schemas/ooxml/dml-picture.xsd
+        - schemas/ooxml/dml-chart.xsd
+        - schemas/ooxml/dml-spreadsheetDrawing.xsd
+
+  pptx:
+    validate_presentation:
+      rules:
+        - rules/opc_packaging.md
+        - rules/drawingml_quickref.md
+      schemas:
+        - schemas/ooxml/pml.xsd
+        - schemas/ooxml/dml-main.xsd
+        - schemas/ooxml/dml-picture.xsd
+        - schemas/ooxml/dml-chart.xsd
+
