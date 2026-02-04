@@ -217,7 +217,6 @@ class AgnoAsyncEngine:
     # Future Web/Plugin/Cloud surfaces should follow `aura/runtime/surface.py`.
     _auto_compact_seen_turn_ids: set[str] = field(default_factory=set, init=False, repr=False)
     _event_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
-    _event_sequence: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.project_root = self.project_root.expanduser().resolve()
@@ -297,7 +296,7 @@ class AgnoAsyncEngine:
                     last = evt.sequence
         except Exception:
             last = 0
-        self._event_sequence = last
+        self.event_bus.prime_sequence(session_id=self.session_id, last_sequence=last)
 
     def get_llm_streaming(self) -> bool:
         return bool(self.llm_streaming)
@@ -2711,28 +2710,42 @@ class AgnoAsyncEngine:
         step_id: str | None,
     ) -> Event:
         async with self._event_lock:
-            self._event_sequence += 1
+            payload_out = dict(payload or {})
+            payload_out.setdefault("source", "engine")
             event = Event(
                 kind=kind.value,
-                payload=payload,
+                payload=payload_out,
                 session_id=self.session_id,
                 event_id=new_id("evt"),
                 timestamp=now_ts_ms(),
-                sequence=self._event_sequence,
+                sequence=None,
                 request_id=request_id,
                 turn_id=turn_id,
                 step_id=step_id,
                 schema_version=self.schema_version,
             )
-            self.event_bus.publish(event)
+            published = self.event_bus.publish(event)
             try:
-                self.session_store.update_session(
-                    self.session_id,
-                    {"last_request_id": request_id, "last_event_id": event.event_id, "last_event_sequence": self._event_sequence},
-                )
+                seq = int(published.sequence) if isinstance(published.sequence, int) else None
             except Exception:
-                pass
-            return event
+                seq = None
+            if seq is not None:
+                try:
+                    self.session_store.update_session(
+                        self.session_id,
+                        {"last_request_id": request_id, "last_event_id": published.event_id, "last_event_sequence": seq},
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.session_store.update_session(
+                        self.session_id,
+                        {"last_request_id": request_id, "last_event_id": published.event_id},
+                    )
+                except Exception:
+                    pass
+            return published
 
     # Agno-backed execution is still used by subagents (see `aura/runtime/subagents/runner.py`),
     # but the main engine LLM path calls Aura's provider adapters directly.

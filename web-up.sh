@@ -85,7 +85,33 @@ sleep 0.8
 echo "==> Starting frontend (Vite)"
 (
   cd "$FRONTEND_DIR"
-  npm install
+  NPM_MODE="${AURA_WEB_NPM_MODE:-auto}" # auto|ci|install|skip
+  case "$NPM_MODE" in
+    auto)
+      if [[ -d node_modules ]]; then
+        echo "==> Frontend deps present; skipping install (set AURA_WEB_NPM_MODE=install to force)"
+      else
+        if [[ -f package-lock.json ]]; then
+          npm ci
+        else
+          npm install
+        fi
+      fi
+      ;;
+    ci)
+      npm ci
+      ;;
+    install)
+      npm install
+      ;;
+    skip)
+      echo "==> Skipping npm install (AURA_WEB_NPM_MODE=skip)"
+      ;;
+    *)
+      echo "ERROR: invalid AURA_WEB_NPM_MODE=$NPM_MODE (expected auto|ci|install|skip)" >&2
+      exit 1
+      ;;
+  esac
   # Force Vite to bind to a predictable host/port for copy-paste URL.
   npm run dev -- --host 127.0.0.1 --port "$FRONTEND_PORT"
 ) &

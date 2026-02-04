@@ -20,7 +20,7 @@ def main() -> int:
         help="Aura project root (directory containing .aura). Default: current directory.",
     )
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
     run(project_root=Path(args.project), host=str(args.host), port=int(args.port))
@@ -29,4 +29,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

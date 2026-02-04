@@ -142,6 +142,10 @@ def _validate_events(events: list[Event], *, strict: bool) -> list[ValidationIss
         if ev.schema_version is None:
             issues.append(ValidationIssue("warning", "Missing schema_version.", f"event[{idx}]"))
 
+        if ev.sequence is None:
+            sev = "error" if strict else "warning"
+            issues.append(ValidationIssue(sev, "Missing sequence (required for stable replay).", f"event[{idx}]"))
+
         if ev.kind in step_expected and ev.step_id is None:
             issues.append(ValidationIssue("warning", "Missing step_id for step-scoped event.", f"event[{idx}]"))
 

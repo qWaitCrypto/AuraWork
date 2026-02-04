@@ -84,14 +84,31 @@ class SessionHub:
         # IMPORTANT: Keep sends serialized per session to preserve event ordering
         # and avoid concurrent writes to the same WebSocket.
         async with self._send_lock:
-            dead: list[WebSocket] = []
-            for ws in list(self.clients):
+            timeout_s = 0.0
+            try:
+                timeout_s = float(str(os.environ.get("AURA_WEB_WS_SEND_TIMEOUT_S") or "0.8"))
+            except Exception:
+                timeout_s = 0.8
+            if timeout_s < 0:
+                timeout_s = 0.0
+
+            async def _send_one(ws: WebSocket) -> Exception | None:
                 try:
-                    await ws.send_text(data)
-                except Exception:
-                    dead.append(ws)
-            for ws in dead:
-                self.clients.discard(ws)
+                    if timeout_s > 0:
+                        await asyncio.wait_for(ws.send_text(data), timeout=timeout_s)
+                    else:
+                        await ws.send_text(data)
+                    return None
+                except Exception as e:
+                    return e
+
+            clients = list(self.clients)
+            if not clients:
+                return
+            results = await asyncio.gather(*[_send_one(ws) for ws in clients])
+            for ws, err in zip(clients, results):
+                if err is not None:
+                    self.clients.discard(ws)
 
 
 def build_app(*, project_root: Path) -> FastAPI:
@@ -170,6 +187,12 @@ def build_app(*, project_root: Path) -> FastAPI:
         "dist",
         "build",
     }
+    _extra_ignores = os.environ.get("AURA_WORKSPACE_IGNORE_DIRS")
+    if isinstance(_extra_ignores, str) and _extra_ignores.strip():
+        for part in _extra_ignores.replace(";", ",").split(","):
+            name = part.strip()
+            if name:
+                _WORKSPACE_IGNORE_DIRS.add(name)
 
     def _resolve_workspace_path(*, root: Path, rel: str) -> Path:
         raw = str(rel or "").strip().replace("\\", "/")

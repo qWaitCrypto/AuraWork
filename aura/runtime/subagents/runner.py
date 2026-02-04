@@ -420,16 +420,19 @@ def run_subagent(
         if event_bus is None:
             return
         step_id = payload.get("tool_execution_id")
+        payload_out = dict(payload or {})
+        payload_out.setdefault("source", "subagent")
         event = Event(
             kind=kind.value,
-            payload=payload,
+            payload=payload_out,
             session_id=session_id,
             event_id=new_id("evt"),
             timestamp=now_ts_ms(),
+            sequence=None,
             request_id=request_id,
             turn_id=turn_id,
             step_id=step_id if isinstance(step_id, str) else None,
-            schema_version="0.1",
+            schema_version=None,
         )
         event_bus.publish(event)
 

@@ -10,10 +10,15 @@ type State = {
 };
 
 function sortEvents(a: AuraEvent, b: AuraEvent) {
+  const as = typeof a.sequence === "number" ? a.sequence : null;
+  const bs = typeof b.sequence === "number" ? b.sequence : null;
+  // Prefer sequence when both are present (stable replay across concurrent sources).
+  if (as !== null && bs !== null && as !== bs) return as - bs;
+  // Fallback to timestamp for older logs that may not include sequence.
   if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
-  const as = typeof a.sequence === "number" ? a.sequence : Number.MAX_SAFE_INTEGER;
-  const bs = typeof b.sequence === "number" ? b.sequence : Number.MAX_SAFE_INTEGER;
-  if (as !== bs) return as - bs;
+  // Deterministic tie-breaker if one side has sequence and the other doesn't.
+  if (as !== null && bs === null) return -1;
+  if (as === null && bs !== null) return 1;
   return a.event_id.localeCompare(b.event_id);
 }
 
