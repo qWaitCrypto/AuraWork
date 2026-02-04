@@ -44,6 +44,10 @@ Same flow: `skill__load("aura-pdf")` → write `plan.json` → `python "<skill_r
    - Extract from the WorkSpec/task text: target artifact type (docx/pdf), output path, length, style, whether a template is required.
    - Decide: create-new vs edit an existing file.
 2. **Read inputs**
+   - Check `WorkSpec.inputs` first:
+     - DAG dependency passing may provide upstream outputs as `connector_object dag://<node_id>` entries.
+     - The connector description may contain JSON for an upstream `node_result` record; parse and use its `report` data as source material.
+     - If a `file` input path is provided, read it via `project__read_text`.
    - Use `project__read_text` / `project__read_text_many` to load the source materials.
    - Use `project__search_text` to locate relevant definitions/terms inside the repo.
 3. **Build an outline**

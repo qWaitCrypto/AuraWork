@@ -167,12 +167,35 @@ def _browser_step_is_high_risk(step: list[str]) -> bool:
     if not step:
         return True
 
-    cmd = step[0]
+    cmd = str(step[0] or "").strip().lower()
+    if not cmd:
+        return True
     if cmd == "search":
         # `agent-browser search <query>` is a convenience wrapper around normal browsing.
         return False
     if cmd == "open":
         # Allow normal web browsing without approval; gate local/insecure schemes.
+        url = next((t for t in step[1:] if isinstance(t, str) and "://" in t), None)
+        if isinstance(url, str):
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"}:
+                return True
+            host = parsed.hostname
+            if isinstance(host, str) and host:
+                host_l = host.lower()
+                if host_l in {"localhost"} or host_l.endswith(".local"):
+                    return True
+                try:
+                    ip = ipaddress.ip_address(host_l.strip("[]"))
+                    if ip.is_loopback or ip.is_private or ip.is_link_local:
+                        return True
+                except ValueError:
+                    pass
+        return False
+
+    if cmd == "tab":
+        # Most tab ops are safe. If a URL is provided (e.g. `tab new <url>`), apply the same
+        # safety rules as `open` so tab creation can't bypass local/insecure gating.
         url = next((t for t in step[1:] if isinstance(t, str) and "://" in t), None)
         if isinstance(url, str):
             parsed = urlparse(url)
@@ -205,7 +228,7 @@ def _browser_step_is_high_risk(step: list[str]) -> bool:
 
     if cmd == "find":
         # `find` can embed an action word; only gate operations that are clearly higher-risk.
-        if any(tok == "upload" for tok in step[1:] if isinstance(tok, str)):
+        if any(str(tok).lower() == "upload" for tok in step[1:] if isinstance(tok, str)):
             return True
         return False
 
@@ -225,7 +248,7 @@ def _browser_step_is_high_risk(step: list[str]) -> bool:
         return True
 
     if cmd == "set":
-        if len(step) >= 2 and step[1] in {"headers", "credentials"}:
+        if len(step) >= 2 and str(step[1] or "").strip().lower() in {"headers", "credentials"}:
             return True
         return False
 
@@ -1057,6 +1080,105 @@ def _classify_tool_exception(exc: BaseException) -> ErrorCode:
     if isinstance(exc, OSError):
         return ErrorCode.UNKNOWN
     return ErrorCode.UNKNOWN
+
+
+def _tool_result_needs_approval(raw: dict[str, Any]) -> bool:
+    status = raw.get("status")
+    if isinstance(status, str) and status.strip() == "needs_approval":
+        return True
+    blocked = raw.get("blocked_approval")
+    if isinstance(blocked, (dict, list)) and blocked:
+        return True
+    needs = raw.get("needs_approval")
+    if isinstance(needs, list) and any(isinstance(x, dict) for x in needs):
+        return True
+    node_results = raw.get("node_results")
+    if isinstance(node_results, dict):
+        for v in node_results.values():
+            if not isinstance(v, dict):
+                continue
+            if str(v.get("status") or "") == "needs_approval":
+                return True
+    return False
+
+
+def _classify_tool_result(*, tool_name: str, raw: Any) -> tuple[str, bool, str | None, str | None]:
+    """
+    Map a tool's returned value to a normalized (status, ok, error_code, error) tuple.
+
+    Tool implementations can either:
+    - raise exceptions (hard failure), or
+    - return a dict with an `ok: bool` field (soft failure).
+
+    We treat `ok=False` as non-success and distinguish approval-blocked vs failed.
+    """
+
+    if not isinstance(raw, dict):
+        return ("succeeded", True, None, None)
+
+    ok_val = raw.get("ok")
+    if isinstance(ok_val, bool) and ok_val is True:
+        return ("succeeded", True, None, None)
+
+    if isinstance(ok_val, bool) and ok_val is False:
+        if _tool_result_needs_approval(raw):
+            msg = raw.get("message") or raw.get("error") or "Approval required."
+            msg_s = str(msg) if msg is not None else "Approval required."
+            return ("needs_approval", False, ErrorCode.APPROVAL_PENDING.value, _elide_tail(msg_s, 400))
+
+        # Best-effort error code + message extraction for soft failures.
+        error_code = raw.get("error_code")
+        if isinstance(error_code, str) and error_code.strip():
+            code = error_code.strip()
+        else:
+            code = ErrorCode.TOOL_FAILED.value
+
+        msg = raw.get("error") or raw.get("message")
+        msg_s: str | None = None
+        if isinstance(msg, str) and msg.strip():
+            msg_s = msg.strip()
+
+        # Tool-specific heuristics
+        if tool_name == "browser__run":
+            steps = raw.get("steps")
+            if isinstance(steps, list):
+                for step in steps:
+                    if not isinstance(step, dict):
+                        continue
+                    if step.get("timed_out") is True:
+                        code = ErrorCode.TIMEOUT.value
+                        argv = step.get("argv")
+                        argv_s = " ".join([str(x) for x in argv]) if isinstance(argv, list) else None
+                        msg_s = msg_s or f"browser__run timed out ({argv_s or 'agent-browser'})"
+                        break
+                    exit_code = step.get("exit_code")
+                    if isinstance(exit_code, int) and exit_code != 0:
+                        stderr = step.get("stderr")
+                        if isinstance(stderr, str) and stderr.strip():
+                            msg_s = msg_s or stderr.strip()
+                        msg_s = msg_s or f"browser__run failed (exit_code={exit_code})"
+                        break
+
+        if msg_s is None:
+            msg_s = f"{tool_name} returned ok=false"
+        msg_s = _elide_tail(msg_s, 400)
+
+        # Optional: map common messages to more specific codes.
+        msg_l = msg_s.lower()
+        if code == ErrorCode.TOOL_FAILED.value:
+            if "invalid" in msg_l or "expected" in msg_l:
+                code = ErrorCode.BAD_REQUEST.value
+            elif "not found" in msg_l:
+                code = ErrorCode.NOT_FOUND.value
+            elif "permission" in msg_l or "denied" in msg_l:
+                code = ErrorCode.PERMISSION.value
+            elif "timeout" in msg_l or "timed out" in msg_l:
+                code = ErrorCode.TIMEOUT.value
+
+        return ("failed", False, code, msg_s)
+
+    # No `ok` field: treat as success.
+    return ("succeeded", True, None, None)
 
 
 def _is_under_spec_dir(path: str) -> bool:

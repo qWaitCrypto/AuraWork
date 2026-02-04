@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@tauri-apps/plugin-dialog": "^2.0.0",
     "clsx": "^2.1.1",
     "lucide-react": "^0.469.0",
     "mermaid": "^10.9.1",
@@ -31,4 +32,3 @@
     "vite": "^6.0.7"
   }
 }
-

@@ -1,5 +1,7 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import type { ApprovalRecord } from "../lib/types";
+import { apiFetchWorkspaceFileText, apiListWorkspaceFiles, type WorkspaceFileEntry } from "../lib/api";
+import { httpBase } from "../lib/backendBase";
 import { Badge } from "./Badge";
 import { Button } from "./Button";
 
@@ -34,6 +36,7 @@ type TerminalLogItem = {
 };
 
 export const RightPanel = React.memo(function RightPanel(props: {
+  currentSessionId: string | null;
   rightTab: RightTab;
   setRightTab: (t: RightTab) => void;
 
@@ -71,6 +74,7 @@ export const RightPanel = React.memo(function RightPanel(props: {
   fmtTime: (ms: number) => string;
 }) {
   const {
+    currentSessionId,
     rightTab,
     setRightTab,
     latestPlan,
@@ -97,7 +101,53 @@ export const RightPanel = React.memo(function RightPanel(props: {
   } = props;
 
   const [terminalFilter, setTerminalFilter] = useState<"all" | "llm" | "tools" | "plan" | "approvals" | "errors">("all");
-  const [selectedArtifact, setSelectedArtifact] = useState<string | null>(null);
+  const [workspaceDir, setWorkspaceDir] = useState<string>("");
+  const [workspaceEntries, setWorkspaceEntries] = useState<WorkspaceFileEntry[]>([]);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [workspaceErr, setWorkspaceErr] = useState<string | null>(null);
+  const [selectedWorkspaceFile, setSelectedWorkspaceFile] = useState<string | null>(null);
+  const [workspacePreview, setWorkspacePreview] = useState<{ text: string; truncated: boolean; bytes: number } | null>(null);
+  const [workspacePreviewLoading, setWorkspacePreviewLoading] = useState(false);
+
+  function encodePath(p: string) {
+    return String(p || "")
+      .split("/")
+      .map((seg) => encodeURIComponent(seg))
+      .join("/");
+  }
+
+  useEffect(() => {
+    setWorkspaceDir("");
+    setWorkspaceEntries([]);
+    setWorkspaceErr(null);
+    setSelectedWorkspaceFile(null);
+    setWorkspacePreview(null);
+    setWorkspacePreviewLoading(false);
+  }, [currentSessionId]);
+
+  async function refreshWorkspaceFiles() {
+    if (!currentSessionId) return;
+    setWorkspaceLoading(true);
+    setWorkspaceErr(null);
+    try {
+      const data = await apiListWorkspaceFiles(currentSessionId, workspaceDir, { limit: 800 });
+      setWorkspaceEntries(Array.isArray(data.entries) ? data.entries : []);
+    } catch (e: any) {
+      setWorkspaceEntries([]);
+      setWorkspaceErr(String(e?.message || e || "workspace_files_failed"));
+    } finally {
+      setWorkspaceLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (rightTab !== "files") return;
+    if (!currentSessionId) return;
+    void refreshWorkspaceFiles();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rightTab, currentSessionId, workspaceDir]);
+
+  const eventsKey = `${events.length}_${events[events.length - 1]?.event_id || ""}`;
 
   const terminalLogItems = useMemo<TerminalLogItem[]>(() => {
     const toolById = new Map<string, ToolRun>();
@@ -189,7 +239,7 @@ export const RightPanel = React.memo(function RightPanel(props: {
     });
 
     return filtered.slice(-MAX);
-  }, [events, terminalFilter, toolRuns]);
+  }, [eventsKey, terminalFilter, toolRuns.length]);
 
   const DagPanel = React.lazy(() => import("./DagPanel"));
 
@@ -245,13 +295,25 @@ export const RightPanel = React.memo(function RightPanel(props: {
               </div>
             </div>
 
-            {/* Mermaid Graph */}
-            <div className="flex-1 overflow-auto p-4 flex items-center justify-center bg-surface-50">
-              <div className="w-full">
-                <React.Suspense fallback={<div className="text-sm text-ink-500">Loading plan…</div>}>
-                  <DagPanel latestPlan={latestPlan} />
-                </React.Suspense>
+            {/* Progress */}
+            <div className="border-b border-surface-200 bg-surface-0 px-3 py-2">
+              <div className="flex items-center justify-between text-[10px] font-semibold text-ink-400">
+                <span>Progress</span>
+                <span>{planStats.percent}%</span>
               </div>
+              <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-surface-200">
+                <div
+                  className="h-full bg-gradient-to-r from-accent-400 to-accent-600 transition-all duration-500"
+                  style={{ width: `${planStats.percent}%` }}
+                />
+              </div>
+            </div>
+
+            {/* Plan (vertical timeline) */}
+            <div className="flex-1 overflow-y-auto bg-surface-50/50 p-3">
+              <React.Suspense fallback={<div className="text-sm text-ink-500">Loading plan…</div>}>
+                <DagPanel latestPlan={latestPlan} />
+              </React.Suspense>
             </div>
 
             {/* Active Step */}
@@ -320,105 +382,155 @@ export const RightPanel = React.memo(function RightPanel(props: {
         ) : null}
 
         {rightTab === "files" ? (
-          <div className="min-h-0 flex-1 overflow-auto p-3">
-            <div className="flex items-center justify-between">
-              <div className="text-xs font-semibold text-ink-500">Artifacts</div>
-              <div className="text-[10px] text-ink-400">Preview</div>
+          <div className="flex min-h-0 flex-1 flex-col">
+            {/* Header */}
+            <div className="flex items-center justify-between border-b border-surface-200 bg-surface-0 px-4 py-3">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-ink-700">Workspace files</div>
+                <div className="mt-0.5 truncate font-mono text-[10px] text-ink-400">{workspaceDir ? `/${workspaceDir}` : "/"}</div>
+              </div>
+              <div className="flex items-center gap-2">
+                <Badge tone="gray">{workspaceEntries.length}</Badge>
+                <Button onClick={() => void refreshWorkspaceFiles()} disabled={workspaceLoading || !currentSessionId}>
+                  Refresh
+                </Button>
+              </div>
             </div>
 
-            <div className="mt-3 grid min-h-0 grid-cols-2 gap-2">
-              {/* List */}
-              <div className="min-h-0 overflow-auto rounded-xl border border-surface-200 bg-surface-0">
-                <div className="border-b border-surface-200 px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-ink-400">Recent</div>
-                <div className="p-2">
-                  {recentArtifacts.length ? (
-                    <div className="space-y-1">
-                      {recentArtifacts.map((loc) => {
-                        const selected = selectedArtifact === loc;
-                        const cached = artifactTexts[loc] !== undefined;
-                        const href = `/api/artifacts/${encodeURIComponent(loc)}`;
-                        return (
-                          <button
-                            key={loc}
-                            onClick={() => {
-                              setSelectedArtifact(loc);
-                              void ensureText(loc);
-                            }}
-                            className={[
-                              "w-full rounded-md border p-2.5 text-left transition-colors",
-                              selected ? "border-accent-200 bg-accent-50" : "border-surface-200 bg-surface-0 hover:bg-surface-50",
-                            ].join(" ")}
-                          >
-                            <div className="truncate font-mono text-[11px] text-ink-700">{loc}</div>
-                            <div className="mt-2 flex items-center justify-between gap-2">
-                              <Badge tone={cached ? "blue" : "gray"}>{cached ? "cached" : "not loaded"}</Badge>
-                              <div className="flex items-center gap-2">
-                                <a
-                                  className="rounded-lg border border-surface-200 bg-surface-0 px-2 py-1 text-[10px] font-semibold text-ink-600 hover:bg-surface-50"
-                                  href={href}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  onClick={(e) => e.stopPropagation()}
-                                  title="Download artifact"
-                                >
-                                  Download
-                                </a>
-                                <Button
-                                  title="Copy locator"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    void navigator.clipboard.writeText(loc);
-                                  }}
-                                >
-                                  Copy
-                                </Button>
-                              </div>
-                            </div>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  ) : (
-                    <div className="p-3 text-sm text-ink-500">No artifacts yet.</div>
-                  )}
-                </div>
-              </div>
+            {/* Workspace files list */}
+            <div className="flex-1 overflow-y-auto bg-surface-50/50 p-3">
+              {workspaceErr ? (
+                <div className="rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">{workspaceErr}</div>
+              ) : null}
 
-              {/* Preview */}
-              <div className="min-h-0 overflow-auto rounded-xl border border-surface-200 bg-surface-0">
-                <div className="border-b border-surface-200 px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-ink-400">Preview</div>
-                <div className="p-3">
-                  {selectedArtifact ? (
-                    <>
-                      <div className="truncate font-mono text-[11px] text-ink-500">{selectedArtifact}</div>
-                      <pre className="mt-2 max-h-[520px] overflow-auto whitespace-pre-wrap rounded-lg border border-surface-200 bg-surface-50 p-3 font-mono text-xs text-ink-700">
-                        {artifactTexts[selectedArtifact] ?? "Loading…"}
-                      </pre>
-                    </>
-                  ) : (
-                    <div className="text-sm text-ink-500">Select an artifact to preview.</div>
-                  )}
+              {workspaceLoading && !workspaceEntries.length ? (
+                <div className="flex h-24 items-center justify-center rounded-xl border border-dashed border-surface-200 text-sm text-ink-400">
+                  Loading…
                 </div>
-              </div>
+              ) : null}
+
+              {!workspaceLoading && !workspaceEntries.length && !workspaceErr ? (
+                <div className="flex h-24 items-center justify-center rounded-xl border border-dashed border-surface-200 text-sm text-ink-400">
+                  No files
+                </div>
+              ) : null}
+
+              {workspaceEntries.length ? (
+                <div className="space-y-2">
+                  {workspaceDir ? (
+                    <button
+                      type="button"
+                      className="w-full rounded-lg border border-surface-200 bg-surface-0 px-3 py-2 text-left text-xs text-ink-700 shadow-soft hover:bg-surface-50"
+                      onClick={() => {
+                        const parts = workspaceDir.split("/").filter(Boolean);
+                        parts.pop();
+                        setSelectedWorkspaceFile(null);
+                        setWorkspacePreview(null);
+                        setWorkspaceDir(parts.join("/"));
+                      }}
+                    >
+                      ← Up
+                    </button>
+                  ) : null}
+
+                  {workspaceEntries.map((ent) => {
+                    const selected = selectedWorkspaceFile === ent.path;
+                    const href = currentSessionId
+                      ? `${httpBase()}/api/sessions/${encodeURIComponent(currentSessionId)}/workspace/file/${encodePath(ent.path)}`
+                      : "#";
+                    const sizeLabel = ent.is_dir ? "dir" : typeof ent.size_bytes === "number" ? `${ent.size_bytes} bytes` : "file";
+                    return (
+                      <div
+                        key={ent.path}
+                        className={[
+                          "rounded-lg border p-3 transition-all cursor-pointer",
+                          selected
+                            ? "border-accent-300 bg-accent-50 shadow-soft ring-1 ring-accent-200"
+                            : "border-surface-200 bg-surface-0 hover:border-surface-300 hover:shadow-soft",
+                        ].join(" ")}
+                        onClick={async () => {
+                          if (ent.is_dir) {
+                            setSelectedWorkspaceFile(null);
+                            setWorkspacePreview(null);
+                            setWorkspaceDir(ent.path);
+                            return;
+                          }
+
+                          const next = selected ? null : ent.path;
+                          setSelectedWorkspaceFile(next);
+                          setWorkspacePreview(null);
+                          if (!next || !currentSessionId) return;
+                          setWorkspacePreviewLoading(true);
+                          try {
+                            const data = await apiFetchWorkspaceFileText(currentSessionId, next, { maxBytes: 220_000 });
+                            setWorkspacePreview({ text: data.text, truncated: data.truncated, bytes: data.bytes });
+                          } catch (e: any) {
+                            setWorkspacePreview({ text: String(e?.message || e || "preview_failed"), truncated: false, bytes: 0 });
+                          } finally {
+                            setWorkspacePreviewLoading(false);
+                          }
+                        }}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-xs font-medium text-ink-800">{ent.name}</div>
+                            <div className="mt-0.5 truncate font-mono text-[10px] text-ink-400">
+                              {ent.path} · {sizeLabel} · {fmtTime(ent.modified_at)}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            {ent.is_dir ? (
+                              <Badge tone="gray">dir</Badge>
+                            ) : (
+                              <a
+                                className="rounded-md border border-surface-200 bg-surface-0 px-2 py-1 text-[10px] font-medium text-ink-600 transition-colors hover:bg-surface-100"
+                                href={href}
+                                target="_blank"
+                                rel="noreferrer"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (!currentSessionId) e.preventDefault();
+                                }}
+                                title="Download"
+                              >
+                                ↓
+                              </a>
+                            )}
+                          </div>
+                        </div>
+
+                        {selected && !ent.is_dir ? (
+                          <div className="mt-3 animate-fade-in">
+                            <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-lg border border-surface-200 bg-surface-0 p-3 font-mono text-[11px] text-ink-700">
+                              {workspacePreviewLoading ? "Loading…" : workspacePreview?.text ?? "—"}
+                            </pre>
+                            {workspacePreview?.truncated ? <div className="mt-1 text-[10px] text-ink-400">Preview truncated.</div> : null}
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : null}
             </div>
           </div>
         ) : null}
 
         {rightTab === "terminal" ? (
-          <div className="min-h-0 flex-1 overflow-auto p-3">
-            <div className="flex items-center justify-between">
-              <div className="text-xs font-semibold text-ink-500">Run log</div>
-              <div className="flex flex-wrap items-center gap-1">
-                {(["all", "llm", "tools", "plan", "approvals", "errors"] as const).map((k) => (
+          <div className="flex min-h-0 flex-1 flex-col">
+            {/* Header with filters */}
+            <div className="flex items-center justify-between border-b border-surface-200 bg-surface-0 px-4 py-3">
+              <div className="text-sm font-semibold text-ink-700">Run Log</div>
+              <div className="flex items-center gap-1">
+                {(["all", "tools", "llm", "errors"] as const).map((k) => (
                   <button
                     key={k}
                     onClick={() => setTerminalFilter(k)}
-                    title={`Filter: ${k}`}
                     className={[
-                      "rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
+                      "rounded-md px-2 py-1 text-[10px] font-medium transition-colors",
                       terminalFilter === k
-                        ? "border-accent-200 bg-accent-50 text-accent-700"
-                        : "border-surface-200 bg-surface-0 text-ink-500 hover:bg-surface-50",
+                        ? "bg-accent-100 text-accent-700"
+                        : "text-ink-500 hover:bg-surface-100",
                     ].join(" ")}
                   >
                     {k}
@@ -427,55 +539,76 @@ export const RightPanel = React.memo(function RightPanel(props: {
               </div>
             </div>
 
-            <div className="mt-3 space-y-1">
+            {/* Log List */}
+            <div className="flex-1 overflow-y-auto bg-surface-50/50 p-3">
               {terminalLogItems.length ? (
-                terminalLogItems.map((it) => {
-                  const tone =
-                    it.level === "error" || it.status === "failed"
-                      ? "red"
-                      : it.status === "running"
-                        ? "orange"
-                        : it.status === "succeeded"
-                          ? "blue"
-                          : "gray";
+                <div className="space-y-3">
+                  {terminalLogItems.map((it) => {
+                    const isError = it.level === "error" || it.status === "failed";
+                    const isRunning = it.status === "running";
+                    const isSuccess = it.status === "succeeded";
 
-                  const anchorId = it.toolRunId ? `toolrun_${it.toolRunId}` : `log_${it.id}`;
+                    const borderColor = isError
+                      ? "border-l-rose-400"
+                      : isRunning
+                        ? "border-l-amber-400"
+                        : isSuccess
+                          ? "border-l-emerald-400"
+                          : "border-l-surface-300";
 
-                  return (
-                    <div
-                      id={anchorId}
-                      key={it.id}
-                      className="rounded-md border border-surface-200 bg-surface-0 p-2.5 transition-colors hover:bg-surface-50"
-                    >
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="min-w-0">
+                    const tone = isError ? "red" : isRunning ? "orange" : isSuccess ? "blue" : "gray";
+                    const anchorId = it.toolRunId ? `toolrun_${it.toolRunId}` : `log_${it.id}`;
+
+                    return (
+                      <div
+                        id={anchorId}
+                        key={it.id}
+                        className={[
+                          "rounded-lg border border-surface-200 border-l-[3px] bg-surface-0 p-3 shadow-soft transition-all hover:shadow-medium",
+                          borderColor,
+                        ].join(" ")}
+                      >
+                        {/* Top row: kind + time + status */}
+                        <div className="flex items-center justify-between">
                           <div className="flex items-center gap-2">
-                            <span className="text-[10px] font-bold uppercase tracking-wider text-ink-400">{it.kind}</span>
+                            <span className="rounded bg-surface-100 px-1.5 py-0.5 text-[9px] font-bold uppercase text-ink-500">
+                              {it.kind}
+                            </span>
                             <span className="text-[10px] text-ink-400">{fmtTime(it.ts)}</span>
                           </div>
-                          <div className="mt-1 truncate text-xs font-medium text-ink-900">{it.title}</div>
-                          {it.subtitle ? <div className="mt-0.5 truncate font-mono text-[11px] text-ink-500">{it.subtitle}</div> : null}
-
-                          {it.expandable ? (
-                            <details className="mt-2">
-                              <summary className="cursor-pointer text-[11px] text-ink-500 hover:text-ink-700">Details</summary>
-                              <div className="mt-2 rounded-lg border border-surface-200 bg-surface-0 p-2 font-mono text-[11px] text-ink-700">
-                                {it.details || "—"}
-                              </div>
-                            </details>
-                          ) : null}
+                          <div className="flex items-center gap-2">
+                            {typeof it.durationMs === "number" && (
+                              <span className="font-mono text-[10px] text-ink-400">{it.durationMs}ms</span>
+                            )}
+                            <Badge tone={tone as any}>{it.status || it.level}</Badge>
+                          </div>
                         </div>
 
-                        <div className="flex flex-shrink-0 items-center gap-2">
-                          {typeof it.durationMs === "number" ? <span className="font-mono text-[11px] text-ink-500">{it.durationMs}ms</span> : null}
-                          {it.status ? <Badge tone={tone as any}>{it.status}</Badge> : <Badge tone={tone as any}>{it.level}</Badge>}
-                        </div>
+                        {/* Title */}
+                        <div className="mt-2 text-xs font-medium text-ink-800 leading-relaxed">{it.title}</div>
+
+                        {/* Subtitle */}
+                        {it.subtitle && (
+                          <div className="mt-1 truncate font-mono text-[10px] text-ink-500">{it.subtitle}</div>
+                        )}
+
+                        {/* Expandable details */}
+                        {it.expandable && (
+                          <details className="mt-2 group">
+                            <summary className="cursor-pointer text-[10px] text-ink-400 hover:text-ink-600">▸ Details</summary>
+                            <pre className="mt-2 overflow-auto whitespace-pre-wrap rounded-md border border-surface-200 bg-surface-50 p-2 font-mono text-[10px] text-ink-600 animate-fade-in">
+                              {it.details || "—"}
+                            </pre>
+                          </details>
+                        )}
                       </div>
-                    </div>
-                  );
-                })
+                    );
+                  })}
+                </div>
               ) : (
-                <div className="text-sm text-ink-500">No logs yet.</div>
+                <div className="flex h-32 items-center justify-center rounded-xl border border-dashed border-surface-200 text-sm text-ink-400">
+                  No logs yet
+                </div>
               )}
             </div>
 

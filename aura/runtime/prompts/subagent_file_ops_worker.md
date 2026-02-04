@@ -55,6 +55,12 @@ If you do not see an explicit approval marker and the plan includes any risky ch
 ## Step-by-step template (follow strictly)
 1. **Parse the task**
    - Extract: target directories, file types, organization rules, constraints (do-not-touch paths), and desired output artifacts (index/report).
+   - **Read WorkSpec inputs first**:
+     - `WorkSpec.inputs` may include dependency outputs injected by the DAG runner.
+     - If you see an input like `connector_object dag://<node_id> — {...JSON...}`, treat its description as an upstream `node_result` record.
+       - Parse it as JSON and use the embedded `report` / `report_preview` / artifacts references as your primary input.
+       - Do not “re-search” just because an upstream file is missing—dependency outputs may be passed in-memory via this connector.
+     - If file inputs are listed (type=`file`, path=`...`), prefer reading those paths via `project__read_text`.
    - Decide:
      - Always: produce deliverables listed in `WorkSpec.expected_outputs`.
      - If the task requires modifying other files: `mode = plan_only | execute` based on the approval marker.

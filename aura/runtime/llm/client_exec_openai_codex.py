@@ -134,6 +134,12 @@ def _should_use_httpx_for_responses(*, base_url: str, credential_ref_kind: str |
     return True
 
 
+def _is_openai_platform_base_url(base_url: str) -> bool:
+    host = (urlparse(base_url).hostname or "").lower()
+    # Keep this intentionally strict: gateways often mimic OpenAI-compatible paths but not /responses.
+    return host == "api.openai.com"
+
+
 def _iter_sse_json(resp: Any) -> Iterator[dict[str, Any]]:
     """
     Yield JSON objects from an SSE-ish response.
@@ -229,6 +235,17 @@ def _responses_sse_dicts_to_events(
     text_parts: list[str] = []
     tool_calls_by_output_index: dict[int, dict[str, Any]] = {}
     saw_terminal = False
+
+    def _coerce_text(value: Any) -> str | None:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            for k in ("text", "delta", "content"):
+                v = value.get(k)
+                if isinstance(v, str):
+                    return v
+        return None
+
     for ev in events:
         if on_provider_chunk is not None:
             try:
@@ -244,10 +261,19 @@ def _responses_sse_dicts_to_events(
             event_type = "response.completed"
 
         if event_type == "response.output_text.delta":
-            delta = ev.get("delta")
+            delta = _coerce_text(ev.get("delta"))
             if isinstance(delta, str) and delta:
                 text_parts.append(delta)
                 yield LLMStreamEvent(kind=LLMStreamEventKind.TEXT_DELTA, text_delta=delta)
+            continue
+
+        if event_type == "response.output_text.done":
+            # Some gateways emit only a terminal "done" with full text (no deltas).
+            if not text_parts:
+                text = _coerce_text(ev.get("text")) or _coerce_text(ev.get("output_text"))
+                if isinstance(text, str) and text:
+                    text_parts.append(text)
+                    yield LLMStreamEvent(kind=LLMStreamEventKind.TEXT_DELTA, text_delta=text)
             continue
 
         if event_type == "response.output_item.added":
@@ -311,6 +337,8 @@ def _responses_sse_dicts_to_events(
             out = _responses_to_response(
                 provider_kind=provider_kind, profile_id=profile_id, resp=(resp if resp is not None else ev)
             )
+            if not out.text and text_parts:
+                out = replace(out, text="".join(text_parts))
             yield LLMStreamEvent(kind=LLMStreamEventKind.COMPLETED, response=out)
             saw_terminal = True
             return
@@ -610,6 +638,42 @@ def complete_openai_codex(
     )
 
     if _is_chatgpt_codex_route(profile.base_url) or _token_supports_openai_responses(token):
+        def _fallback_complete_chat_completions() -> LLMResponse:
+            payload = OpenAICompatibleAdapter().prepare_request(
+                replace(profile, provider_kind=ProviderKind.OPENAI_COMPATIBLE), request
+            ).json
+            if trace is not None:
+                trace.record_prepared_request(
+                    provider_kind=profile.provider_kind,
+                    profile_id=profile.profile_id,
+                    base_url=profile.base_url,
+                    model=profile.model_name,
+                    stream=False,
+                    timeout_s=request_timeout_s,
+                    payload=payload,
+                )
+            try:
+                resp = client.chat.completions.create(**payload, timeout=request_timeout_s)
+            except openai.OpenAIError as e:
+                raise wrap_provider_exception(
+                    e,
+                    provider_kind=profile.provider_kind,
+                    profile_id=profile.profile_id,
+                    model=profile.model_name,
+                    operation="complete",
+                ) from e
+            out = _openai_to_response(profile_id=profile.profile_id, resp=resp)
+            return LLMResponse(
+                provider_kind=ProviderKind.OPENAI_CODEX,
+                profile_id=out.profile_id,
+                model=out.model,
+                text=out.text,
+                tool_calls=out.tool_calls,
+                usage=out.usage,
+                stop_reason=out.stop_reason,
+                request_id=out.request_id,
+            )
+
         payload = OpenAICodexAdapter().prepare_request(profile, request).json
         if not (isinstance(payload.get("instructions"), str) and payload["instructions"].strip()):
             payload["instructions"] = "You are a helpful assistant."
@@ -661,6 +725,16 @@ def complete_openai_codex(
                         trace.record_error(e, code=e.code.value)
                     except Exception:
                         pass
+                if (
+                    not _is_openai_platform_base_url(profile.base_url)
+                    and e.code in {LLMErrorCode.BAD_REQUEST, LLMErrorCode.NOT_FOUND, LLMErrorCode.UNPROCESSABLE}
+                ):
+                    if trace is not None:
+                        try:
+                            trace.record_meta(fallback="responses_unavailable:chat_completions")
+                        except Exception:
+                            pass
+                    return _fallback_complete_chat_completions()
                 if e.code == LLMErrorCode.PERMISSION and _should_retry_blocked_without_tools(request=request):
                     fallback_req = _blocked_fallback_request(request)
                     fallback_payload = OpenAICodexAdapter().prepare_request(profile, fallback_req).json
@@ -713,6 +787,23 @@ def complete_openai_codex(
             )
         try:
             raw_stream = client.responses.create(**payload, stream=True, timeout=request_timeout_s)
+        except (openai.BadRequestError, openai.NotFoundError, openai.UnprocessableEntityError) as e:
+            # Many OpenAI-compatible gateways do not implement the Responses API. Fall back to chat.completions.
+            if not _is_openai_platform_base_url(profile.base_url):
+                if trace is not None:
+                    try:
+                        trace.record_error(e, code=classify_provider_exception(e).value)  # type: ignore[name-defined]
+                        trace.record_meta(fallback="responses_unavailable:chat_completions")
+                    except Exception:
+                        pass
+                return _fallback_complete_chat_completions()
+            raise wrap_provider_exception(
+                e,
+                provider_kind=profile.provider_kind,
+                profile_id=profile.profile_id,
+                model=profile.model_name,
+                operation="complete",
+            ) from e
         except openai.PermissionDeniedError as e:
             # Retry once with a minimal prompt and no tools, if the request likely got blocked by a gateway filter.
             if _should_retry_blocked_without_tools(request=request):
@@ -932,6 +1023,69 @@ def stream_openai_codex(
 
     use_responses = _is_chatgpt_codex_route(profile.base_url) or _token_supports_openai_responses(token)
     if use_responses:
+        def _fallback_stream_chat_completions() -> Iterator[LLMStreamEvent]:
+            payload = OpenAICompatibleAdapter().prepare_request(
+                replace(profile, provider_kind=ProviderKind.OPENAI_COMPATIBLE), request
+            ).json
+            payload["stream"] = True
+            if trace is not None:
+                trace.record_prepared_request(
+                    provider_kind=profile.provider_kind,
+                    profile_id=profile.profile_id,
+                    base_url=profile.base_url,
+                    model=profile.model_name,
+                    stream=True,
+                    timeout_s=request_timeout_s,
+                    payload=payload,
+                )
+            raw_stream = client.chat.completions.create(**payload, stream=True, timeout=request_timeout_s)
+
+            stop_closer = _start_cancel_closer(cancel, raw_stream)
+            wd_stop, wd_timed_out, wd_tick, wd_phase = _start_stream_idle_watchdog(
+                stream=raw_stream,
+                cancel=cancel,
+                first_event_timeout_s=(None if request_timeout_s is None else float(request_timeout_s)),
+                idle_timeout_s=(None if request_timeout_s is None else float(request_timeout_s)),
+            )
+            try:
+                for ev in _openai_stream_to_events(
+                    profile_id=profile.profile_id,
+                    stream=raw_stream,
+                    timeout_flag=wd_timed_out,
+                    on_chunk=wd_tick,
+                    on_provider_chunk=(None if trace is None else trace.record_provider_item),
+                ):
+                    if ev.kind.value == "completed" and ev.response is not None:
+                        ev = LLMStreamEvent(kind=ev.kind, response=replace(ev.response, provider_kind=ProviderKind.OPENAI_CODEX))
+                    if trace is not None:
+                        trace.record_stream_event(ev)
+                    yield ev
+                if wd_timed_out.is_set():
+                    phase = wd_phase()
+                    raise LLMRequestError(
+                        (
+                            "Stream timed out waiting for first stream chunk."
+                            if phase == "first_event"
+                            else "Stream timed out (no terminal event / idle)."
+                        ),
+                        code=LLMErrorCode.TIMEOUT,
+                        provider_kind=profile.provider_kind,
+                        profile_id=profile.profile_id,
+                        model=profile.model_name,
+                        retryable=True,
+                        details={"operation": "stream", "timeout_s": request_timeout_s, "phase": phase},
+                    )
+            finally:
+                try:
+                    wd_stop()
+                except Exception:
+                    pass
+                try:
+                    stop_closer()
+                except Exception:
+                    pass
+                _maybe_close_stream(raw_stream)
+
         payload = OpenAICodexAdapter().prepare_request(profile, request).json
         if not (isinstance(payload.get("instructions"), str) and payload["instructions"].strip()):
             payload["instructions"] = "You are a helpful assistant."
@@ -982,6 +1136,17 @@ def stream_openai_codex(
                         trace.record_error(e, code=e.code.value)
                     except Exception:
                         pass
+                if (
+                    not _is_openai_platform_base_url(profile.base_url)
+                    and e.code in {LLMErrorCode.BAD_REQUEST, LLMErrorCode.NOT_FOUND, LLMErrorCode.UNPROCESSABLE}
+                ):
+                    if trace is not None:
+                        try:
+                            trace.record_meta(fallback="responses_unavailable:chat_completions")
+                        except Exception:
+                            pass
+                    yield from _fallback_stream_chat_completions()
+                    return
                 if e.code == LLMErrorCode.PERMISSION and _should_retry_blocked_without_tools(request=request):
                     fallback_req = _blocked_fallback_request(request)
                     fallback_payload = OpenAICodexAdapter().prepare_request(profile, fallback_req).json
@@ -1030,6 +1195,24 @@ def stream_openai_codex(
             )
         try:
             raw_stream = client.responses.create(**payload, stream=True, timeout=request_timeout_s)
+        except (openai.BadRequestError, openai.NotFoundError, openai.UnprocessableEntityError) as e:
+            # Many OpenAI-compatible gateways do not implement the Responses API. Fall back to chat.completions.
+            if not _is_openai_platform_base_url(profile.base_url):
+                if trace is not None:
+                    try:
+                        trace.record_error(e, code=classify_provider_exception(e).value)  # type: ignore[name-defined]
+                        trace.record_meta(fallback="responses_unavailable:chat_completions")
+                    except Exception:
+                        pass
+                yield from _fallback_stream_chat_completions()
+                return
+            raise wrap_provider_exception(
+                e,
+                provider_kind=profile.provider_kind,
+                profile_id=profile.profile_id,
+                model=profile.model_name,
+                operation="stream",
+            ) from e
         except openai.PermissionDeniedError as e:
             if _should_retry_blocked_without_tools(request=request):
                 fallback_req = _blocked_fallback_request(request)

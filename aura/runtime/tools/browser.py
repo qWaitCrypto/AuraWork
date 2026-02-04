@@ -11,7 +11,12 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from ..stores import ArtifactStore
+from ..agent_browser import (
+    agent_browser_session_for_aura_session,
+    ensure_agent_browser_stream_port,
+)
 from .browser_steps import parse_browser_steps
+from .runtime import ToolExecutionContext
 
 
 def _maybe_int(args: dict[str, Any], key: str) -> int | None:
@@ -45,13 +50,62 @@ def _resolve_in_project(project_root: Path, rel: str) -> Path:
     return candidate
 
 
-def _is_screenshot_to_stdout(argv: list[str]) -> bool:
+def _screenshot_path_arg(argv: list[str]) -> str | None:
     if not argv or argv[0] != "screenshot":
-        return False
-    # `agent-browser screenshot` outputs to stdout unless a path argument is provided.
-    # We treat any non-flag argument as a path.
-    non_flags = [a for a in argv[1:] if isinstance(a, str) and a and not a.startswith("-")]
-    return len(non_flags) == 0
+        return None
+    # Treat the first non-flag arg as the felt "path" argument.
+    for a in argv[1:]:
+        if isinstance(a, str) and a and not a.startswith("-"):
+            return a
+    return None
+
+
+def _extract_screenshot_path(stdout_text: str) -> str | None:
+    """
+    Best-effort extraction of screenshot file path from agent-browser stdout.
+
+    agent-browser v0.8+ saves screenshots to a file and reports the path.
+    Output format may vary (plain path, JSON, etc.), so keep this heuristic.
+    """
+
+    import re
+
+    def _strip_ansi(text: str) -> str:
+        # agent-browser prints colored output by default (ANSI escape sequences).
+        return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+    s = _strip_ansi(str(stdout_text or "")).strip()
+    if not s:
+        return None
+
+    # Try JSON first: {"success":true,"data":{"path":"..."}} or similar.
+    try:
+        import json
+
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            data = obj.get("data")
+            if isinstance(data, dict):
+                p = data.get("path")
+                if isinstance(p, str) and p.strip():
+                    return p.strip()
+            p = obj.get("path")
+            if isinstance(p, str) and p.strip():
+                return p.strip()
+    except Exception:
+        pass
+
+    # Fallback: scan lines for a path-like substring ending in an image extension.
+    # Handles common agent-browser output like: "Screenshot saved to /run/user/.../x.png"
+    path_re = re.compile(r"(?P<path>(?:/[^\s\"']+|[^\s\"']+)\.(?:png|jpg|jpeg|webp))", re.IGNORECASE)
+    for line in reversed(s.splitlines()):
+        candidate = line.strip().strip('"').strip("'")
+        if not candidate:
+            continue
+        m = path_re.search(candidate)
+        if m:
+            return m.group("path").strip()
+    return None
 
 
 @dataclass(slots=True)
@@ -104,7 +158,7 @@ class BrowserRunTool:
         "additionalProperties": False,
     }
 
-    def execute(self, *, args: dict[str, Any], project_root: Path) -> dict[str, Any]:
+    def execute(self, *, args: dict[str, Any], project_root: Path, context: ToolExecutionContext | None = None) -> dict[str, Any]:
         steps = parse_browser_steps(args.get("steps"))
         cwd_rel = str(args.get("cwd") or ".")
         cwd_path = _resolve_in_project(project_root, cwd_rel)
@@ -123,6 +177,12 @@ class BrowserRunTool:
 
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
+        if context is not None:
+            agent_session = agent_browser_session_for_aura_session(context.session_id)
+            env["AGENT_BROWSER_SESSION"] = agent_session
+            if str(env.get("AURA_ENABLE_BROWSER_STREAMING") or "").strip() == "1":
+                port = ensure_agent_browser_stream_port(project_root, aura_session_id=context.session_id)
+                env["AGENT_BROWSER_STREAM_PORT"] = str(port)
 
         results: list[dict[str, Any]] = []
         for step_argv in steps:
@@ -164,25 +224,38 @@ class BrowserRunTool:
             stdout_text: str | None = None
             stdout_ref: dict[str, Any] | None = None
 
-            if _is_screenshot_to_stdout(step_argv):
-                payload = stdout_b or b""
-                truncated_bytes = False
-                if len(payload) > max_binary_bytes:
-                    payload = payload[:max_binary_bytes]
-                    truncated_bytes = True
-                ref = self.artifact_store.put(
-                    payload,
-                    kind="browser_screenshot",
-                    meta={"summary": "Browser screenshot (stdout)", "truncated": truncated_bytes},
-                )
-                stdout_ref = ref.to_dict()
-                stdout_text = None
-                stdout_truncated = truncated_bytes
-            else:
-                stdout_text = (stdout_b or b"").decode("utf-8", errors="replace")
-                if len(stdout_text) > max_output_chars:
-                    stdout_truncated = True
-                    stdout_text = stdout_text[:max_output_chars] + "…"
+            stdout_text = (stdout_b or b"").decode("utf-8", errors="replace")
+            if len(stdout_text) > max_output_chars:
+                stdout_truncated = True
+                stdout_text = stdout_text[:max_output_chars] + "…"
+
+            # agent-browser v0.8+ screenshots are written to a file and stdout reports the path.
+            # Best effort: if this step is `screenshot` without explicit path, capture the image bytes as an artifact.
+            if _screenshot_path_arg(step_argv) is None and (step_argv and step_argv[0] == "screenshot"):
+                shot_path = _extract_screenshot_path(stdout_text)
+                if shot_path:
+                    try:
+                        p = Path(shot_path).expanduser()
+                        if p.is_file():
+                            payload = p.read_bytes()
+                            truncated_bytes = False
+                            if len(payload) > max_binary_bytes:
+                                payload = payload[:max_binary_bytes]
+                                truncated_bytes = True
+                            ref = self.artifact_store.put(
+                                payload,
+                                kind="browser_screenshot",
+                                meta={
+                                    "summary": "Browser screenshot",
+                                    "source": "agent-browser",
+                                    "path": str(p),
+                                    "truncated": truncated_bytes,
+                                },
+                            )
+                            stdout_ref = ref.to_dict()
+                            stdout_truncated = stdout_truncated or truncated_bytes
+                    except Exception:
+                        pass
 
             stderr_text = (stderr_b or b"").decode("utf-8", errors="replace")
             if len(stderr_text) > max_output_chars:

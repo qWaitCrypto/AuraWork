@@ -55,8 +55,10 @@ echo "==> Starting backend (FastAPI)"
   python - <<'PY'
 from __future__ import annotations
 
-from pathlib import Path
+import os
 import sys
+from pathlib import Path
+
 import uvicorn
 
 repo_root = Path.cwd().parents[1]
@@ -68,8 +70,11 @@ sys.path.insert(0, str(backend_root))
 
 from aura_web.server import build_app  # noqa: E402
 
+host = str(os.environ.get("AURA_WEB_HOST") or "127.0.0.1")
+port = int(str(os.environ.get("AURA_WEB_PORT") or "8000"))
+
 app = build_app(project_root=repo_root)
-uvicorn.run(app, host="${AURA_WEB_HOST:-127.0.0.1}", port=int("${AURA_WEB_PORT:-8000}"), log_level="info")
+uvicorn.run(app, host=host, port=port, log_level="info")
 PY
 ) &
 BACK_PID=$!

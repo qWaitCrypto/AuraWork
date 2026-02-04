@@ -1,5 +1,5 @@
 import React from "react";
-import { CheckCircle2, ChevronDown, Plus, XCircle } from "lucide-react";
+import { ChevronDown, Plus, Trash2 } from "lucide-react";
 import type { SessionSummary } from "../lib/types";
 import { Badge } from "./Badge";
 
@@ -9,6 +9,8 @@ export const Sidebar = React.memo(function Sidebar(props: {
   sessions: SessionSummary[];
   currentSessionId: string | null;
   onSelectSession: (id: string) => void;
+  onDeleteSession: (id: string) => void;
+  onOpenWorkspacePicker: () => void;
 
   // Status / derived signals (App computes these for current session)
   approvalsCount: number;
@@ -26,6 +28,8 @@ export const Sidebar = React.memo(function Sidebar(props: {
     sessions,
     currentSessionId,
     onSelectSession,
+    onDeleteSession,
+    onOpenWorkspacePicker,
     approvalsCount,
     lastEventKind,
     hasRunningTool,
@@ -44,9 +48,9 @@ export const Sidebar = React.memo(function Sidebar(props: {
       {/* Workspace Select */}
       <div className="border-b border-surface-200 p-4">
         <button
-          className="group flex w-full items-center justify-between rounded-lg border border-transparent px-3 py-2.5 shadow-soft transition-colors hover:border-surface-200 hover:bg-surface-0 hover:shadow-medium disabled:cursor-not-allowed disabled:opacity-70"
-          disabled
-          title="Workspace switching is not available yet"
+          className="group flex w-full items-center justify-between rounded-lg border border-transparent px-3 py-2.5 shadow-soft transition-colors hover:border-surface-200 hover:bg-surface-0 hover:shadow-medium"
+          onClick={onOpenWorkspacePicker}
+          title="选择/新建工作目录"
           type="button"
         >
           <div className="flex min-w-0 items-center gap-3">
@@ -60,30 +64,31 @@ export const Sidebar = React.memo(function Sidebar(props: {
           </div>
           <ChevronDown className="h-4 w-4 text-ink-400" />
         </button>
-        <div className="mt-2 rounded-lg border border-surface-200 bg-surface-0 px-3 py-2 text-[11px] text-ink-500 shadow-soft">
-          Workspace switching is not available in this build.
-        </div>
       </div>
 
       {/* Session List */}
-      <div className="flex-1 overflow-auto p-2">
-        <div className="px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-ink-400">Sessions</div>
-        {sessions.map((s) => {
-          const active = s.session_id === currentSessionId;
-          return (
-            <button
+        <div className="flex-1 overflow-auto p-2">
+          <div className="px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-ink-400">Sessions</div>
+          {sessions.map((s) => {
+            const active = s.session_id === currentSessionId;
+            const containerClass = active
+              ? "border-accent-200 bg-surface-0 shadow-soft hover:shadow-medium"
+              : "border-transparent hover:border-surface-200 hover:bg-surface-0 hover:shadow-soft";
+            return (
+            <div
               key={s.session_id}
-              onClick={() => onSelectSession(s.session_id)}
+              className={["group mb-1 flex w-full items-stretch gap-1 rounded-lg border transition-all", containerClass].join(" ")}
               title={s.session_id}
-              className={[
-                "group mb-1 flex w-full items-start gap-3 rounded-lg border p-3 text-left transition-all",
-                active ? "border-accent-200 bg-surface-0 shadow-soft hover:shadow-medium" : "border-transparent hover:border-surface-200 hover:bg-surface-0 hover:shadow-soft",
-              ].join(" ")}
             >
-              {(() => {
-                const now = Date.now();
-                const updated = typeof s.updated_at === "number" ? s.updated_at : null;
-                const recentlyActive = updated ? now - updated < 2 * 60 * 1000 : false;
+              <button
+                onClick={() => onSelectSession(s.session_id)}
+                className="flex min-w-0 flex-1 items-start gap-3 p-3 text-left"
+                type="button"
+              >
+                {(() => {
+                  const now = Date.now();
+                  const updated = typeof s.updated_at === "number" ? s.updated_at : null;
+                  const recentlyActive = updated ? now - updated < 2 * 60 * 1000 : false;
 
                 const currentDerived = active
                   ? (() => {
@@ -123,15 +128,15 @@ export const Sidebar = React.memo(function Sidebar(props: {
 
                 return (
                   <>
-                    {active ? (
-                      <div className={["mt-1.5 h-2 w-2 flex-shrink-0 rounded-full", dotClass, currentDerived === "Active" ? "animate-pulse" : ""].join(" ")} />
-                    ) : currentDerived === "Failed" ? (
-                      <XCircle className="mt-0.5 h-4 w-4 flex-shrink-0 text-rose-500" />
-                    ) : currentDerived === "Completed" ? (
-                      <CheckCircle2 className="mt-0.5 h-4 w-4 flex-shrink-0 text-emerald-500" />
-                    ) : (
-                      <div className="mt-1.5 h-2 w-2 flex-shrink-0 rounded-full bg-surface-200" />
-                    )}
+                    <div
+                      className={[
+                        "mt-1.5 h-2 w-2 flex-shrink-0 rounded-full",
+                        dotClass,
+                        currentDerived === "Active" ? "animate-pulse-subtle" : "",
+                      ].join(" ")}
+                      aria-label={currentDerived}
+                      title={currentDerived}
+                    />
                     <div className="min-w-0 flex-1">
                       <div className={active ? "truncate text-sm font-medium text-ink-900" : "truncate text-sm text-ink-700 group-hover:text-ink-900 transition-colors"}>
                         {sessionLabel(s)}
@@ -139,14 +144,36 @@ export const Sidebar = React.memo(function Sidebar(props: {
                       <div className={active ? "mt-1 truncate text-xs text-ink-500" : "mt-1 truncate text-xs text-ink-400"}>
                         {active ? subtitle : updated ? `Completed · ${new Date(updated).toLocaleString()}` : subtitle}
                       </div>
+                      {s.project_root ? (
+                        <div className={active ? "mt-1 truncate font-mono text-[10px] text-ink-400" : "mt-1 truncate font-mono text-[10px] text-ink-400"} title={s.project_root}>
+                          {s.project_root}
+                        </div>
+                      ) : null}
                     </div>
                   </>
                 );
               })()}
-            </button>
-          );
-        })}
-      </div>
+              </button>
+
+              <button
+                type="button"
+                className={[
+                  "flex w-10 flex-shrink-0 items-center justify-center rounded-md text-ink-400 transition-colors",
+                  "opacity-0 group-hover:opacity-100 hover:bg-rose-50 hover:text-rose-600",
+                ].join(" ")}
+                title="Delete session"
+                onClick={() => {
+                  const ok = window.confirm(`Delete session ${s.session_id}? This cannot be undone.`);
+                  if (!ok) return;
+                  onDeleteSession(s.session_id);
+                }}
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </div>
+            );
+          })}
+        </div>
 
       <div className="border-t border-surface-200 bg-surface-0/50 p-4">
         <button

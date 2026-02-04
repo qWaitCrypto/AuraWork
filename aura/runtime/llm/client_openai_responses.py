@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from dataclasses import replace
 from typing import Any, Iterator
 
 from .errors import ProviderAdapterError
@@ -38,7 +39,7 @@ def _responses_to_response(*, provider_kind: ProviderKind, profile_id: str, resp
             if isinstance(content, list):
                 for part in content:
                     part_type = getattr(part, "type", None) if not isinstance(part, dict) else part.get("type")
-                    if part_type == "output_text":
+                    if part_type in {"output_text", "text"}:
                         text = getattr(part, "text", None) if not isinstance(part, dict) else part.get("text")
                         if isinstance(text, str):
                             text_parts.append(text)
@@ -63,6 +64,12 @@ def _responses_to_response(*, provider_kind: ProviderKind, profile_id: str, resp
                 )
             )
             continue
+
+    # Some SDKs/gateways expose aggregated text directly (without `output` content items).
+    if not text_parts:
+        output_text = getattr(resp, "output_text", None) if not isinstance(resp, dict) else resp.get("output_text")
+        if isinstance(output_text, str) and output_text:
+            text_parts.append(output_text)
 
     return LLMResponse(
         provider_kind=provider_kind,
@@ -108,6 +115,14 @@ def _responses_stream_to_events(
                 if isinstance(delta, str) and delta:
                     text_parts.append(delta)
                     yield LLMStreamEvent(kind=LLMStreamEventKind.TEXT_DELTA, text_delta=delta)
+                continue
+
+            if event_type == "response.output_text.done":
+                # Some gateways emit only a terminal "done" with full text (no deltas).
+                text = getattr(event, "text", None)
+                if isinstance(text, str) and text and not text_parts:
+                    text_parts.append(text)
+                    yield LLMStreamEvent(kind=LLMStreamEventKind.TEXT_DELTA, text_delta=text)
                 continue
 
             if event_type == "response.output_item.added":
@@ -167,6 +182,8 @@ def _responses_stream_to_events(
             if event_type == "response.completed":
                 resp = getattr(event, "response", None)
                 out = _responses_to_response(provider_kind=provider_kind, profile_id=profile_id, resp=resp)
+                if not out.text and text_parts:
+                    out = replace(out, text="".join(text_parts))
                 yield LLMStreamEvent(kind=LLMStreamEventKind.COMPLETED, response=out)
                 saw_terminal = True
                 return

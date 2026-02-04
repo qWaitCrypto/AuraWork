@@ -83,6 +83,14 @@ class DAGExecuteNextTool:
 
         if not nodes:
             finished = self.dag_runner.is_all_done()
+            diagnostics = self._diagnose_no_ready()
+            message = "All nodes completed" if finished else "No ready nodes to dispatch"
+            if not finished and diagnostics:
+                running = diagnostics.get("running_nodes") or []
+                if running:
+                    message = f"No ready nodes to dispatch (running: {', '.join(running)})"
+                elif diagnostics.get("deadlock") is True:
+                    message = "No ready nodes to dispatch (deadlock: pending nodes blocked by dependencies)"
             return {
                 "ok": True,
                 "dispatched": 0,
@@ -91,7 +99,8 @@ class DAGExecuteNextTool:
                 "all_proposals": [],
                 "blocked_node": None,
                 "blocked_approval": None,
-                "message": "All nodes completed" if finished else "No ready nodes to dispatch",
+                "message": message,
+                "diagnostics": diagnostics,
             }
 
         plan_state = self.dag_runner.plan_store.get()
@@ -378,3 +387,74 @@ class DAGExecuteNextTool:
                 return future.result()
 
         return asyncio.run(self.execute_async(args=args, project_root=project_root, context=context))
+
+    def _diagnose_no_ready(self) -> dict[str, Any]:
+        """
+        Provide explainability when the scheduler has no dispatchable nodes.
+
+        This is intentionally side-effect free (no status mutation).
+        """
+
+        try:
+            plan_state = self.dag_runner.plan_store.get()
+        except Exception:
+            return {}
+
+        by_id: dict[str, PlanItem] = {it.id: it for it in plan_state.plan}
+
+        # Scheduler state is more accurate for "running" than PlanStore, because PlanStore may keep nodes as "pending"
+        # while they are actively executing.
+        running_nodes: list[str] = []
+        try:
+            sched = getattr(self.dag_runner, "_scheduler", None)
+            if sched is not None:
+                running_nodes = sorted(list(sched.running_nodes()))
+        except Exception:
+            running_nodes = []
+
+        pending: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        completed: list[str] = []
+        for it in plan_state.plan:
+            st = it.status
+            if st.value == "pending":
+                waiting_on = [d for d in it.depends_on if by_id.get(d) is not None and by_id[d].status.value != "completed"]
+                waiting_on_failed = [d for d in waiting_on if by_id.get(d) is not None and by_id[d].status.value == "failed"]
+                pending.append(
+                    {
+                        "id": it.id,
+                        "depends_on": list(it.depends_on),
+                        "waiting_on": waiting_on,
+                        "waiting_on_failed": waiting_on_failed,
+                    }
+                )
+            elif st.value == "failed":
+                last_err = None
+                try:
+                    if it.error_trace:
+                        last_err = it.error_trace[-1].get("error")
+                except Exception:
+                    last_err = None
+                failed.append({"id": it.id, "error": last_err})
+            elif st.value == "completed":
+                completed.append(it.id)
+
+        # Detect deadlock: nothing running, not finished, and no pending nodes can ever become ready.
+        deadlock = False
+        if not running_nodes:
+            if pending and all(p.get("waiting_on") for p in pending):
+                deadlock = True
+
+        return {
+            "running_nodes": running_nodes,
+            "counts": {
+                "total": len(plan_state.plan),
+                "pending": sum(1 for it in plan_state.plan if it.status.value == "pending"),
+                "completed": sum(1 for it in plan_state.plan if it.status.value == "completed"),
+                "failed": sum(1 for it in plan_state.plan if it.status.value == "failed"),
+            },
+            "pending": pending,
+            "failed": failed,
+            "completed": completed[-10:],
+            "deadlock": deadlock,
+        }

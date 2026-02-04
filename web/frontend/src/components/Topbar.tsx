@@ -8,6 +8,19 @@ export const Topbar = React.memo(function Topbar(props: {
   onChangeChatProfile: (profileId: string) => void;
 }) {
   const { currentSessionId, modelProfiles, sessionMeta, onChangeChatProfile } = props;
+  const [dropdownOpen, setDropdownOpen] = React.useState(false);
+  const dropdownRef = React.useRef<HTMLDivElement | null>(null);
+
+  // 点击外部关闭下拉框
+  React.useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setDropdownOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
 
   return (
     <header className="z-10 flex h-14 flex-shrink-0 items-center justify-between border-b border-surface-200 bg-surface-0/80 px-6 backdrop-blur-sm">
@@ -20,26 +33,44 @@ export const Topbar = React.memo(function Topbar(props: {
         {currentSessionId ? <span className="truncate font-mono text-[10px] text-ink-500">{currentSessionId}</span> : null}
       </div>
       <div className="flex items-center gap-4">
-        <div
-          className="flex items-center gap-2 rounded px-2 py-1 text-xs text-ink-500 hover:bg-surface-100 hover:text-accent-600"
-          title="Model"
-        >
-          <Cpu className="h-3.5 w-3.5" />
-          <select
-            className="cursor-pointer bg-transparent text-xs text-ink-500 outline-none"
-            value={sessionMeta?.chat_profile_id || ""}
-            onChange={(e) => onChangeChatProfile(e.target.value || "")}
+        <div className="relative" ref={dropdownRef}>
+          <button
+            onClick={() => setDropdownOpen(!dropdownOpen)}
+            className="flex items-center gap-2 rounded-lg border border-surface-200 bg-surface-0 px-3 py-1.5 text-xs font-medium text-ink-700 shadow-soft transition-all hover:border-accent-400 hover:shadow-medium"
+            title="Model"
           >
-            <option value="" disabled>
-              Select model…
-            </option>
-            {modelProfiles.map((p) => (
-              <option key={p.profile_id} value={p.profile_id}>
-                {p.profile_id} · {p.provider_kind}
-              </option>
-            ))}
-          </select>
-          <ChevronDown className="h-3 w-3" />
+            <Cpu className="h-3.5 w-3.5 text-accent-500" />
+            <span className="max-w-[140px] truncate">
+              {sessionMeta?.chat_profile_id
+                ? modelProfiles.find(p => p.profile_id === sessionMeta.chat_profile_id)?.profile_id || "Select model…"
+                : "Select model…"}
+            </span>
+            <ChevronDown className={`h-3 w-3 transition-transform ${dropdownOpen ? "rotate-180" : ""}`} />
+          </button>
+
+          {dropdownOpen && (
+            <div className="absolute right-0 top-full z-50 mt-1 min-w-[240px] rounded-xl border border-surface-200 bg-surface-0 py-1 shadow-large animate-fade-in">
+              {modelProfiles.map((p) => {
+                const isActive = p.profile_id === sessionMeta?.chat_profile_id;
+                return (
+                  <button
+                    key={p.profile_id}
+                    onClick={() => {
+                      onChangeChatProfile(p.profile_id);
+                      setDropdownOpen(false);
+                    }}
+                    className={`w-full px-3 py-2 text-left transition-colors hover:bg-surface-100 ${isActive ? "bg-accent-50" : ""
+                      }`}
+                  >
+                    <div className={`text-xs font-medium ${isActive ? "text-accent-700" : "text-ink-700"}`}>
+                      {p.profile_id}
+                    </div>
+                    <div className="mt-0.5 text-[10px] text-ink-400">{p.provider_kind}</div>
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </div>
         <button
           className="rounded p-1 text-ink-400 transition-colors hover:bg-surface-100 hover:text-ink-700"

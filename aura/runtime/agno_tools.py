@@ -15,6 +15,7 @@ from .tools.runtime import (
     ToolExecutionContext,
     ToolRuntime,
     _classify_tool_exception,
+    _classify_tool_result,
  )
 
 
@@ -375,20 +376,23 @@ def build_agno_toolset(
                     kind="tool_output",
                     meta={"summary": f"{planned.tool_name} output"},
                 )
-                tool_message = json.dumps(
-                    {
-                        "ok": True,
-                        "tool": planned.tool_name,
-                        "output_ref": output_ref.to_dict(),
-                        "result": raw,
-                        "remaining_tool_calls": remaining_tool_calls,
-                    },
-                    ensure_ascii=False,
-                )
+                status, ok, error_code, error = _classify_tool_result(tool_name=planned.tool_name, raw=raw)
+                tool_message_payload: dict[str, Any] = {
+                    "ok": ok,
+                    "tool": planned.tool_name,
+                    "output_ref": output_ref.to_dict(),
+                    "result": raw,
+                    "remaining_tool_calls": remaining_tool_calls,
+                }
+                if isinstance(error_code, str) and error_code.strip():
+                    tool_message_payload["error_code"] = error_code
+                if isinstance(error, str) and error.strip():
+                    tool_message_payload["error"] = error
+                tool_message = json.dumps(tool_message_payload, ensure_ascii=False)
                 tool_message_ref = artifact_store.put(
                     tool_message,
                     kind="tool_message",
-                    meta={"summary": f"{planned.tool_name} tool_result"},
+                    meta={"summary": f"{planned.tool_name} tool_result ({status})"},
                 )
 
                 emit(
@@ -399,14 +403,14 @@ def build_agno_toolset(
                         "tool_name": planned.tool_name,
                         "tool_call_id": planned.tool_call_id,
                         "summary": _summarize_tool_for_ui(planned.tool_name, planned.arguments),
-                        "status": "succeeded",
+                        "status": status,
                         "duration_ms": duration_ms,
                         "output_ref": output_ref.to_dict(),
                         "tool_message_ref": tool_message_ref.to_dict(),
                         "details": None,
                         "remaining_tool_calls": remaining_tool_calls,
-                        "error_code": None,
-                        "error": None,
+                        "error_code": error_code if status != "succeeded" else None,
+                        "error": error if status != "succeeded" else None,
                         }
                     ),
                 )

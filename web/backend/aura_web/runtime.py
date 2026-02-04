@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -149,6 +150,56 @@ class WebRuntime:
     def get_session_meta(self, *, session_id: str) -> dict[str, Any]:
         return self.session_store.get_session(session_id)
 
+    def delete_session(self, *, session_id: str) -> None:
+        sid = str(session_id or "").strip()
+        if not sid:
+            raise ValueError("session_id must be non-empty.")
+
+        # Ensure it exists first (consistent error behavior).
+        _ = self.session_store.get_session(sid)
+
+        # Drop any cached engine/locks first.
+        self._engine_cache.pop(sid, None)
+        self._session_locks.pop(sid, None)
+
+        # Remove session meta + event log (main persistence).
+        try:
+            (self.paths.sessions_dir / f"{sid}.json").unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            (self.paths.events_dir / f"{sid}.jsonl").unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        # Remove pending approvals for this session (best-effort).
+        approvals_dir = (self.paths.state_dir / "approvals").resolve()
+        if approvals_dir.is_dir():
+            for p in approvals_dir.glob("*.json"):
+                try:
+                    raw = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if isinstance(raw, dict) and str(raw.get("session_id") or "") == sid:
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+        # Remove agent-browser state files (best-effort).
+        try:
+            from aura.runtime.agent_browser import agent_browser_stream_port_file
+
+            port_file = agent_browser_stream_port_file(self.project_root, aura_session_id=sid)
+            try:
+                port_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            # The daemon also writes a per-session `.stream` file under its socket dir, but that's not
+            # workspace-local and is handled by the daemon lifecycle.
+        except Exception:
+            pass
+
     def update_session_settings(
         self,
         *,
@@ -246,4 +297,3 @@ class WebRuntime:
             eng = self._build_engine(session_id=session_id)
             self._engine_cache[session_id] = eng
         return eng
-

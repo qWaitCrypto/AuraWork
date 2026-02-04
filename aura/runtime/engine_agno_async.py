@@ -98,6 +98,7 @@ from .tools.runtime import (
     ToolExecutionContext,
     ToolRuntime,
     _classify_tool_exception,
+    _classify_tool_result,
     file_edit_ui_details,
 )
 from .prompts.template import render_prompt_template
@@ -390,33 +391,13 @@ class AgnoAsyncEngine:
         before the model produces the follow-up assistant message. Some model providers reject
         histories where the user speaks before the assistant finishes the tool turn.
 
-        Strategy: drop the last (user -> assistant tool_calls -> tool*) segment when we detect a
-        dangling tool turn at the end of the loaded history.
+        Strategy: do NOT delete history. Instead, "close" the dangling tool turn by appending
+        synthetic tool/assistant messages to make the conversation structure valid for providers.
         """
         if not self._history:
             return None
 
         history = self._history
-
-        def _truncate_from_last_user(before_index: int) -> dict[str, Any] | None:
-            for i in range(before_index, -1, -1):
-                if history[i].role is CanonicalMessageRole.USER:
-                    removed = history[i:]
-                    removed_tool_names: list[str] = []
-                    for msg in removed:
-                        if msg.role is CanonicalMessageRole.ASSISTANT and msg.tool_calls:
-                            removed_tool_names.extend([tc.name for tc in msg.tool_calls if tc and tc.name])
-                        if msg.role is CanonicalMessageRole.TOOL and msg.tool_name:
-                            removed_tool_names.append(msg.tool_name)
-                    removed_tool_names = sorted({n for n in removed_tool_names if n})
-                    self._history = history[:i]
-                    return {
-                        "type": "history_repair",
-                        "reason": "dangling_tool_turn",
-                        "removed_messages": len(removed),
-                        "removed_tool_names": removed_tool_names,
-                    }
-            return None
 
         # Case A: history ends with tool messages.
         if history[-1].role is CanonicalMessageRole.TOOL:
@@ -429,11 +410,74 @@ class AgnoAsyncEngine:
                 and history[assistant_idx].role is CanonicalMessageRole.ASSISTANT
                 and history[assistant_idx].tool_calls
             ):
-                return _truncate_from_last_user(assistant_idx - 1)
+                tool_names = sorted(
+                    {m.tool_name for m in history[first_tool_idx:] if m.role is CanonicalMessageRole.TOOL and isinstance(m.tool_name, str) and m.tool_name}
+                )
+                summary = ", ".join(tool_names[:4])
+                if len(tool_names) > 4:
+                    summary = f"{summary} (+{len(tool_names) - 4} more)"
+                note = "Recovery note: previous run ended after tool execution."
+                if summary:
+                    note = f"{note} Tool results recorded: {summary}."
+                else:
+                    note = f"{note} Tool results were recorded."
+                self._history.append(CanonicalMessage(role=CanonicalMessageRole.ASSISTANT, content=note))
+                return {
+                    "type": "history_repair",
+                    "reason": "dangling_tool_turn",
+                    "action": "append_assistant_close",
+                    "appended_messages": 1,
+                    "appended_tool_messages": 0,
+                    "tool_names": tool_names,
+                }
 
         # Case B: history ends with an assistant tool call (no tool response persisted yet).
         if history[-1].role is CanonicalMessageRole.ASSISTANT and history[-1].tool_calls:
-            return _truncate_from_last_user(len(history) - 2)
+            tool_calls = list(history[-1].tool_calls or [])
+            appended_tools = 0
+            tool_names: list[str] = []
+            for tc in tool_calls:
+                tool_call_id = getattr(tc, "tool_call_id", None)
+                tool_name = getattr(tc, "name", None)
+                if not isinstance(tool_call_id, str) or not tool_call_id:
+                    continue
+                if not isinstance(tool_name, str) or not tool_name:
+                    continue
+                tool_names.append(tool_name)
+                tool_message = json.dumps(
+                    {
+                        "ok": False,
+                        "tool": tool_name,
+                        "error_code": ErrorCode.CANCELLED.value,
+                        "error": "Interrupted before tool execution; marking as cancelled for history consistency.",
+                        "result": None,
+                    },
+                    ensure_ascii=False,
+                )
+                self._history.append(
+                    CanonicalMessage(
+                        role=CanonicalMessageRole.TOOL,
+                        content=tool_message,
+                        tool_call_id=tool_call_id,
+                        tool_name=tool_name,
+                    )
+                )
+                appended_tools += 1
+
+            tool_names_sorted = sorted({n for n in tool_names if n})
+            note = (
+                "Recovery note: previous run ended before tool results were recorded. "
+                "Pending tool calls were marked as cancelled; re-run them if still needed."
+            )
+            self._history.append(CanonicalMessage(role=CanonicalMessageRole.ASSISTANT, content=note))
+            return {
+                "type": "history_repair",
+                "reason": "dangling_tool_turn",
+                "action": "append_cancelled_tools_and_close",
+                "appended_messages": appended_tools + 1,
+                "appended_tool_messages": appended_tools,
+                "tool_names": tool_names_sorted,
+            }
 
         return None
 
@@ -1027,6 +1071,8 @@ class AgnoAsyncEngine:
                         "role": ModelRole.MAIN.value,
                         "context_ref": self._write_context_ref(request).to_dict(),
                         "profile_id": getattr(profile, "profile_id", None),
+                        "provider_kind": profile.provider_kind.value,
+                        "model": profile.model_name,
                         "timeout_s": timeout_s if timeout_s is not None else getattr(profile, "timeout_s", None),
                         "stream": use_stream,
                         "context_stats": dict(context_stats),
@@ -1555,6 +1601,8 @@ class AgnoAsyncEngine:
                 "role": ModelRole.EXTRACT.value,
                 "context_ref": self._write_context_ref(compact_request).to_dict(),
                 "profile_id": getattr(profile, "profile_id", None),
+                "provider_kind": profile.provider_kind.value,
+                "model": profile.model_name,
                 "timeout_s": timeout_s if timeout_s is not None else getattr(profile, "timeout_s", None),
                 "stream": False,
                 "run_mode": "llm_compact",
@@ -1745,7 +1793,10 @@ class AgnoAsyncEngine:
                 )
             raise RuntimeError(f"Unsupported provider_kind: {kind}")
 
-        return await asyncio.to_thread(_complete_sync)
+        resp = await asyncio.to_thread(_complete_sync)
+        if not resp.model:
+            resp = replace(resp, model=profile.model_name)
+        return resp
 
     async def _run_agent_stream(
         self,
@@ -1801,6 +1852,8 @@ class AgnoAsyncEngine:
         threading.Thread(target=_producer, name="aura-llm-stream", daemon=True).start()
 
         final: LLMResponse | None = None
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
         streamed_tool_calls: list[ToolCall] = []
         while True:
             item = await q.get()
@@ -1811,6 +1864,7 @@ class AgnoAsyncEngine:
             ev = item
             if ev.kind == LLMStreamEventKind.THINKING_DELTA:
                 if ev.thinking_delta:
+                    thinking_parts.append(ev.thinking_delta)
                     await self._emit(
                         kind=EventKind.LLM_THINKING_DELTA,
                         payload={"thinking_delta": ev.thinking_delta},
@@ -1820,6 +1874,7 @@ class AgnoAsyncEngine:
                     )
             elif ev.kind == LLMStreamEventKind.TEXT_DELTA:
                 if ev.text_delta:
+                    text_parts.append(ev.text_delta)
                     await self._emit(
                         kind=EventKind.LLM_RESPONSE_DELTA,
                         payload={"text_delta": ev.text_delta},
@@ -1838,6 +1893,15 @@ class AgnoAsyncEngine:
 
         if final is None:
             raise RuntimeError("Stream ended without a terminal response.")
+        if not final.text and text_parts:
+            final = replace(final, text="".join(text_parts))
+        if final.thinking is None and thinking_parts:
+            final = replace(final, thinking="".join(thinking_parts))
+        if not final.text and not final.tool_calls and isinstance(final.thinking, str) and final.thinking.strip():
+            # Some gateways (or misconfigured providers) stream assistant-visible text via a
+            # "reasoning/thinking" channel while leaving the main content empty.
+            # Prefer showing *something* to the user in that case.
+            final = replace(final, text=final.thinking, thinking=None)
         if streamed_tool_calls and not final.tool_calls:
             # Dedupe by (tool_call_id, name, raw_arguments).
             seen: set[tuple[str | None, str, str | None]] = set()
@@ -1849,6 +1913,8 @@ class AgnoAsyncEngine:
                 seen.add(key)
                 merged.append(tc)
             final = replace(final, tool_calls=merged)
+        if not final.model:
+            final = replace(final, model=profile.model_name)
         if trace is not None:
             try:
                 trace.record_response(final)
@@ -2156,8 +2222,23 @@ class AgnoAsyncEngine:
             kind="tool_output",
             meta={"summary": f"{planned.tool_name} output"},
         )
-        tool_message = json.dumps({"ok": True, "tool": planned.tool_name, "output_ref": output_ref.to_dict(), "result": raw}, ensure_ascii=False)
-        tool_message_ref = self.artifact_store.put(tool_message, kind="tool_message", meta={"summary": f"{planned.tool_name} tool_result"})
+        status, ok, error_code, error = _classify_tool_result(tool_name=planned.tool_name, raw=raw)
+        tool_message_payload: dict[str, Any] = {
+            "ok": ok,
+            "tool": planned.tool_name,
+            "output_ref": output_ref.to_dict(),
+            "result": raw,
+        }
+        if isinstance(error_code, str) and error_code.strip():
+            tool_message_payload["error_code"] = error_code
+        if isinstance(error, str) and error.strip():
+            tool_message_payload["error"] = error
+        tool_message = json.dumps(tool_message_payload, ensure_ascii=False)
+        tool_message_ref = self.artifact_store.put(
+            tool_message,
+            kind="tool_message",
+            meta={"summary": f"{planned.tool_name} tool_result ({status})"},
+        )
         await self._emit(
             kind=EventKind.TOOL_CALL_END,
             payload={
@@ -2165,12 +2246,12 @@ class AgnoAsyncEngine:
                 "tool_name": planned.tool_name,
                 "tool_call_id": planned.tool_call_id,
                 "summary": f"MCP: {planned.tool_name}",
-                "status": "succeeded",
+                "status": status,
                 "duration_ms": duration_ms,
                 "output_ref": output_ref.to_dict(),
                 "tool_message_ref": tool_message_ref.to_dict(),
-                "error_code": None,
-                "error": None,
+                "error_code": error_code if status != "succeeded" else None,
+                "error": error if status != "succeeded" else None,
                 "tool_kind": "mcp",
             },
             request_id=request_id,
@@ -2243,6 +2324,7 @@ class AgnoAsyncEngine:
             "provider_kind": final_response.provider_kind.value,
             "model": final_response.model,
             "output_ref": output_ref.to_dict(),
+            "final_text": assistant_text,
             "tool_calls": tool_calls_payload,
             "usage": usage,
             "context_stats": merged_stats,
@@ -2493,12 +2575,12 @@ class AgnoAsyncEngine:
                 "tool_name": planned.tool_name,
                 "tool_call_id": planned.tool_call_id,
                 "summary": _summarize_tool_for_ui(planned.tool_name, planned.arguments),
-                "status": "succeeded",
+                "status": status,
                 "duration_ms": duration_ms,
                 "output_ref": output_ref.to_dict(),
                 "tool_message_ref": tool_message_ref.to_dict(),
-                "error_code": None,
-                "error": None,
+                "error_code": error_code if status != "succeeded" else None,
+                "error": error if status != "succeeded" else None,
                 "details": details,
             },
             request_id=request_id,
@@ -2506,18 +2588,18 @@ class AgnoAsyncEngine:
             step_id=planned.tool_execution_id,
         )
 
-        if planned.tool_name in {"update_plan", "update_todo"}:
+        if planned.tool_name in {"update_plan", "update_todo", "dag__execute_next"}:
             try:
-                if planned.tool_name == "update_plan":
-                    state = self.plan_store.get()
-                    plan_type = "dag"
-                    items = state.plan
-                    explanation = state.explanation
-                    updated_at = state.updated_at
-                else:
+                if planned.tool_name == "update_todo":
                     state = self.todo_store.get()
                     plan_type = "todo"
                     items = state.todo
+                    explanation = state.explanation
+                    updated_at = state.updated_at
+                else:
+                    state = self.plan_store.get()
+                    plan_type = "dag"
+                    items = state.plan
                     explanation = state.explanation
                     updated_at = state.updated_at
                 await self._emit(
