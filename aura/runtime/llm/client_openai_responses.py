@@ -93,6 +93,7 @@ def _responses_stream_to_events(
     on_provider_chunk: callable | None = None,
 ) -> Iterator[LLMStreamEvent]:
     text_parts: list[str] = []
+    thinking_parts: list[str] = []
     tool_calls_by_output_index: dict[int, dict[str, Any]] = {}
     saw_terminal = False
 
@@ -110,6 +111,15 @@ def _responses_stream_to_events(
                     pass
 
             event_type = getattr(event, "type", None)
+            if isinstance(event_type, str) and ("reasoning" in event_type or "thinking" in event_type):
+                # Best-effort: some gateways stream a separate reasoning channel.
+                delta = getattr(event, "delta", None)
+                if delta is None:
+                    delta = getattr(event, "text", None)
+                if isinstance(delta, str) and delta:
+                    thinking_parts.append(delta)
+                    yield LLMStreamEvent(kind=LLMStreamEventKind.THINKING_DELTA, thinking_delta=delta)
+                continue
             if event_type == "response.output_text.delta":
                 delta = getattr(event, "delta", None)
                 if isinstance(delta, str) and delta:
@@ -184,6 +194,8 @@ def _responses_stream_to_events(
                 out = _responses_to_response(provider_kind=provider_kind, profile_id=profile_id, resp=resp)
                 if not out.text and text_parts:
                     out = replace(out, text="".join(text_parts))
+                if (out.thinking is None or not str(out.thinking or "").strip()) and thinking_parts:
+                    out = replace(out, thinking="".join(thinking_parts))
                 yield LLMStreamEvent(kind=LLMStreamEventKind.COMPLETED, response=out)
                 saw_terminal = True
                 return
@@ -210,5 +222,6 @@ def _responses_stream_to_events(
             usage=None,
             stop_reason="timeout" if (timeout_flag is not None and timeout_flag.is_set()) else None,
             request_id=None,
+            thinking=("".join(thinking_parts) if thinking_parts else None),
         ),
     )

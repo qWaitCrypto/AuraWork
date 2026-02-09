@@ -649,6 +649,8 @@ class ConsoleUI:
             return self._format_badge("DENIED", "33")
         if st in {"needs_approval", "require_approval"} or code in {"needs_approval", "require_approval"}:
             return self._format_badge("APPROVAL", "35")
+        if st in {"blocked", "denied"} or code in {"blocked", "denied", "permission"}:
+            return self._format_badge("BLOCKED", "33")
         if st == "cancelled" or code == "cancelled":
             return self._format_badge("CANCELLED", "33")
         if ok:

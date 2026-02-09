@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .approval import ApprovalRecord, ApprovalStatus
-from .protocol import ArtifactRef, Event, EventKind
+from .protocol import ArtifactRef, Event, EventKind, TOOL_END_STATUSES_ALL
 from .stores import FileApprovalStore
 
 
@@ -159,7 +159,16 @@ def _validate_events(events: list[Event], *, strict: bool) -> list[ValidationIss
 
         if ev.kind == EventKind.TOOL_CALL_END.value:
             status = ev.payload.get("status")
-            if status in {"failed", "denied", "cancelled"}:
+            if status is not None and str(status) not in TOOL_END_STATUSES_ALL:
+                sev = "error" if strict else "warning"
+                issues.append(
+                    ValidationIssue(
+                        sev,
+                        f"Unknown payload.status for tool_call_end: {status!r}",
+                        f"event[{idx}]",
+                    )
+                )
+            if status in {"failed", "blocked", "denied", "cancelled"}:
                 if not isinstance(ev.payload.get("error_code"), str) or not ev.payload.get("error_code"):
                     issues.append(ValidationIssue("error", "Missing payload.error_code for tool_call_end failure.", f"event[{idx}]"))
 

@@ -8,6 +8,7 @@ from .error_codes import ErrorCode
 from .ids import new_id, now_ts_ms
 from .protocol import Event
 from .protocol import EventKind
+from .protocol import EVENT_SCHEMA_VERSION
 from .stores import EventLogStore
 
 EventHandler = Callable[[Event], None]
@@ -30,9 +31,9 @@ class EventFilter:
 
 
 class EventBus:
-    def __init__(self, *, event_log_store: EventLogStore | None = None, schema_version_default: str = "0.2") -> None:
+    def __init__(self, *, event_log_store: EventLogStore | None = None, schema_version_default: str = EVENT_SCHEMA_VERSION) -> None:
         self._event_log_store = event_log_store
-        self._schema_version_default = str(schema_version_default or "").strip() or "0.2"
+        self._schema_version_default = str(schema_version_default or "").strip() or EVENT_SCHEMA_VERSION
         self._lock = threading.RLock()
         self._last_sequence_by_session: dict[str, int] = {}
         self._next_sub_id = 1

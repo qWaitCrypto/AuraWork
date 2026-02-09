@@ -688,7 +688,7 @@ def run_subagent(
                             "risk_level": inspection.risk_level,
                             "action_summary": inspection.action_summary,
                             "reason": inspection.reason,
-                            "error_code": (inspection.error_code.value if inspection.error_code is not None else None),
+                            "error_code": (inspection.error_code.value if inspection.error_code is not None else "permission"),
                         },
                         "work_spec": {
                             "goal": work_spec.goal,
@@ -719,7 +719,7 @@ def run_subagent(
                             "risk_level": inspection.risk_level,
                             "action_summary": inspection.action_summary,
                             "reason": inspection.reason,
-                            "error_code": (inspection.error_code.value if inspection.error_code is not None else None),
+                            "error_code": (inspection.error_code.value if inspection.error_code is not None else "permission"),
                         },
                         "inspection_after": {
                             "decision": updated.decision,
@@ -847,11 +847,12 @@ def run_subagent(
                     "tool_name": planned.tool_name,
                     "tool_call_id": planned.tool_call_id,
                     "summary": _summarize_tool_for_ui(planned.tool_name, planned.arguments),
-                    "status": "denied",
+                    "status": "blocked",
+                    "status_legacy": "denied",
                     "duration_ms": 0,
                     "output_ref": None,
                     "tool_message_ref": None,
-                    "error_code": (inspection.error_code.value if inspection.error_code is not None else None),
+                    "error_code": (inspection.error_code.value if inspection.error_code is not None else "permission"),
                     "error": inspection.reason or inspection.action_summary,
                 },
             )

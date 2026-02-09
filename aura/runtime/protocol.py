@@ -5,6 +5,26 @@ from enum import Enum
 from typing import Any
 
 
+EVENT_SCHEMA_VERSION = "0.2"
+
+# Normalized tool terminal statuses in event schema v0.2.
+TOOL_END_STATUSES_V02 = frozenset(
+    {
+        "running",
+        "succeeded",
+        "failed",
+        "blocked",
+        "needs_approval",
+        "cancelled",
+        "unknown",
+    }
+)
+
+# Backward-compatibility aliases still seen in historical logs.
+TOOL_END_STATUSES_LEGACY = frozenset({"denied"})
+TOOL_END_STATUSES_ALL = TOOL_END_STATUSES_V02 | TOOL_END_STATUSES_LEGACY
+
+
 class EventKind(str, Enum):
     OPERATION_STARTED = "operation_started"
     OPERATION_PROGRESS = "operation_progress"

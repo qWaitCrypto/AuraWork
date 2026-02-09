@@ -179,6 +179,6 @@ def _openai_stream_to_events(
         usage=usage,
         stop_reason=stop_reason or ("timeout" if (timeout_flag is not None and timeout_flag.is_set()) else None),
         request_id=request_id,
-        thinking=(accumulated_thinking if (tool_calls and accumulated_thinking.strip()) else None),
+        thinking=(accumulated_thinking if accumulated_thinking.strip() else None),
     )
     yield LLMStreamEvent(kind=LLMStreamEventKind.COMPLETED, response=response)

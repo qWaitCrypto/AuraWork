@@ -415,6 +415,17 @@ class ToolRuntime:
                 norm = "." + norm
             allowed_file_suffixes.add(norm)
 
+        def _work_spec_requires_skill_plan_json() -> bool:
+            # Doc/PDF/XLSX/PPTX workflows rely on an intermediate plan.json to drive the skill runner.
+            # Treat that plan file as an allowed intermediate output even when WorkSpec restricts the
+            # final deliverable file types (e.g. file_type_allowlist=["docx"]).
+            outs = work_spec.expected_outputs or []
+            for out in outs:
+                fmt = str(getattr(out, "format", "") or "").strip().lower().lstrip(".")
+                if fmt in {"docx", "pdf", "xlsx", "pptx"}:
+                    return True
+            return False
+
         def _domain_allowed(host: str) -> bool:
             host_l = host.lower().strip(".")
             for entry in domains_raw:
@@ -423,6 +434,12 @@ class ToolRuntime:
                 entry_l = entry.lower().strip().strip(".")
                 if not entry_l:
                     continue
+                if entry_l == "*":
+                    return True
+                if entry_l.startswith("*.") and len(entry_l) > 2:
+                    base = entry_l[2:]
+                    if host_l == base or host_l.endswith("." + base):
+                        return True
                 if host_l == entry_l or host_l.endswith("." + entry_l):
                     return True
             return False
@@ -474,6 +491,8 @@ class ToolRuntime:
             suffix = Path(rel).suffix.lower()
             if not suffix:
                 return False
+            if suffix == ".json" and Path(rel).name.lower() == "plan.json" and _work_spec_requires_skill_plan_json():
+                return True
             return suffix in allowed_file_suffixes
 
         target_paths: list[str] = []
@@ -1082,9 +1101,45 @@ def _classify_tool_exception(exc: BaseException) -> ErrorCode:
     return ErrorCode.UNKNOWN
 
 
+_TOOL_END_STATUS_MAP: dict[str, str] = {
+    "ok": "succeeded",
+    "success": "succeeded",
+    "succeeded": "succeeded",
+    "completed": "succeeded",
+    "done": "succeeded",
+    "error": "failed",
+    "failed": "failed",
+    "cancelled": "cancelled",
+    "canceled": "cancelled",
+    "denied": "blocked",
+    "blocked": "blocked",
+    "needs_approval": "needs_approval",
+    "require_approval": "needs_approval",
+    "requires_approval": "needs_approval",
+    "pending_approval": "needs_approval",
+    "running": "running",
+}
+
+
+def _normalize_tool_end_status(status: str | None) -> str:
+    raw = str(status or "").strip().lower()
+    if not raw:
+        return "unknown"
+    return _TOOL_END_STATUS_MAP.get(raw, "unknown")
+
+
+def _status_from_error_code(*, error_code: str | None, fallback: str = "failed") -> str:
+    code = str(error_code or "").strip().lower()
+    if code == ErrorCode.PERMISSION.value:
+        return "blocked"
+    if code == ErrorCode.APPROVAL_PENDING.value:
+        return "needs_approval"
+    return _normalize_tool_end_status(fallback)
+
+
 def _tool_result_needs_approval(raw: dict[str, Any]) -> bool:
     status = raw.get("status")
-    if isinstance(status, str) and status.strip() == "needs_approval":
+    if _normalize_tool_end_status(str(status) if isinstance(status, str) else None) == "needs_approval":
         return True
     blocked = raw.get("blocked_approval")
     if isinstance(blocked, (dict, list)) and blocked:
@@ -1097,7 +1152,7 @@ def _tool_result_needs_approval(raw: dict[str, Any]) -> bool:
         for v in node_results.values():
             if not isinstance(v, dict):
                 continue
-            if str(v.get("status") or "") == "needs_approval":
+            if _normalize_tool_end_status(str(v.get("status") or "")) == "needs_approval":
                 return True
     return False
 
@@ -1175,7 +1230,8 @@ def _classify_tool_result(*, tool_name: str, raw: Any) -> tuple[str, bool, str |
             elif "timeout" in msg_l or "timed out" in msg_l:
                 code = ErrorCode.TIMEOUT.value
 
-        return ("failed", False, code, msg_s)
+        status = _status_from_error_code(error_code=code, fallback="failed")
+        return (status, False, code, msg_s)
 
     # No `ok` field: treat as success.
     return ("succeeded", True, None, None)

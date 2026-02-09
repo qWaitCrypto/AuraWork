@@ -16,6 +16,7 @@ from .tools.runtime import (
     ToolRuntime,
     _classify_tool_exception,
     _classify_tool_result,
+    _normalize_tool_end_status,
  )
 
 
@@ -139,7 +140,8 @@ def build_agno_toolset(
                 inspection = tool_runtime.inspect(planned)
                 if inspection.decision is InspectionDecision.DENY:
                     remaining_tool_calls = _consume_tool_call_budget()
-                    error_code = inspection.error_code.value if inspection.error_code is not None else None
+                    error_code = inspection.error_code.value if inspection.error_code is not None else "permission"
+                    status = _normalize_tool_end_status("blocked")
                     error_message = inspection.reason or inspection.action_summary or f"Tool call denied: {planned.tool_name}"
                     output_ref = artifact_store.put(
                         json.dumps(
@@ -155,7 +157,7 @@ def build_agno_toolset(
                             indent=2,
                         ),
                         kind="tool_output",
-                        meta={"summary": f"{planned.tool_name} output (denied)"},
+                        meta={"summary": f"{planned.tool_name} output ({status})"},
                     )
                     tool_message = json.dumps(
                         {
@@ -172,25 +174,25 @@ def build_agno_toolset(
                     tool_message_ref = artifact_store.put(
                         tool_message,
                         kind="tool_message",
-                        meta={"summary": f"{planned.tool_name} tool_result (denied)"},
+                        meta={"summary": f"{planned.tool_name} tool_result ({status})"},
                     )
+                    payload = {
+                        "tool_execution_id": planned.tool_execution_id,
+                        "tool_name": planned.tool_name,
+                        "tool_call_id": planned.tool_call_id,
+                        "summary": _summarize_tool_for_ui(planned.tool_name, planned.arguments),
+                        "status": status,
+                        "status_legacy": "denied",
+                        "duration_ms": 0,
+                        "output_ref": output_ref.to_dict(),
+                        "tool_message_ref": tool_message_ref.to_dict(),
+                        "remaining_tool_calls": remaining_tool_calls,
+                        "error_code": error_code,
+                        "error": error_message,
+                    }
                     emit(
                         kind=EventKind.TOOL_CALL_END,
-                        payload=_with_subagent_meta(
-                            {
-                            "tool_execution_id": planned.tool_execution_id,
-                            "tool_name": planned.tool_name,
-                            "tool_call_id": planned.tool_call_id,
-                            "summary": _summarize_tool_for_ui(planned.tool_name, planned.arguments),
-                            "status": "denied",
-                            "duration_ms": 0,
-                            "output_ref": output_ref.to_dict(),
-                            "tool_message_ref": tool_message_ref.to_dict(),
-                            "remaining_tool_calls": remaining_tool_calls,
-                            "error_code": error_code,
-                            "error": error_message,
-                            }
-                        ),
+                        payload=_with_subagent_meta(payload),
                     )
                     append_history(
                         CanonicalMessage(

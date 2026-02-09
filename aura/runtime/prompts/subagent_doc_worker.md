@@ -27,6 +27,7 @@ Notes:
 1) Call `skill__load` to load `aura-docx` (DocWorker is only allowed to use `aura-docx` / `aura-pdf`). Use the returned `skill.skill_root` as a **project-relative path** (e.g., `.aura/skills/aura-docx`).
 2) Write `plan.json` following `aura-docx`'s `SKILL.md` (use `project__apply_edits` to write to `{{PLAN_JSON_PATH}}`; directories will be created automatically; no `mkdir` needed).
    - If you need to rewrite/update the same plan file: use `project__apply_edits(overwrite=true)`; do not switch to a different path.
+   - `plan.json` MUST be strict JSON (no trailing commas). JSON strings MUST NOT contain literal newlines/tabs; use `\\n`/`\\t` escapes or split into multiple operations (e.g., multiple `add_paragraph` ops).
 3) Run via `shell__run` (example; build the path using the `skill_root` you obtained; do not `cd` outside the project, and do not use absolute engine-source paths):
    - `python "<skill_root>/scripts/run.py" input.docx "{{PLAN_JSON_PATH}}" --out "<OUTPUT_PATH>" --artifacts-dir "{{RUN_ARTIFACTS_DIR}}"`
    - Notes:

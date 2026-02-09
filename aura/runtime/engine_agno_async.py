@@ -28,7 +28,7 @@ from .llm.client_exec_anthropic import complete_anthropic, stream_anthropic
 from .llm.client_exec_openai_codex import complete_openai_codex, stream_openai_codex
 from .llm.client_exec_gemini import complete_gemini, stream_gemini
 from .llm.client_exec_openai_compatible import complete_openai_compatible, stream_openai_compatible
-from .llm.errors import CancellationToken, LLMRequestError, ModelResolutionError
+from .llm.errors import CancellationToken, LLMRequestError, ModelResolutionError, wrap_provider_exception
 from .llm.router import ModelRouter
 from .llm.trace import LLMTrace
 from .llm.types import (
@@ -52,7 +52,7 @@ from .orchestrator_helpers import (
     _tool_calls_from_payload,
 )
 from .plan import PlanStore, TodoStore
-from .protocol import ArtifactRef, Event, EventKind, Op, OpKind
+from .protocol import EVENT_SCHEMA_VERSION, ArtifactRef, Event, EventKind, Op, OpKind
 from .run_snapshots import PendingToolCall as SnapshotPendingToolCall
 from .run_snapshots import RunSnapshot, delete_run_snapshot, read_run_snapshot, write_run_snapshot
 from .skills import SkillStore
@@ -99,6 +99,8 @@ from .tools.runtime import (
     ToolRuntime,
     _classify_tool_exception,
     _classify_tool_result,
+    _normalize_tool_end_status,
+    _status_from_error_code,
     file_edit_ui_details,
 )
 from .prompts.template import render_prompt_template
@@ -198,7 +200,7 @@ class AgnoAsyncEngine:
     tool_registry: ToolRegistry | None = None
     tool_runtime: ToolRuntime | None = None
     memory_summary: str | None = None
-    schema_version: str = "0.2"
+    schema_version: str = EVENT_SCHEMA_VERSION
 
     model_router: ModelRouter = field(init=False)
     skill_store: SkillStore = field(init=False)
@@ -1792,7 +1794,18 @@ class AgnoAsyncEngine:
                 )
             raise RuntimeError(f"Unsupported provider_kind: {kind}")
 
-        resp = await asyncio.to_thread(_complete_sync)
+        try:
+            resp = await asyncio.to_thread(_complete_sync)
+        except LLMRequestError:
+            raise
+        except Exception as e:
+            raise wrap_provider_exception(
+                e,
+                provider_kind=profile.provider_kind,
+                profile_id=profile.profile_id,
+                model=profile.model_name,
+                operation="complete",
+            ) from e
         if not resp.model:
             resp = replace(resp, model=profile.model_name)
         return resp
@@ -1859,7 +1872,15 @@ class AgnoAsyncEngine:
             if item is None:
                 break
             if isinstance(item, BaseException):
-                raise item
+                if isinstance(item, LLMRequestError):
+                    raise item
+                raise wrap_provider_exception(
+                    item,
+                    provider_kind=profile.provider_kind,
+                    profile_id=profile.profile_id,
+                    model=profile.model_name,
+                    operation="stream",
+                ) from item
             ev = item
             if ev.kind == LLMStreamEventKind.THINKING_DELTA:
                 if ev.thinking_delta:
@@ -1896,11 +1917,6 @@ class AgnoAsyncEngine:
             final = replace(final, text="".join(text_parts))
         if final.thinking is None and thinking_parts:
             final = replace(final, thinking="".join(thinking_parts))
-        if not final.text and not final.tool_calls and isinstance(final.thinking, str) and final.thinking.strip():
-            # Some gateways (or misconfigured providers) stream assistant-visible text via a
-            # "reasoning/thinking" channel while leaving the main content empty.
-            # Prefer showing *something* to the user in that case.
-            final = replace(final, text=final.thinking, thinking=None)
         if streamed_tool_calls and not final.tool_calls:
             # Dedupe by (tool_call_id, name, raw_arguments).
             seen: set[tuple[str | None, str, str | None]] = set()
@@ -2295,11 +2311,19 @@ class AgnoAsyncEngine:
             )
 
         assistant_text = final_response.text
+        thinking_text = final_response.thinking
+        thinking_ref = None
         output_ref = self.artifact_store.put(
             assistant_text,
             kind="chat_assistant",
             meta={"summary": _summarize_text(assistant_text)},
         )
+        if isinstance(thinking_text, str) and thinking_text.strip():
+            thinking_ref = self.artifact_store.put(
+                thinking_text,
+                kind="llm_thinking",
+                meta={"summary": _summarize_text(thinking_text)},
+            )
         thought_signatures: dict[str, str] = {}
         for tc in final_response.tool_calls or []:
             tcid = tc.tool_call_id
@@ -2323,6 +2347,7 @@ class AgnoAsyncEngine:
             "provider_kind": final_response.provider_kind.value,
             "model": final_response.model,
             "output_ref": output_ref.to_dict(),
+            "thinking_ref": (thinking_ref.to_dict() if thinking_ref is not None else None),
             "final_text": assistant_text,
             "tool_calls": tool_calls_payload,
             "usage": usage,
@@ -2441,7 +2466,7 @@ class AgnoAsyncEngine:
         )
 
         snapshot = RunSnapshot(
-            schema_version="0.2",
+            schema_version=EVENT_SCHEMA_VERSION,
             run_id=request_id,
             session_id=self.session_id,
             model_profile_id=model_profile_id,
@@ -2555,8 +2580,23 @@ class AgnoAsyncEngine:
             kind="tool_output",
             meta={"summary": f"{planned.tool_name} output"},
         )
-        tool_message = json.dumps({"ok": True, "tool": planned.tool_name, "output_ref": output_ref.to_dict(), "result": raw}, ensure_ascii=False)
-        tool_message_ref = self.artifact_store.put(tool_message, kind="tool_message", meta={"summary": f"{planned.tool_name} tool_result"})
+        status, ok, error_code, error = _classify_tool_result(tool_name=planned.tool_name, raw=raw)
+        tool_message_payload: dict[str, Any] = {
+            "ok": ok,
+            "tool": planned.tool_name,
+            "output_ref": output_ref.to_dict(),
+            "result": raw,
+        }
+        if isinstance(error_code, str) and error_code.strip():
+            tool_message_payload["error_code"] = error_code
+        if isinstance(error, str) and error.strip():
+            tool_message_payload["error"] = error
+        tool_message = json.dumps(tool_message_payload, ensure_ascii=False)
+        tool_message_ref = self.artifact_store.put(
+            tool_message,
+            kind="tool_message",
+            meta={"summary": f"{planned.tool_name} tool_result ({status})"},
+        )
 
         details = None
         if planned.tool_name in {"project__apply_edits", "project__apply_patch", "project__patch"} and isinstance(raw, dict):
@@ -2633,7 +2673,7 @@ class AgnoAsyncEngine:
             turn_id=turn_id,
             error_code=error_code,
             error_message=str(error_message),
-            status="denied",
+            status="blocked",
         )
 
     async def _tool_result_denied_by_user(
@@ -2671,29 +2711,36 @@ class AgnoAsyncEngine:
         error_message: str,
         status: str = "failed",
     ) -> str:
+        normalized_status = _normalize_tool_end_status(status)
+        if normalized_status == "unknown":
+            normalized_status = _status_from_error_code(error_code=error_code, fallback="failed")
         output_ref = self.artifact_store.put(
             json.dumps({"ok": False, "tool": planned.tool_name, "error_code": error_code, "error": error_message}, ensure_ascii=False, sort_keys=True, indent=2),
             kind="tool_output",
-            meta={"summary": f"{planned.tool_name} output ({status})"},
+            meta={"summary": f"{planned.tool_name} output ({normalized_status})"},
         )
         tool_message = json.dumps(
             {"ok": False, "tool": planned.tool_name, "output_ref": output_ref.to_dict(), "error_code": error_code, "error": error_message, "result": None},
             ensure_ascii=False,
         )
-        tool_message_ref = self.artifact_store.put(tool_message, kind="tool_message", meta={"summary": f"{planned.tool_name} tool_result ({status})"})
+        tool_message_ref = self.artifact_store.put(tool_message, kind="tool_message", meta={"summary": f"{planned.tool_name} tool_result ({normalized_status})"})
+        payload: dict[str, Any] = {
+            "tool_execution_id": planned.tool_execution_id,
+            "tool_name": planned.tool_name,
+            "tool_call_id": planned.tool_call_id,
+            "status": normalized_status,
+            "duration_ms": 0,
+            "output_ref": output_ref.to_dict(),
+            "tool_message_ref": tool_message_ref.to_dict(),
+            "error_code": error_code,
+            "error": error_message,
+        }
+        raw_status = str(status or "").strip()
+        if raw_status and raw_status.lower() != normalized_status:
+            payload["status_legacy"] = raw_status
         await self._emit(
             kind=EventKind.TOOL_CALL_END,
-            payload={
-                "tool_execution_id": planned.tool_execution_id,
-                "tool_name": planned.tool_name,
-                "tool_call_id": planned.tool_call_id,
-                "status": status,
-                "duration_ms": 0,
-                "output_ref": output_ref.to_dict(),
-                "tool_message_ref": tool_message_ref.to_dict(),
-                "error_code": error_code,
-                "error": error_message,
-            },
+            payload=payload,
             request_id=request_id,
             turn_id=turn_id,
             step_id=planned.tool_execution_id,

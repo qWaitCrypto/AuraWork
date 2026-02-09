@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from difflib import unified_diff
 from pathlib import Path
@@ -52,6 +53,77 @@ def _ensure_trailing_newline(text: str) -> str:
     if text.endswith("\n"):
         return text
     return text + "\n"
+
+
+def _is_plan_json_path(rel_path: str) -> bool:
+    p = Path(rel_path or "")
+    return p.suffix.lower() == ".json" and p.name.lower() == "plan.json"
+
+
+def _escape_unescaped_newlines_in_json_strings(text: str) -> str:
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if not in_string:
+            if ch == '"':
+                in_string = True
+            out.append(ch)
+            continue
+
+        if escaped:
+            escaped = False
+            out.append(ch)
+            continue
+
+        if ch == "\\":
+            escaped = True
+            out.append(ch)
+            continue
+
+        if ch == '"':
+            in_string = False
+            out.append(ch)
+            continue
+
+        if ch == "\n":
+            out.append("\\n")
+            continue
+        if ch == "\r":
+            out.append("\\r")
+            continue
+        if ch == "\t":
+            out.append("\\t")
+            continue
+
+        out.append(ch)
+
+    return "".join(out)
+
+
+def _ensure_valid_json_if_plan_file(*, rel_path: str, content: str) -> str:
+    if not _is_plan_json_path(rel_path):
+        return content
+    stripped = content.strip()
+    if not stripped:
+        return content
+    if stripped[0] not in "{[":
+        return content
+    try:
+        json.loads(stripped)
+        return content
+    except json.JSONDecodeError as e:
+        repaired = _escape_unescaped_newlines_in_json_strings(content)
+        if repaired != content:
+            try:
+                json.loads(repaired.strip())
+                return repaired
+            except json.JSONDecodeError:
+                pass
+        raise ValueError(
+            f"Invalid JSON in {rel_path}: {e.msg} (line {e.lineno}, col {e.colno}). "
+            "JSON strings must not contain literal newlines; use \\\\n or split into multiple operations."
+        ) from e
 
 
 def _split_lines_no_trailing_empty(text: str) -> list[str]:
@@ -566,7 +638,9 @@ class ProjectApplyEditsTool:
                         raise ValueError(f"expected_sha256 provided but file does not exist: {path}")
                     baseline.setdefault(path, "")
 
-                _set_current(path, _ensure_trailing_newline(content))
+                next_content = _ensure_trailing_newline(content)
+                next_content = _ensure_valid_json_if_plan_file(rel_path=path, content=next_content)
+                _set_current(path, next_content)
                 _mark_changed(path)
                 continue
 
@@ -637,6 +711,7 @@ class ProjectApplyEditsTool:
                     )
 
                 new = derive_new_contents_from_chunks(old, chunks, path_for_errors=path)
+                new = _ensure_valid_json_if_plan_file(rel_path=path, content=new)
 
                 if move_to and move_to != path:
                     _resolve_in_project(project_root, move_to)

@@ -8,7 +8,7 @@ from typing import Any, Iterator
 
 from ..approval import ApprovalRecord, ApprovalStatus
 from ..ids import new_id, now_ts_ms
-from ..protocol import ArtifactRef, Event
+from ..protocol import ArtifactRef, EVENT_SCHEMA_VERSION, Event
 from .base import ApprovalStore, ArtifactStore, EventLogStore, SessionStore
 
 
@@ -167,6 +167,7 @@ class FileEventLogStore(EventLogStore):
         if not path.exists():
             return iter(())
         seen_anchor = since_event_id is None
+        last_seq = 0
         with path.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -177,6 +178,37 @@ class FileEventLogStore(EventLogStore):
                 except json.JSONDecodeError:
                     continue
                 event = Event.from_dict(raw)
+                seq = event.sequence
+                if not isinstance(seq, int) or seq <= last_seq:
+                    seq = last_seq + 1
+                    event = Event(
+                        kind=event.kind,
+                        payload=event.payload,
+                        session_id=event.session_id,
+                        event_id=event.event_id,
+                        timestamp=event.timestamp,
+                        sequence=seq,
+                        request_id=event.request_id,
+                        turn_id=event.turn_id,
+                        step_id=event.step_id,
+                        schema_version=event.schema_version,
+                    )
+                schema_version = event.schema_version
+                if schema_version is None or not str(schema_version).strip():
+                    schema_version = EVENT_SCHEMA_VERSION
+                    event = Event(
+                        kind=event.kind,
+                        payload=event.payload,
+                        session_id=event.session_id,
+                        event_id=event.event_id,
+                        timestamp=event.timestamp,
+                        sequence=event.sequence,
+                        request_id=event.request_id,
+                        turn_id=event.turn_id,
+                        step_id=event.step_id,
+                        schema_version=schema_version,
+                    )
+                last_seq = int(event.sequence) if isinstance(event.sequence, int) else last_seq
                 if not seen_anchor:
                     if event.event_id == since_event_id:
                         seen_anchor = True

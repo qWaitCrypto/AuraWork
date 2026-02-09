@@ -64,12 +64,16 @@ def _finalize_response_from_stream_events(
     """
 
     text_parts: list[str] = []
+    thinking_parts: list[str] = []
     tool_calls: list[ToolCall] = []
     final: LLMResponse | None = None
 
     for ev in events:
         if ev.kind is LLMStreamEventKind.TEXT_DELTA and isinstance(ev.text_delta, str) and ev.text_delta:
             text_parts.append(ev.text_delta)
+            continue
+        if ev.kind is LLMStreamEventKind.THINKING_DELTA and isinstance(ev.thinking_delta, str) and ev.thinking_delta:
+            thinking_parts.append(ev.thinking_delta)
             continue
         if ev.kind is LLMStreamEventKind.TOOL_CALL and ev.tool_call is not None:
             tool_calls.append(ev.tool_call)
@@ -79,6 +83,7 @@ def _finalize_response_from_stream_events(
             continue
 
     merged_text = "".join(text_parts)
+    merged_thinking = "".join(thinking_parts)
     merged_tool_calls = _dedupe_tool_calls(tool_calls)
 
     if final is None:
@@ -91,11 +96,13 @@ def _finalize_response_from_stream_events(
             usage=None,
             stop_reason="eof",
             request_id=None,
+            thinking=(merged_thinking if merged_thinking else None),
         )
 
     return replace(
         final,
         text=(final.text if final.text else merged_text),
+        thinking=(final.thinking if (isinstance(final.thinking, str) and final.thinking.strip()) else (merged_thinking if merged_thinking else None)),
         tool_calls=(_dedupe_tool_calls([*(final.tool_calls or []), *merged_tool_calls]) if merged_tool_calls else final.tool_calls),
     )
 
@@ -233,6 +240,7 @@ def _responses_sse_dicts_to_events(
     import json as _json
 
     text_parts: list[str] = []
+    thinking_parts: list[str] = []
     tool_calls_by_output_index: dict[int, dict[str, Any]] = {}
     saw_terminal = False
 
@@ -259,6 +267,13 @@ def _responses_sse_dicts_to_events(
         if event_type is None and isinstance(ev.get("output"), list):
             # Some gateways may stream only the final response object.
             event_type = "response.completed"
+
+        if isinstance(event_type, str) and ("reasoning" in event_type or "thinking" in event_type):
+            delta = _coerce_text(ev.get("delta")) or _coerce_text(ev.get("text"))
+            if isinstance(delta, str) and delta:
+                thinking_parts.append(delta)
+                yield LLMStreamEvent(kind=LLMStreamEventKind.THINKING_DELTA, thinking_delta=delta)
+            continue
 
         if event_type == "response.output_text.delta":
             delta = _coerce_text(ev.get("delta"))
@@ -339,6 +354,8 @@ def _responses_sse_dicts_to_events(
             )
             if not out.text and text_parts:
                 out = replace(out, text="".join(text_parts))
+            if (out.thinking is None or not str(out.thinking or "").strip()) and thinking_parts:
+                out = replace(out, thinking="".join(thinking_parts))
             yield LLMStreamEvent(kind=LLMStreamEventKind.COMPLETED, response=out)
             saw_terminal = True
             return
@@ -358,6 +375,7 @@ def _responses_sse_dicts_to_events(
             usage=None,
             stop_reason="eof",
             request_id=None,
+            thinking=("".join(thinking_parts) if thinking_parts else None),
         ),
     )
 
@@ -829,14 +847,14 @@ def complete_openai_codex(
                         pass
                 try:
                     raw_stream = client.responses.create(**fallback_payload, stream=True, timeout=request_timeout_s)
-                except openai.OpenAIError:
+                except openai.OpenAIError as e2:
                     raise wrap_provider_exception(
-                        e,
+                        e2,
                         provider_kind=profile.provider_kind,
                         profile_id=profile.profile_id,
                         model=profile.model_name,
                         operation="complete",
-                    ) from e
+                    ) from e2
             else:
                 raise wrap_provider_exception(
                     e,
@@ -861,6 +879,7 @@ def complete_openai_codex(
         final: LLMResponse | None = None
         tool_calls: list[ToolCall] = []
         text_parts: list[str] = []
+        thinking_parts: list[str] = []
         try:
             for ev in _responses_stream_to_events(
                 provider_kind=ProviderKind.OPENAI_CODEX,
@@ -872,6 +891,8 @@ def complete_openai_codex(
                     trace.record_stream_event(ev)
                 if ev.kind is LLMStreamEventKind.TEXT_DELTA and isinstance(ev.text_delta, str) and ev.text_delta:
                     text_parts.append(ev.text_delta)
+                if ev.kind is LLMStreamEventKind.THINKING_DELTA and isinstance(ev.thinking_delta, str) and ev.thinking_delta:
+                    thinking_parts.append(ev.thinking_delta)
                 if ev.kind is LLMStreamEventKind.TOOL_CALL and ev.tool_call is not None:
                     tool_calls.append(ev.tool_call)
                 if ev.kind is not None and ev.kind.value == "completed":
@@ -932,6 +953,7 @@ def complete_openai_codex(
         return replace(
             final,
             text=(final.text if final.text else "".join(text_parts)),
+            thinking=(final.thinking if (isinstance(final.thinking, str) and final.thinking.strip()) else ("".join(thinking_parts) if thinking_parts else None)),
             tool_calls=(_dedupe_tool_calls([*(final.tool_calls or []), *merged_tool_calls]) if merged_tool_calls else final.tool_calls),
         )
 
@@ -1038,7 +1060,63 @@ def stream_openai_codex(
                     timeout_s=request_timeout_s,
                     payload=payload,
                 )
-            raw_stream = client.chat.completions.create(**payload, stream=True, timeout=request_timeout_s)
+            try:
+                raw_stream = client.chat.completions.create(**payload, timeout=request_timeout_s)
+            except openai.PermissionDeniedError as e:
+                if _should_retry_blocked_without_tools(request=request):
+                    fallback_req = _blocked_fallback_request(request)
+                    fallback_payload = OpenAICompatibleAdapter().prepare_request(
+                        replace(profile, provider_kind=ProviderKind.OPENAI_COMPATIBLE), fallback_req
+                    ).json
+                    fallback_payload["stream"] = True
+                    if trace is not None:
+                        try:
+                            trace.write_json(
+                                "prepared_request_fallback.json",
+                                {
+                                    "reason": "permission_blocked",
+                                    "strategy": "minimal_instructions_no_tools",
+                                    "endpoint": "chat.completions",
+                                    "payload": fallback_payload,
+                                },
+                            )
+                            trace.record_meta(fallback="permission_blocked:minimal_instructions_no_tools:chat_completions")
+                        except Exception:
+                            pass
+                    try:
+                        raw_stream = client.chat.completions.create(**fallback_payload, timeout=request_timeout_s)
+                    except Exception as e2:
+                        raise wrap_provider_exception(
+                            e2,
+                            provider_kind=profile.provider_kind,
+                            profile_id=profile.profile_id,
+                            model=profile.model_name,
+                            operation="stream",
+                        ) from e2
+                else:
+                    raise wrap_provider_exception(
+                        e,
+                        provider_kind=profile.provider_kind,
+                        profile_id=profile.profile_id,
+                        model=profile.model_name,
+                        operation="stream",
+                    ) from e
+            except openai.OpenAIError as e:
+                raise wrap_provider_exception(
+                    e,
+                    provider_kind=profile.provider_kind,
+                    profile_id=profile.profile_id,
+                    model=profile.model_name,
+                    operation="stream",
+                ) from e
+            except Exception as e:
+                raise wrap_provider_exception(
+                    e,
+                    provider_kind=profile.provider_kind,
+                    profile_id=profile.profile_id,
+                    model=profile.model_name,
+                    operation="stream",
+                ) from e
 
             stop_closer = _start_cancel_closer(cancel, raw_stream)
             wd_stop, wd_timed_out, wd_tick, wd_phase = _start_stream_idle_watchdog(
@@ -1387,8 +1465,55 @@ def stream_openai_codex(
             payload=payload,
         )
     try:
-        raw_stream = client.chat.completions.create(**payload, stream=True, timeout=request_timeout_s)
+        raw_stream = client.chat.completions.create(**payload, timeout=request_timeout_s)
+    except openai.PermissionDeniedError as e:
+        if _should_retry_blocked_without_tools(request=request):
+            fallback_req = _blocked_fallback_request(request)
+            fallback_payload = OpenAICompatibleAdapter().prepare_request(
+                replace(profile, provider_kind=ProviderKind.OPENAI_COMPATIBLE), fallback_req
+            ).json
+            fallback_payload["stream"] = True
+            if trace is not None:
+                try:
+                    trace.write_json(
+                        "prepared_request_fallback.json",
+                        {
+                            "reason": "permission_blocked",
+                            "strategy": "minimal_instructions_no_tools",
+                            "endpoint": "chat.completions",
+                            "payload": fallback_payload,
+                        },
+                    )
+                    trace.record_meta(fallback="permission_blocked:minimal_instructions_no_tools:chat_completions")
+                except Exception:
+                    pass
+            try:
+                raw_stream = client.chat.completions.create(**fallback_payload, timeout=request_timeout_s)
+            except Exception as e2:
+                raise wrap_provider_exception(
+                    e2,
+                    provider_kind=profile.provider_kind,
+                    profile_id=profile.profile_id,
+                    model=profile.model_name,
+                    operation="stream",
+                ) from e2
+        else:
+            raise wrap_provider_exception(
+                e,
+                provider_kind=profile.provider_kind,
+                profile_id=profile.profile_id,
+                model=profile.model_name,
+                operation="stream",
+            ) from e
     except openai.OpenAIError as e:
+        raise wrap_provider_exception(
+            e,
+            provider_kind=profile.provider_kind,
+            profile_id=profile.profile_id,
+            model=profile.model_name,
+            operation="stream",
+        ) from e
+    except Exception as e:
         raise wrap_provider_exception(
             e,
             provider_kind=profile.provider_kind,

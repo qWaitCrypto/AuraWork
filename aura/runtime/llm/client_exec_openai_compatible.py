@@ -133,6 +133,14 @@ def complete_openai_compatible(
             details={"operation": "complete"},
             cause=e,
         ) from e
+    except Exception as e:
+        raise wrap_provider_exception(
+            e,
+            provider_kind=profile.provider_kind,
+            profile_id=profile.profile_id,
+            model=profile.model_name,
+            operation="complete",
+        ) from e
     if trace is not None:
         trace.write_json("provider_response.json", resp)
     return _openai_to_response(profile_id=profile.profile_id, resp=resp)
@@ -183,6 +191,7 @@ def stream_openai_compatible(
         ) from e
     client = OpenAI(api_key=api_key, base_url=profile.base_url, max_retries=0)
     payload = OpenAICompatibleAdapter().prepare_request(profile, request).json
+    payload["stream"] = True
     request_timeout_s = timeout_s if timeout_s is not None else profile.timeout_s
 
     added_stream_usage = False
@@ -219,9 +228,9 @@ def stream_openai_compatible(
             timeout_arg = float(request_timeout_s)
     try:
         if timeout_arg is not None:
-            raw_stream = client.chat.completions.create(**payload, stream=True, timeout=timeout_arg)
+            raw_stream = client.chat.completions.create(**payload, timeout=timeout_arg)
         else:
-            raw_stream = client.chat.completions.create(**payload, stream=True)
+            raw_stream = client.chat.completions.create(**payload)
     except openai.OpenAIError as e:
         status_code = getattr(e, "status_code", None)
         if added_stream_usage and status_code == 400 and ("stream_options" in str(e) or "include_usage" in str(e)):
@@ -233,9 +242,9 @@ def stream_openai_compatible(
                 trace.record_meta(stream_include_usage_rejected=True)
             try:
                 if timeout_arg is not None:
-                    raw_stream = client.chat.completions.create(**payload, stream=True, timeout=timeout_arg)
+                    raw_stream = client.chat.completions.create(**payload, timeout=timeout_arg)
                 else:
-                    raw_stream = client.chat.completions.create(**payload, stream=True)
+                    raw_stream = client.chat.completions.create(**payload)
             except openai.OpenAIError as e2:
                 raise wrap_provider_exception(
                     e2,
@@ -262,6 +271,14 @@ def stream_openai_compatible(
             retryable=False,
             details={"operation": "stream"},
             cause=e,
+        ) from e
+    except Exception as e:
+        raise wrap_provider_exception(
+            e,
+            provider_kind=profile.provider_kind,
+            profile_id=profile.profile_id,
+            model=profile.model_name,
+            operation="stream",
         ) from e
 
     stop_closer = _start_cancel_closer(cancel, raw_stream)
