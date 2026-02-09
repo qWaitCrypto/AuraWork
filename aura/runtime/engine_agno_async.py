@@ -1010,7 +1010,7 @@ class AgnoAsyncEngine:
                         ],
                     )
 
-                for planned in pending_planned:
+                for idx, planned in enumerate(pending_planned):
                     inspection = self._inspect_tool(planned=planned, mcp_functions=mcp_functions)
                     tool_message = await self._execute_planned_after_decisions(
                         planned=planned,
@@ -1028,6 +1028,43 @@ class AgnoAsyncEngine:
                             tool_name=planned.tool_name,
                         )
                     )
+                    # Fail-fast: if a tool call failed/blocked/cancelled, do not execute the rest of the tool calls
+                    # from the same assistant turn. Instead, close them out as cancelled so provider adapters always
+                    # have a 1:1 tool_call -> tool_result pairing.
+                    try:
+                        msg = json.loads(tool_message)
+                    except Exception:
+                        msg = None
+                    if isinstance(msg, dict) and msg.get("ok") is False:
+                        prev_tool = planned.tool_name
+                        prev_code = msg.get("error_code") if isinstance(msg.get("error_code"), str) else None
+                        prev_err = msg.get("error") if isinstance(msg.get("error"), str) else None
+                        reason = f"Skipped because a previous tool call failed: {prev_tool}"
+                        if prev_code:
+                            reason = f"{reason} ({prev_code})"
+                        if prev_err:
+                            reason = f"{reason}: {prev_err}"
+                        if len(reason) > 400:
+                            reason = reason[:399].rstrip() + "…"
+
+                        for remaining in pending_planned[idx + 1 :]:
+                            skipped_message = await self._tool_result_error(
+                                planned=remaining,
+                                request_id=request_id,
+                                turn_id=turn_id,
+                                error_code=ErrorCode.CANCELLED.value,
+                                error_message=reason,
+                                status="cancelled",
+                            )
+                            self._history.append(
+                                CanonicalMessage(
+                                    role=CanonicalMessageRole.TOOL,
+                                    content=skipped_message,
+                                    tool_call_id=remaining.tool_call_id,
+                                    tool_name=remaining.tool_name,
+                                )
+                            )
+                        break
 
                 # If the user denied an approval and provided guidance ("Tell assistant what to do differently"),
                 # surface it as a user message *after* the tool responses so providers keep tool-call pairing valid.
@@ -1228,7 +1265,7 @@ class AgnoAsyncEngine:
                         ],
                     )
 
-                for planned in planned_calls:
+                for idx, planned in enumerate(planned_calls):
                     inspection = self._inspect_tool(planned=planned, mcp_functions=mcp_functions)
                     tool_message = await self._execute_planned_after_decisions(
                         planned=planned,
@@ -1474,9 +1511,46 @@ class AgnoAsyncEngine:
                                     pending_tools=[
                                         PendingToolCall(tool_call_id=p.tool_call_id, tool_name=p.tool_name, args=dict(p.arguments))
                                         for p in pending_planned
-                                    ],
-                                    error="DAG requested approval.",
+	                                    ],
+	                                    error="DAG requested approval.",
+	                                )
+
+                    # Fail-fast: stop executing further tool calls from the same assistant message after a failure.
+                    # Close remaining tool calls as cancelled to keep tool-call pairing valid across providers.
+                    try:
+                        msg = json.loads(tool_message)
+                    except Exception:
+                        msg = None
+                    if isinstance(msg, dict) and msg.get("ok") is False:
+                        prev_tool = planned.tool_name
+                        prev_code = msg.get("error_code") if isinstance(msg.get("error_code"), str) else None
+                        prev_err = msg.get("error") if isinstance(msg.get("error"), str) else None
+                        reason = f"Skipped because a previous tool call failed: {prev_tool}"
+                        if prev_code:
+                            reason = f"{reason} ({prev_code})"
+                        if prev_err:
+                            reason = f"{reason}: {prev_err}"
+                        if len(reason) > 400:
+                            reason = reason[:399].rstrip() + "…"
+
+                        for remaining in planned_calls[idx + 1 :]:
+                            skipped_message = await self._tool_result_error(
+                                planned=remaining,
+                                request_id=request_id,
+                                turn_id=turn_id,
+                                error_code=ErrorCode.CANCELLED.value,
+                                error_message=reason,
+                                status="cancelled",
+                            )
+                            self._history.append(
+                                CanonicalMessage(
+                                    role=CanonicalMessageRole.TOOL,
+                                    content=skipped_message,
+                                    tool_call_id=remaining.tool_call_id,
+                                    tool_name=remaining.tool_name,
                                 )
+                            )
+                        break
 
                 request = self._build_request(profile=profile, extra_tools=mcp_specs)
 

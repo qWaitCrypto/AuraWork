@@ -185,15 +185,22 @@ def _parse_registry_profile(profile_id: str, profile_dict: dict[str, Any], *, so
     api_key = api_key_val if isinstance(api_key_val, str) else None
     api_key = api_key.strip() if isinstance(api_key, str) else None
 
+    strip_codex_suffix = os.environ.get("AURA_OPENAI_CODEX_STRIP_SUFFIX", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     if (
-        provider_kind is ProviderKind.OPENAI_CODEX
+        strip_codex_suffix
+        and provider_kind is ProviderKind.OPENAI_CODEX
         and api_key
         and not api_key.startswith("codex-cli")
         and "/backend-api/codex" not in base_url
         and model_name.endswith("-codex")
     ):
-        # Common misconfiguration: using a Codex-suffixed model name with a non-Codex OAuth token.
-        # For OpenAI-compatible Responses endpoints, the unsuffixed model name is usually required.
+        # Optional compatibility switch for old configs that relied on implicit model-name rewriting.
+        # Default behavior keeps the configured model verbatim.
         model_name = model_name[: -len("-codex")]
 
     if provider_kind is ProviderKind.OPENAI_CODEX and api_key == "codex-cli" and _should_apply_codex_cli_model_migrations():

@@ -82,6 +82,26 @@ class DAGExecuteNextTool:
                     self.dag_runner._scheduler.max_parallel = original_max_parallel
 
         if not nodes:
+            try:
+                plan_state = self.dag_runner.plan_store.get()
+                plan_len = len(plan_state.plan)
+            except Exception:
+                plan_state = None
+                plan_len = 0
+
+            if plan_len == 0:
+                return {
+                    "ok": False,
+                    "dispatched": 0,
+                    "finished": False,
+                    "node_results": {},
+                    "all_proposals": [],
+                    "blocked_node": None,
+                    "blocked_approval": None,
+                    "error_code": "no_plan_loaded",
+                    "message": "No plan loaded. Call `update_plan` before `dag__execute_next`.",
+                    "diagnostics": {},
+                }
             finished = self.dag_runner.is_all_done()
             diagnostics = self._diagnose_no_ready()
             message = "All nodes completed" if finished else "No ready nodes to dispatch"

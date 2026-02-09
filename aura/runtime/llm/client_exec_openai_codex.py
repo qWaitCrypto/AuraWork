@@ -147,6 +147,30 @@ def _is_openai_platform_base_url(base_url: str) -> bool:
     return host == "api.openai.com"
 
 
+def _should_use_responses_api(*, base_url: str, token: str) -> bool:
+    """
+    Choose Responses API deterministically for OPENAI_CODEX provider.
+
+    - OPENAI_CODEX is Responses-first by design (including third-party "openai/v1" gateways).
+    - OpenAI Platform still respects token scope when we can infer it.
+    - Env flags allow explicit override for troubleshooting.
+    """
+
+    force_env = os.environ.get("AURA_OPENAI_CODEX_FORCE_RESPONSES", "").strip().lower()
+    if force_env in {"1", "true", "yes", "on"}:
+        return True
+
+    disable_env = os.environ.get("AURA_OPENAI_CODEX_DISABLE_RESPONSES", "").strip().lower()
+    if disable_env in {"1", "true", "yes", "on"}:
+        return False
+
+    if _is_chatgpt_codex_route(base_url):
+        return True
+    if _is_openai_platform_base_url(base_url):
+        return _token_supports_openai_responses(token)
+    return True
+
+
 def _iter_sse_json(resp: Any) -> Iterator[dict[str, Any]]:
     """
     Yield JSON objects from an SSE-ish response.
@@ -655,7 +679,7 @@ def complete_openai_codex(
         operation="complete",
     )
 
-    if _is_chatgpt_codex_route(profile.base_url) or _token_supports_openai_responses(token):
+    if _should_use_responses_api(base_url=profile.base_url, token=token):
         def _fallback_complete_chat_completions() -> LLMResponse:
             payload = OpenAICompatibleAdapter().prepare_request(
                 replace(profile, provider_kind=ProviderKind.OPENAI_COMPATIBLE), request
@@ -793,6 +817,7 @@ def complete_openai_codex(
                     )
                 else:
                     raise
+        payload["stream"] = True
         if trace is not None:
             trace.record_prepared_request(
                 provider_kind=profile.provider_kind,
@@ -804,7 +829,7 @@ def complete_openai_codex(
                 payload=payload,
             )
         try:
-            raw_stream = client.responses.create(**payload, stream=True, timeout=request_timeout_s)
+            raw_stream = client.responses.create(**payload, timeout=request_timeout_s)
         except (openai.BadRequestError, openai.NotFoundError, openai.UnprocessableEntityError) as e:
             # Many OpenAI-compatible gateways do not implement the Responses API. Fall back to chat.completions.
             if not _is_openai_platform_base_url(profile.base_url):
@@ -828,6 +853,7 @@ def complete_openai_codex(
                 fallback_req = _blocked_fallback_request(request)
                 fallback_payload = OpenAICodexAdapter().prepare_request(profile, fallback_req).json
                 fallback_payload["store"] = False
+                fallback_payload["stream"] = True
                 if not (
                     isinstance(fallback_payload.get("instructions"), str) and fallback_payload["instructions"].strip()
                 ):
@@ -846,7 +872,7 @@ def complete_openai_codex(
                     except Exception:
                         pass
                 try:
-                    raw_stream = client.responses.create(**fallback_payload, stream=True, timeout=request_timeout_s)
+                    raw_stream = client.responses.create(**fallback_payload, timeout=request_timeout_s)
                 except openai.OpenAIError as e2:
                     raise wrap_provider_exception(
                         e2,
@@ -1043,7 +1069,7 @@ def stream_openai_codex(
 
     request_timeout_s = timeout_s if timeout_s is not None else profile.timeout_s
 
-    use_responses = _is_chatgpt_codex_route(profile.base_url) or _token_supports_openai_responses(token)
+    use_responses = _should_use_responses_api(base_url=profile.base_url, token=token)
     if use_responses:
         def _fallback_stream_chat_completions() -> Iterator[LLMStreamEvent]:
             payload = OpenAICompatibleAdapter().prepare_request(
@@ -1261,6 +1287,7 @@ def stream_openai_codex(
                     )
                     return
                 raise
+        payload["stream"] = True
         if trace is not None:
             trace.record_prepared_request(
                 provider_kind=profile.provider_kind,
@@ -1272,7 +1299,7 @@ def stream_openai_codex(
                 payload=payload,
             )
         try:
-            raw_stream = client.responses.create(**payload, stream=True, timeout=request_timeout_s)
+            raw_stream = client.responses.create(**payload, timeout=request_timeout_s)
         except (openai.BadRequestError, openai.NotFoundError, openai.UnprocessableEntityError) as e:
             # Many OpenAI-compatible gateways do not implement the Responses API. Fall back to chat.completions.
             if not _is_openai_platform_base_url(profile.base_url):
@@ -1296,6 +1323,7 @@ def stream_openai_codex(
                 fallback_req = _blocked_fallback_request(request)
                 fallback_payload = OpenAICodexAdapter().prepare_request(profile, fallback_req).json
                 fallback_payload["store"] = False
+                fallback_payload["stream"] = True
                 if not (
                     isinstance(fallback_payload.get("instructions"), str) and fallback_payload["instructions"].strip()
                 ):
@@ -1314,7 +1342,7 @@ def stream_openai_codex(
                     except Exception:
                         pass
                 try:
-                    raw_stream = client.responses.create(**fallback_payload, stream=True, timeout=request_timeout_s)
+                    raw_stream = client.responses.create(**fallback_payload, timeout=request_timeout_s)
                 except openai.OpenAIError as e2:
                     if trace is not None:
                         try:

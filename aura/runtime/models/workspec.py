@@ -35,10 +35,37 @@ class IntentItem(BaseModel):
         return v
 
 
+_LEGACY_WORK_INPUT_TYPE_ALIASES: dict[str, str] = {
+    "document": "file",
+    "spreadsheet": "file",
+    "index": "file",
+    "report": "file",
+    "other": "file",
+    "dir": "directory",
+    "folder": "directory",
+    "connector": "connector_object",
+    "connector-object": "connector_object",
+    "connectorobject": "connector_object",
+    "link": "url",
+    "uri": "url",
+    "website": "url",
+}
+
+
 class WorkInput(BaseModel):
     type: WorkInputType | None = None
     path: str | None = None
     description: str | None = None
+
+    @field_validator("type", mode="before")
+    @classmethod
+    def _normalize_type(cls, v: Any) -> Any:
+        if not isinstance(v, str):
+            return v
+        normalized = v.strip().lower()
+        if not normalized:
+            return None
+        return _LEGACY_WORK_INPUT_TYPE_ALIASES.get(normalized, normalized)
 
 
 class ExpectedOutput(BaseModel):

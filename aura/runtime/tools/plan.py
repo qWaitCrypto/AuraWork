@@ -75,7 +75,11 @@ class UpdatePlanTool:
                                                 "items": {
                                                     "type": "object",
                                                     "properties": {
-                                                        "type": {"type": "string"},
+                                                        "type": {
+                                                            "type": "string",
+                                                            "enum": ["file", "directory", "text", "connector_object", "url"],
+                                                            "description": "Input kind. Use file/directory/text/connector_object/url.",
+                                                        },
                                                         "path": {"type": "string"},
                                                         "description": {"type": "string"},
                                                     },
