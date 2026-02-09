@@ -8,7 +8,7 @@ from typing import Any, Iterator
 
 from ..approval import ApprovalRecord, ApprovalStatus
 from ..ids import new_id, now_ts_ms
-from ..protocol import ArtifactRef, EVENT_SCHEMA_VERSION, Event
+from ..protocol import ArtifactRef, EVENT_SCHEMA_VERSION, Event, EventKind
 from .base import ApprovalStore, ArtifactStore, EventLogStore, SessionStore
 
 
@@ -152,6 +152,76 @@ class FileEventLogStore(EventLogStore):
         self._artifact_store = artifact_store
         self._session_store = session_store
 
+    @staticmethod
+    def _normalize_tool_end_status(status: str | None) -> tuple[str, str | None]:
+        raw = str(status or "").strip()
+        if not raw:
+            return ("unknown", None)
+        key = raw.lower()
+        mapping = {
+            "ok": "succeeded",
+            "success": "succeeded",
+            "succeeded": "succeeded",
+            "completed": "succeeded",
+            "done": "succeeded",
+            "error": "failed",
+            "failed": "failed",
+            "cancelled": "cancelled",
+            "canceled": "cancelled",
+            "denied": "blocked",
+            "blocked": "blocked",
+            "needs_approval": "needs_approval",
+            "require_approval": "needs_approval",
+            "requires_approval": "needs_approval",
+            "pending_approval": "needs_approval",
+            "running": "running",
+        }
+        normalized = mapping.get(key, "unknown")
+        if normalized == key:
+            return (normalized, None)
+        return (normalized, raw)
+
+    def _normalize_event_for_read(self, event: Event) -> Event:
+        payload = dict(event.payload or {})
+        if not isinstance(payload.get("source"), str) or not payload.get("source"):
+            payload["source"] = "unknown"
+
+        if event.kind == EventKind.TOOL_CALL_END.value:
+            status = payload.get("status")
+            normalized, legacy = self._normalize_tool_end_status(str(status) if status is not None else None)
+            if legacy and legacy.lower() != normalized:
+                payload.setdefault("status_legacy", legacy)
+            payload["status"] = normalized
+
+        if event.kind == EventKind.LLM_RESPONSE_COMPLETED.value:
+            final_text = payload.get("final_text")
+            if not isinstance(final_text, str):
+                ref_raw = payload.get("output_ref")
+                if isinstance(ref_raw, dict):
+                    try:
+                        ref = ArtifactRef.from_dict(ref_raw)
+                        data = self._artifact_store.get(ref)
+                        payload["final_text"] = data.decode("utf-8", errors="replace")
+                    except Exception:
+                        payload["final_text"] = ""
+                else:
+                    payload["final_text"] = ""
+
+        if payload == event.payload:
+            return event
+        return Event(
+            kind=event.kind,
+            payload=payload,
+            session_id=event.session_id,
+            event_id=event.event_id,
+            timestamp=event.timestamp,
+            sequence=event.sequence,
+            request_id=event.request_id,
+            turn_id=event.turn_id,
+            step_id=event.step_id,
+            schema_version=event.schema_version,
+        )
+
     def _path(self, session_id: str) -> Path:
         return self._root / f"{session_id}.jsonl"
 
@@ -209,6 +279,7 @@ class FileEventLogStore(EventLogStore):
                         schema_version=schema_version,
                     )
                 last_seq = int(event.sequence) if isinstance(event.sequence, int) else last_seq
+                event = self._normalize_event_for_read(event)
                 if not seen_anchor:
                     if event.event_id == since_event_id:
                         seen_anchor = True
