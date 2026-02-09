@@ -15,6 +15,7 @@
     --ink-500: 113 113 122;
     --ink-400: 161 161 170;
 
+    /* Primary accent - Trust Blue */
     --accent-50: 239 246 255;
     --accent-100: 219 234 254;
     --accent-200: 191 219 254;
@@ -24,9 +25,36 @@
     --accent-600: 37 99 235;
     --accent-700: 29 78 216;
 
+    /* CTA - Vibrant Orange */
+    --cta-400: 251 146 60;
+    --cta-500: 249 115 22;
+    --cta-600: 234 88 12;
+
+    /* Status colors */
+    --success-400: 74 222 128;
+    --success-500: 34 197 94;
+    --success-600: 22 163 74;
+
+    --warning-400: 250 204 21;
+    --warning-500: 234 179 8;
+    --warning-600: 202 138 4;
+
+    --danger-400: 248 113 113;
+    --danger-500: 239 68 68;
+    --danger-600: 220 38 38;
+
     /* Font tokens */
     --font-sans: "IBM Plex Sans", "Noto Sans SC", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
     --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+
+    /* Shadow tokens - Soft UI */
+    --shadow-xs: 0 1px 2px rgba(0,0,0,0.04);
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+    --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.07), 0 2px 4px -1px rgba(0,0,0,0.04);
+    --shadow-lg: 0 10px 15px -3px rgba(0,0,0,0.08), 0 4px 6px -2px rgba(0,0,0,0.03);
+    --shadow-xl: 0 20px 25px -5px rgba(0,0,0,0.08), 0 10px 10px -5px rgba(0,0,0,0.02);
+    --shadow-glow-accent: 0 0 20px rgba(59, 130, 246, 0.15);
+    --shadow-glow-cta: 0 0 20px rgba(249, 115, 22, 0.2);
 
     /* Scrollbar tokens */
     --scrollbar-thumb: 212 212 216;

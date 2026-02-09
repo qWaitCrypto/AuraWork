@@ -14,7 +14,7 @@ type ToolRun = {
   startedAt: number;
   endedAt?: number;
   durationMs?: number;
-  status: "running" | "succeeded" | "failed" | "cancelled" | "unknown";
+  status: "running" | "succeeded" | "failed" | "blocked" | "needs_approval" | "cancelled" | "unknown";
   preset?: string;
   subagentRunId?: string;
 };
@@ -28,7 +28,7 @@ type TerminalLogItem = {
   level: "info" | "error";
   title: string;
   subtitle?: string;
-  status?: "running" | "succeeded" | "failed" | "cancelled" | "unknown";
+  status?: "running" | "succeeded" | "failed" | "blocked" | "needs_approval" | "cancelled" | "unknown";
   durationMs?: number;
   toolRunId?: string;
   expandable?: boolean;
@@ -245,36 +245,25 @@ export const RightPanel = React.memo(function RightPanel(props: {
 
   return (
     <aside className="flex w-[380px] flex-shrink-0 flex-col border-l border-surface-200 bg-surface-0">
-      {/* Tabs */}
-      <div className="flex items-center border-b border-surface-200 bg-surface-50">
-        <button
-          className={["flex-1 py-3 text-xs font-bold uppercase tracking-wide transition-colors", rightTab === "plan" ? "tab-active" : "tab-inactive"].join(
-            " "
-          )}
-          onClick={() => setRightTab("plan")}
-          title="Plan"
-        >
-          Plan
-        </button>
-        <button
-          className={["flex-1 py-3 text-xs font-bold uppercase tracking-wide transition-colors", rightTab === "files" ? "tab-active" : "tab-inactive"].join(
-            " "
-          )}
-          onClick={() => setRightTab("files")}
-          title="Files"
-        >
-          Files
-        </button>
-        <button
-          className={[
-            "flex-1 py-3 text-xs font-bold uppercase tracking-wide transition-colors",
-            rightTab === "terminal" ? "tab-active" : "tab-inactive",
-          ].join(" ")}
-          onClick={() => setRightTab("terminal")}
-          title="Terminal"
-        >
-          Terminal
-        </button>
+      {/* Tabs - Pill Style */}
+      <div className="flex items-center gap-2 border-b border-surface-200 bg-surface-50 px-4 py-3">
+        <div className="flex flex-1 gap-1 rounded-lg bg-surface-100 p-1">
+          {(["plan", "files", "terminal"] as const).map((tab) => (
+            <button
+              key={tab}
+              className={[
+                "flex-1 rounded-md py-1.5 text-xs font-medium transition-all duration-150",
+                rightTab === tab
+                  ? "bg-white text-ink-900 shadow-sm"
+                  : "text-ink-500 hover:text-ink-700",
+              ].join(" ")}
+              onClick={() => setRightTab(tab)}
+              title={tab.charAt(0).toUpperCase() + tab.slice(1)}
+            >
+              {tab.charAt(0).toUpperCase() + tab.slice(1)}
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col">
@@ -547,16 +536,17 @@ export const RightPanel = React.memo(function RightPanel(props: {
                     const isError = it.level === "error" || it.status === "failed";
                     const isRunning = it.status === "running";
                     const isSuccess = it.status === "succeeded";
+                    const isBlocked = it.status === "blocked" || it.status === "needs_approval";
 
                     const borderColor = isError
                       ? "border-l-rose-400"
-                      : isRunning
+                      : isRunning || isBlocked
                         ? "border-l-amber-400"
                         : isSuccess
                           ? "border-l-emerald-400"
                           : "border-l-surface-300";
 
-                    const tone = isError ? "red" : isRunning ? "orange" : isSuccess ? "blue" : "gray";
+                    const tone = isError ? "red" : isRunning || isBlocked ? "orange" : isSuccess ? "blue" : "gray";
                     const anchorId = it.toolRunId ? `toolrun_${it.toolRunId}` : `log_${it.id}`;
 
                     return (

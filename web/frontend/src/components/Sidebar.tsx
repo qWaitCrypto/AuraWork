@@ -67,14 +67,14 @@ export const Sidebar = React.memo(function Sidebar(props: {
       </div>
 
       {/* Session List */}
-        <div className="flex-1 overflow-auto p-2">
-          <div className="px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-ink-400">Sessions</div>
-          {sessions.map((s) => {
-            const active = s.session_id === currentSessionId;
-            const containerClass = active
-              ? "border-accent-200 bg-surface-0 shadow-soft hover:shadow-medium"
-              : "border-transparent hover:border-surface-200 hover:bg-surface-0 hover:shadow-soft";
-            return (
+      <div className="flex-1 overflow-auto p-2">
+        <div className="px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-ink-400">Sessions</div>
+        {sessions.map((s) => {
+          const active = s.session_id === currentSessionId;
+          const containerClass = active
+            ? "border-accent-200 bg-surface-0 shadow-soft ring-1 ring-accent-100"
+            : "border-transparent hover:border-surface-200 hover:bg-surface-0 hover:shadow-soft cursor-pointer";
+          return (
             <div
               key={s.session_id}
               className={["group mb-1 flex w-full items-stretch gap-1 rounded-lg border transition-all", containerClass].join(" ")}
@@ -90,8 +90,8 @@ export const Sidebar = React.memo(function Sidebar(props: {
                   const updated = typeof s.updated_at === "number" ? s.updated_at : null;
                   const recentlyActive = updated ? now - updated < 2 * 60 * 1000 : false;
 
-                const currentDerived = active
-                  ? (() => {
+                  const currentDerived = active
+                    ? (() => {
                       if (approvalsCount > 0 || lastEventKind === "run_paused") return "Paused";
                       if (hasRunningTool || liveAssistant) return "Active";
                       const lastFail = (() => {
@@ -104,55 +104,55 @@ export const Sidebar = React.memo(function Sidebar(props: {
                       })();
                       return lastFail ? "Failed" : "Completed";
                     })()
-                  : recentlyActive
-                    ? "Active"
-                    : "Idle";
+                    : recentlyActive
+                      ? "Active"
+                      : "Idle";
 
-                const dotClass =
-                  currentDerived === "Failed"
-                    ? "bg-red-500"
-                    : currentDerived === "Paused"
-                      ? "bg-amber-500"
-                      : currentDerived === "Active"
-                        ? "bg-accent-500"
-                        : "bg-surface-200";
+                  const dotClass =
+                    currentDerived === "Failed"
+                      ? "bg-red-500"
+                      : currentDerived === "Paused"
+                        ? "bg-amber-500"
+                        : currentDerived === "Active"
+                          ? "bg-accent-500"
+                          : "bg-surface-200";
 
-                const subtitle =
-                  currentDerived === "Paused"
-                    ? "Approval required"
-                    : currentDerived === "Failed"
-                      ? "Failed"
-                      : currentDerived === "Active"
-                        ? "Working…"
-                        : "Completed";
+                  const subtitle =
+                    currentDerived === "Paused"
+                      ? "Approval required"
+                      : currentDerived === "Failed"
+                        ? "Failed"
+                        : currentDerived === "Active"
+                          ? "Working…"
+                          : "Completed";
 
-                return (
-                  <>
-                    <div
-                      className={[
-                        "mt-1.5 h-2 w-2 flex-shrink-0 rounded-full",
-                        dotClass,
-                        currentDerived === "Active" ? "animate-pulse-subtle" : "",
-                      ].join(" ")}
-                      aria-label={currentDerived}
-                      title={currentDerived}
-                    />
-                    <div className="min-w-0 flex-1">
-                      <div className={active ? "truncate text-sm font-medium text-ink-900" : "truncate text-sm text-ink-700 group-hover:text-ink-900 transition-colors"}>
-                        {sessionLabel(s)}
-                      </div>
-                      <div className={active ? "mt-1 truncate text-xs text-ink-500" : "mt-1 truncate text-xs text-ink-400"}>
-                        {active ? subtitle : updated ? `Completed · ${new Date(updated).toLocaleString()}` : subtitle}
-                      </div>
-                      {s.project_root ? (
-                        <div className={active ? "mt-1 truncate font-mono text-[10px] text-ink-400" : "mt-1 truncate font-mono text-[10px] text-ink-400"} title={s.project_root}>
-                          {s.project_root}
+                  return (
+                    <>
+                      <div
+                        className={[
+                          "mt-1.5 h-2 w-2 flex-shrink-0 rounded-full",
+                          dotClass,
+                          currentDerived === "Active" ? "animate-pulse-subtle" : "",
+                        ].join(" ")}
+                        aria-label={currentDerived}
+                        title={currentDerived}
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className={active ? "truncate text-sm font-medium text-ink-900" : "truncate text-sm text-ink-700 group-hover:text-ink-900 transition-colors"}>
+                          {sessionLabel(s)}
                         </div>
-                      ) : null}
-                    </div>
-                  </>
-                );
-              })()}
+                        <div className={active ? "mt-1 truncate text-xs text-ink-500" : "mt-1 truncate text-xs text-ink-400"}>
+                          {active ? subtitle : updated ? `Completed · ${new Date(updated).toLocaleString()}` : subtitle}
+                        </div>
+                        {s.project_root ? (
+                          <div className={active ? "mt-1 truncate font-mono text-[10px] text-ink-400" : "mt-1 truncate font-mono text-[10px] text-ink-400"} title={s.project_root}>
+                            {s.project_root}
+                          </div>
+                        ) : null}
+                      </div>
+                    </>
+                  );
+                })()}
               </button>
 
               <button
@@ -171,17 +171,18 @@ export const Sidebar = React.memo(function Sidebar(props: {
                 <Trash2 className="h-4 w-4" />
               </button>
             </div>
-            );
-          })}
-        </div>
+          );
+        })}
+      </div>
 
       <div className="border-t border-surface-200 bg-surface-0/50 p-4">
         <button
-          className="group flex w-full items-center justify-center gap-2 rounded-lg bg-accent-600 py-2.5 text-sm font-semibold text-white shadow-medium transition-all hover:bg-accent-700 hover:shadow-elevated"
+          className="group flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-cta-500 to-cta-600 py-3 text-sm font-semibold text-white shadow-lg transition-all hover:shadow-xl hover:from-cta-600 hover:to-cta-600 active:scale-[0.98]"
+          style={{ boxShadow: '0 4px 14px rgba(249, 115, 22, 0.35)' }}
           onClick={onCreateSession}
           title="Create new session"
         >
-          <Plus className="h-4 w-4 transition-transform duration-300 group-hover:rotate-90" />
+          <Plus className="h-4 w-4 transition-transform duration-200 group-hover:rotate-90" />
           New Session
         </button>
         <div className="mt-3 flex items-center justify-between">

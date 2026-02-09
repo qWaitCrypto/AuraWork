@@ -6,7 +6,7 @@ export type ToolLog = {
   id: string;
   tool: string;
   summary: string;
-  status: "running" | "succeeded" | "failed" | "cancelled" | "unknown";
+  status: "running" | "succeeded" | "failed" | "blocked" | "needs_approval" | "cancelled" | "unknown";
   durationMs?: number;
   preset?: string;
   subagentRunId?: string;

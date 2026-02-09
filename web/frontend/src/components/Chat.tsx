@@ -18,11 +18,12 @@ type TimelineRow = {
   kind: "llm" | "tool" | "plan" | "approval" | "error";
   title: string;
   subtitle?: string;
-  status?: "running" | "succeeded" | "failed" | "cancelled" | "unknown";
+  status?: "running" | "succeeded" | "failed" | "blocked" | "needs_approval" | "cancelled" | "unknown";
   startedAt?: number;
   durationMs?: number;
   toolRunId?: string;
   onOpenTab?: "plan" | "terminal";
+  thinkingLocator?: string;
 };
 
 type TimelineCard = {
@@ -42,7 +43,7 @@ type ToolRun = {
   startedAt: number;
   endedAt?: number;
   durationMs?: number;
-  status: "running" | "succeeded" | "failed" | "cancelled" | "unknown";
+  status: "running" | "succeeded" | "failed" | "blocked" | "needs_approval" | "cancelled" | "unknown";
 };
 
 export const Chat = React.memo(function Chat(props: {
@@ -147,6 +148,8 @@ export const Chat = React.memo(function Chat(props: {
                         const tone =
                           r.kind === "error" || r.status === "failed"
                             ? "red"
+                            : r.status === "blocked" || r.status === "needs_approval"
+                              ? "orange"
                             : r.status === "running"
                               ? "orange"
                               : r.status === "succeeded"
@@ -177,6 +180,18 @@ export const Chat = React.memo(function Chat(props: {
                                     ) : null}
                                   </div>
                                 ) : null}
+                                {r.kind === "llm" && r.status !== "running" && r.thinkingLocator ? (() => {
+                                  const t = artifactTexts[r.thinkingLocator];
+                                  if (!(typeof t === "string" && t.trim())) return null;
+                                  return (
+                                    <details className="mt-2 rounded-lg border border-surface-200 bg-white/70 px-2.5 py-2">
+                                      <summary className="cursor-pointer text-[11px] font-medium text-ink-600">Thinking</summary>
+                                      <div className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap font-mono text-[11px] text-ink-600">
+                                        {t}
+                                      </div>
+                                    </details>
+                                  );
+                                })() : null}
                               </div>
                               <div className="flex flex-shrink-0 items-center gap-2">
                                 {dur ? <span className="font-mono text-[11px] text-ink-500">{dur}</span> : null}
@@ -210,6 +225,7 @@ export const Chat = React.memo(function Chat(props: {
             if (!m.locator) return m.text ?? "—";
             const v = artifactTexts[m.locator];
             if (typeof v === "string" && v.trim()) return v;
+            if (typeof m.text === "string" && m.text.trim()) return m.text;
             if (m.summary && m.summary.trim()) return m.summary;
             // 如果有 locator 但内容未加载，说明是后续消息，可能还在处理中
             return null;
@@ -244,10 +260,10 @@ export const Chat = React.memo(function Chat(props: {
                 </div>
                 <div
                   className={[
-                    "leading-relaxed text-ink-700",
-                    "border border-surface-200 bg-surface-100 p-4 shadow-soft",
-                    "rounded-2xl",
-                    isUser ? "rounded-tl-sm" : "rounded-tl-2xl",
+                    "leading-relaxed text-ink-700 p-4 shadow-soft",
+                    isUser
+                      ? "rounded-2xl rounded-tr-sm bg-accent-50 border border-accent-100"
+                      : "rounded-2xl rounded-tl-sm bg-surface-0 border-l-2 border-accent-400 border-t border-r border-b border-t-surface-200 border-r-surface-200 border-b-surface-200",
                   ].join(" ")}
                 >
                   <div className="whitespace-pre-wrap">{content}</div>
@@ -273,9 +289,9 @@ export const Chat = React.memo(function Chat(props: {
                 key={q}
                 type="button"
                 onClick={() => onPickSuggestion?.(q)}
-                className="rounded-xl border border-surface-200 bg-surface-50 px-4 py-3 text-sm text-ink-700 shadow-soft transition-colors hover:bg-surface-100"
+                className="rounded-xl border border-surface-200 bg-surface-50 px-4 py-3 text-sm text-ink-700 shadow-soft transition-all duration-200 hover:bg-surface-100 hover:border-accent-200 hover:shadow-md cursor-pointer"
               >
-                <span className="mr-2 text-accent-600">→</span>
+                <span className="mr-2 text-cta-500">→</span>
                 {q}
               </button>
             ))}
@@ -306,43 +322,43 @@ export const Chat = React.memo(function Chat(props: {
       ) : null}
 
       {/* AI Typing Indicator */}
-        {llmRunning && !liveAssistant && !liveThinking ? (
-          <div className="mx-auto flex max-w-3xl gap-4">
-            <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-accent-500 to-accent-700 shadow-medium">
-              <Bot className="h-4 w-4 text-white" />
-            </div>
-            <div className="flex items-center gap-1.5 rounded-2xl border border-surface-200 bg-surface-100 px-4 py-3">
-              <span className="typing-dot h-2 w-2 rounded-full bg-accent-400" />
-              <span className="typing-dot h-2 w-2 rounded-full bg-accent-400" />
-              <span className="typing-dot h-2 w-2 rounded-full bg-accent-400" />
-            </div>
+      {llmRunning && !liveAssistant && !liveThinking ? (
+        <div className="mx-auto flex max-w-3xl gap-4">
+          <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-accent-500 to-accent-700 shadow-medium">
+            <Bot className="h-4 w-4 text-white" />
           </div>
-        ) : null}
+          <div className="flex items-center gap-1.5 rounded-2xl border border-surface-200 bg-surface-100 px-4 py-3">
+            <span className="typing-dot h-2 w-2 rounded-full bg-accent-400" />
+            <span className="typing-dot h-2 w-2 rounded-full bg-accent-400" />
+            <span className="typing-dot h-2 w-2 rounded-full bg-accent-400" />
+          </div>
+        </div>
+      ) : null}
 
-        {/* Streamed response preview */}
-        {llmRunning && (liveAssistant || liveThinking) ? (
-          <div className="mx-auto flex max-w-3xl gap-4 animate-fade-in">
-            <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-accent-500 to-accent-700 shadow-medium">
-              <Bot className="h-4 w-4 text-white" />
+      {/* Streamed response preview */}
+      {llmRunning && (liveAssistant || liveThinking) ? (
+        <div className="mx-auto flex max-w-3xl gap-4 animate-fade-in">
+          <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-accent-500 to-accent-700 shadow-medium">
+            <Bot className="h-4 w-4 text-white" />
+          </div>
+          <div className="min-w-0 flex-1 space-y-1.5">
+            <div className="flex items-baseline gap-2">
+              <span className="font-semibold text-ink-900">Aura</span>
+              <span className="text-xs text-amber-500 animate-pulse">typing…</span>
             </div>
-            <div className="min-w-0 flex-1 space-y-1.5">
-              <div className="flex items-baseline gap-2">
-                <span className="font-semibold text-ink-900">Aura</span>
-                <span className="text-xs text-amber-500 animate-pulse">typing…</span>
-              </div>
-              <div className="rounded-2xl border border-surface-200 bg-surface-100 p-4 shadow-soft">
-                {liveThinking ? (
-                  <div className="mb-2 whitespace-pre-wrap text-[11px] italic text-amber-700/80">
-                    {liveThinking.slice(0, 600)}
-                    {liveThinking.length > 600 ? "…" : ""}
-                  </div>
-                ) : null}
-                {liveAssistant ? <div className="whitespace-pre-wrap text-ink-700">{liveAssistant}</div> : <div className="text-sm text-ink-500">Thinking…</div>}
-                <span className="ml-0.5 inline-block h-4 w-1 align-text-bottom bg-accent-500 animate-pulse" />
-              </div>
+            <div className="rounded-2xl border border-surface-200 bg-surface-100 p-4 shadow-soft">
+              {liveThinking ? (
+                <div className="mb-2 whitespace-pre-wrap text-[11px] italic text-amber-700/80">
+                  {liveThinking.slice(0, 600)}
+                  {liveThinking.length > 600 ? "…" : ""}
+                </div>
+              ) : null}
+              {liveAssistant ? <div className="whitespace-pre-wrap text-ink-700">{liveAssistant}</div> : <div className="text-sm text-ink-500">Thinking…</div>}
+              <span className="ml-0.5 inline-block h-4 w-1 align-text-bottom bg-accent-500 animate-pulse" />
             </div>
           </div>
-        ) : null}
+        </div>
+      ) : null}
     </div>
   );
 });

@@ -31,6 +31,26 @@ export default {
           600: "rgb(var(--accent-600) / <alpha-value>)",
           700: "rgb(var(--accent-700) / <alpha-value>)",
         },
+        cta: {
+          400: "rgb(var(--cta-400) / <alpha-value>)",
+          500: "rgb(var(--cta-500) / <alpha-value>)",
+          600: "rgb(var(--cta-600) / <alpha-value>)",
+        },
+        success: {
+          400: "rgb(var(--success-400) / <alpha-value>)",
+          500: "rgb(var(--success-500) / <alpha-value>)",
+          600: "rgb(var(--success-600) / <alpha-value>)",
+        },
+        warning: {
+          400: "rgb(var(--warning-400) / <alpha-value>)",
+          500: "rgb(var(--warning-500) / <alpha-value>)",
+          600: "rgb(var(--warning-600) / <alpha-value>)",
+        },
+        danger: {
+          400: "rgb(var(--danger-400) / <alpha-value>)",
+          500: "rgb(var(--danger-500) / <alpha-value>)",
+          600: "rgb(var(--danger-600) / <alpha-value>)",
+        },
       },
       boxShadow: {
         soft: "0 1px 3px 0 rgba(0, 0, 0, 0.04), 0 1px 2px -1px rgba(0, 0, 0, 0.04)",

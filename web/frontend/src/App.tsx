@@ -64,13 +64,14 @@ type TimelineRow = {
   kind: "llm" | "tool" | "plan" | "approval" | "error";
   title: string;
   subtitle?: string;
-  status?: "running" | "succeeded" | "failed" | "cancelled" | "unknown";
+  status?: "running" | "succeeded" | "failed" | "blocked" | "needs_approval" | "cancelled" | "unknown";
   startedAt?: number;
   endedAt?: number;
   durationMs?: number;
   toolRunId?: string;
   count?: number;
   onOpenTab?: "plan" | "terminal";
+  thinkingLocator?: string;
 };
 
 type TimelineCard = {
@@ -92,7 +93,7 @@ type ToolRun = {
   startedAt: number;
   endedAt?: number;
   durationMs?: number;
-  status: "running" | "succeeded" | "failed" | "cancelled" | "unknown";
+  status: "running" | "succeeded" | "failed" | "blocked" | "needs_approval" | "cancelled" | "unknown";
   preset?: string;
   subagentRunId?: string;
   requestId?: string | null;
@@ -127,6 +128,25 @@ function toolCategory(toolName: string) {
   if (toolName === "session__export") return "Ran";
   if (toolName === "shell__run") return "Ran";
   return "Tools";
+}
+
+function normalizeToolEndStatus(rawStatus: string | null | undefined):
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "blocked"
+  | "needs_approval"
+  | "cancelled"
+  | "unknown" {
+  const st = String(rawStatus || "").trim().toLowerCase();
+  if (!st) return "unknown";
+  if (st === "running") return "running";
+  if (["ok", "success", "succeeded", "completed", "done"].includes(st)) return "succeeded";
+  if (["cancelled", "canceled"].includes(st)) return "cancelled";
+  if (["needs_approval", "require_approval", "requires_approval", "pending_approval"].includes(st)) return "needs_approval";
+  if (["blocked", "denied"].includes(st)) return "blocked";
+  if (["failed", "error"].includes(st)) return "failed";
+  return "unknown";
 }
 
 export default function App() {
@@ -227,7 +247,7 @@ export default function App() {
   const [browserControlFocused, setBrowserControlFocused] = useState(false);
   const browserImgRef = useRef<HTMLImageElement | null>(null);
   const browserStageRef = useRef<HTMLDivElement | null>(null);
-  const browserMouseMoveRef = useRef<{ x: number; y: number; modifiers: number } | null>(null);
+  const browserMouseMoveRef = useRef<{ x: number; y: number; modifiers: number; buttons?: number } | null>(null);
   const browserMouseMoveRafRef = useRef<number | null>(null);
 
   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
@@ -377,7 +397,8 @@ export default function App() {
         const outRef = p?.output_ref;
         const locator = outRef?.locator;
         const toolCallsLen = Array.isArray(p?.tool_calls) ? p.tool_calls.length : 0;
-        const text = stream.text;
+        const finalText = typeof p?.final_text === "string" ? p.final_text : "";
+        const text = finalText || stream.text;
         if (debug) {
           console.debug("[ui] llm_response_completed", {
             event_id: e.event_id,
@@ -678,28 +699,30 @@ export default function App() {
         const ref = payload?.output_ref;
         const toolCalls = Array.isArray(payload?.tool_calls) ? payload.tool_calls : [];
         const summary = typeof ref?.summary === "string" ? ref.summary : "";
+        const finalText = typeof payload?.final_text === "string" ? payload.final_text : "";
+        const finalTextLen = finalText.trim().length;
         const stepId = typeof e.step_id === "string" ? e.step_id : null;
         const textLen = stepId ? (llmTextLenByStep.get(stepId) || 0) : 0;
 
         // Hide tool-planning turns that produced no user-facing text.
         // This avoids empty assistant bubbles for tool-call-only responses (common with OpenAI Responses).
         const hasToolCalls = toolCalls.length > 0;
-        const hasUserText = textLen > 0 || Boolean(summary.trim());
+        const hasUserText = textLen > 0 || finalTextLen > 0 || Boolean(summary.trim());
         if (hasToolCalls && !hasUserText) {
           continue;
         }
 
-        if (ref?.locator) {
-          out.push({
-            id: e.event_id,
-            role: "assistant",
-            ts: e.timestamp,
-            locator: String(ref.locator),
-            summary: summary || undefined,
-            requestId: e.request_id ?? null,
-            turnId: e.turn_id ?? null,
-          });
-        }
+        const msg: ChatMessage = {
+          id: e.event_id,
+          role: "assistant",
+          ts: e.timestamp,
+          requestId: e.request_id ?? null,
+          turnId: e.turn_id ?? null,
+        };
+        if (ref?.locator) msg.locator = String(ref.locator);
+        if (summary) msg.summary = summary;
+        if (finalTextLen > 0) msg.text = finalText;
+        if (msg.locator || msg.text) out.push(msg);
         continue;
       }
       if (e.kind === "llm_request_failed") {
@@ -741,15 +764,7 @@ export default function App() {
         });
       } else {
         const prev = byId.get(id);
-        const statusRaw = String(p.status || "unknown").toLowerCase();
-        const status =
-          statusRaw === "succeeded"
-            ? "succeeded"
-            : statusRaw === "failed"
-              ? "failed"
-              : statusRaw === "cancelled"
-                ? "cancelled"
-                : "unknown";
+        const status = normalizeToolEndStatus(p.status ?? p.status_legacy ?? "unknown");
         byId.set(id, {
           ...(prev || {
             id,
@@ -826,6 +841,11 @@ export default function App() {
         const endedAt = (llmFailed ?? llmEnd)?.timestamp;
         const status = llmFailed ? "failed" : llmEnd ? "succeeded" : "running";
         const durationMs = startedAt && endedAt ? Math.max(0, endedAt - startedAt) : undefined;
+        const thinkingLocator = (() => {
+          const ref = (llmEnd?.payload as any)?.thinking_ref;
+          const loc = ref?.locator;
+          return typeof loc === "string" && loc.trim() ? loc : undefined;
+        })();
         rows.push({
           key: `llm:${k}`,
           kind: "llm",
@@ -834,6 +854,7 @@ export default function App() {
           startedAt: startedAt ?? undefined,
           endedAt: endedAt ?? undefined,
           durationMs,
+          thinkingLocator,
         });
       }
 
@@ -934,9 +955,17 @@ export default function App() {
       if (artifactLoading[loc]) continue;
       need.push(loc);
     }
+    for (const e of events) {
+      if (e.kind !== "llm_response_completed") continue;
+      const loc = String(((e.payload as any)?.thinking_ref?.locator as any) || "").trim();
+      if (!loc) continue;
+      if (artifactFetched[loc]) continue;
+      if (artifactLoading[loc]) continue;
+      need.push(loc);
+    }
     if (!need.length) return;
     for (const loc of need.slice(0, 10)) void ensureText(loc);
-  }, [artifactFetched, artifactLoading, chatMessages, ensureText]);
+  }, [artifactFetched, artifactLoading, chatMessages, events, ensureText]);
 
   async function createSession() {
     // Open workspace picker: select existing workspace or register a new directory.
@@ -1107,10 +1136,50 @@ export default function App() {
   const browserFrameMeta = browserFrameRef.current.metadata;
   const browserFrameTs = browserFrameRef.current.ts;
   const _browserFrameTick = browserFrameTick;
+  const browserPointerDownRef = useRef<{ pointerId: number; button: "left" | "middle" | "right"; clickCount: number } | null>(null);
 
   function browserModifiers(e: { altKey?: boolean; ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean }): number {
     // Chrome DevTools Protocol modifiers: Alt=1, Ctrl=2, Meta=4, Shift=8
     return (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
+  }
+
+  function browserVKeyCode(key: string): number | null {
+    switch (key) {
+      case "Backspace":
+        return 8;
+      case "Tab":
+        return 9;
+      case "Enter":
+        return 13;
+      case "Escape":
+        return 27;
+      case "ArrowLeft":
+        return 37;
+      case "ArrowUp":
+        return 38;
+      case "ArrowRight":
+        return 39;
+      case "ArrowDown":
+        return 40;
+      case "Delete":
+        return 46;
+      default:
+        return null;
+    }
+  }
+
+  function browserButtonFromMouseButton(btn: number): "left" | "middle" | "right" {
+    if (btn === 1) return "middle";
+    if (btn === 2) return "right";
+    return "left";
+  }
+
+  function browserButtonFromButtonsMask(buttons: number | undefined): "none" | "left" | "middle" | "right" {
+    const v = typeof buttons === "number" ? buttons : 0;
+    if (v & 1) return "left";
+    if (v & 4) return "middle";
+    if (v & 2) return "right";
+    return "none";
   }
 
   function browserDevicePointFromClient(clientX: number, clientY: number): { x: number; y: number } | null {
@@ -1160,29 +1229,92 @@ export default function App() {
     } catch { }
   }
 
-  function onBrowserMouseMove(e: React.MouseEvent) {
+  function onBrowserPointerMove(e: React.PointerEvent) {
     if (!browserControl) return;
+    e.preventDefault();
+    e.stopPropagation();
     const p = browserDevicePointFromClient(e.clientX, e.clientY);
     if (!p) return;
-    browserMouseMoveRef.current = { x: p.x, y: p.y, modifiers: browserModifiers(e) };
+    browserMouseMoveRef.current = {
+      x: p.x,
+      y: p.y,
+      modifiers: browserModifiers(e),
+      buttons: typeof (e as any).buttons === "number" ? (e as any).buttons : undefined,
+    };
     if (browserMouseMoveRafRef.current != null) return;
     browserMouseMoveRafRef.current = requestAnimationFrame(() => {
       browserMouseMoveRafRef.current = null;
       const cur = browserMouseMoveRef.current;
       if (!cur) return;
-      sendBrowserMouseEvent({ type: "input_mouse", eventType: "mouseMoved", x: cur.x, y: cur.y, modifiers: cur.modifiers });
+      const down = browserPointerDownRef.current;
+      const button = down?.button ?? browserButtonFromButtonsMask(cur.buttons);
+      const clickCount = down?.clickCount ?? 0;
+      sendBrowserMouseEvent({
+        type: "input_mouse",
+        eventType: "mouseMoved",
+        x: cur.x,
+        y: cur.y,
+        modifiers: cur.modifiers,
+        button,
+        clickCount,
+        buttons: cur.buttons,
+      });
     });
   }
 
-  function sendBrowserClick(e: React.MouseEvent) {
+  function onBrowserPointerDown(e: React.PointerEvent) {
+    if (!browserControl) return;
+    focusBrowserControl();
+    try {
+      browserStageRef.current?.setPointerCapture(e.pointerId);
+    } catch { }
+    const p = browserDevicePointFromClient(e.clientX, e.clientY);
+    if (!p) return;
+    const modifiers = browserModifiers(e);
+    const button = browserButtonFromMouseButton((e as any).button ?? 0);
+    const clickCount = 1;
+    browserPointerDownRef.current = { pointerId: e.pointerId, button, clickCount };
+    e.preventDefault();
+    e.stopPropagation();
+    sendBrowserMouseEvent({ type: "input_mouse", eventType: "mouseMoved", x: p.x, y: p.y, modifiers });
+    sendBrowserMouseEvent({
+      type: "input_mouse",
+      eventType: "mousePressed",
+      x: p.x,
+      y: p.y,
+      button,
+      clickCount,
+      modifiers,
+      buttons: typeof (e as any).buttons === "number" ? (e as any).buttons : undefined,
+    });
+  }
+
+  function onBrowserPointerUp(e: React.PointerEvent) {
     if (!browserControl) return;
     focusBrowserControl();
     const p = browserDevicePointFromClient(e.clientX, e.clientY);
     if (!p) return;
     const modifiers = browserModifiers(e);
+    const down = browserPointerDownRef.current;
+    const button = down?.button ?? browserButtonFromMouseButton((e as any).button ?? 0);
+    const clickCount = down?.clickCount ?? 1;
+    e.preventDefault();
+    e.stopPropagation();
     sendBrowserMouseEvent({ type: "input_mouse", eventType: "mouseMoved", x: p.x, y: p.y, modifiers });
-    sendBrowserMouseEvent({ type: "input_mouse", eventType: "mousePressed", x: p.x, y: p.y, button: "left", clickCount: 1, modifiers });
-    sendBrowserMouseEvent({ type: "input_mouse", eventType: "mouseReleased", x: p.x, y: p.y, button: "left", clickCount: 1, modifiers });
+    sendBrowserMouseEvent({
+      type: "input_mouse",
+      eventType: "mouseReleased",
+      x: p.x,
+      y: p.y,
+      button,
+      clickCount,
+      modifiers,
+      buttons: typeof (e as any).buttons === "number" ? (e as any).buttons : undefined,
+    });
+    browserPointerDownRef.current = null;
+    try {
+      browserStageRef.current?.releasePointerCapture(e.pointerId);
+    } catch { }
   }
 
   function sendBrowserWheel(e: React.WheelEvent) {
@@ -1215,10 +1347,25 @@ export default function App() {
     const modifiers = browserModifiers(e);
     const key = String(e.key || "");
     const code = String((e as any).code || "");
+    const vkey = browserVKeyCode(key);
+    const isPrintable = key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
+    // Some agent-browser builds do not handle `rawKeyDown` reliably; prefer `keyDown`.
+    const downType = "keyDown";
+    const text = isPrintable ? key : null;
 
-    sendBrowserKeyboardEvent({ type: "input_keyboard", eventType: "keyDown", key, code, modifiers });
+    sendBrowserKeyboardEvent({
+      type: "input_keyboard",
+      eventType: downType,
+      key,
+      code,
+      modifiers,
+      text: text ?? undefined,
+      unmodifiedText: text ?? undefined,
+      windowsVirtualKeyCode: vkey ?? undefined,
+      nativeVirtualKeyCode: vkey ?? undefined,
+    });
     // Best-effort: emit a char event for printable text.
-    if (key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (isPrintable) {
       sendBrowserKeyboardEvent({ type: "input_keyboard", eventType: "char", text: key, key, code, modifiers });
     }
   }
@@ -1231,7 +1378,16 @@ export default function App() {
     const modifiers = browserModifiers(e);
     const key = String(e.key || "");
     const code = String((e as any).code || "");
-    sendBrowserKeyboardEvent({ type: "input_keyboard", eventType: "keyUp", key, code, modifiers });
+    const vkey = browserVKeyCode(key);
+    sendBrowserKeyboardEvent({
+      type: "input_keyboard",
+      eventType: "keyUp",
+      key,
+      code,
+      modifiers,
+      windowsVirtualKeyCode: vkey ?? undefined,
+      nativeVirtualKeyCode: vkey ?? undefined,
+    });
   }
 
   return (
@@ -1516,8 +1672,11 @@ export default function App() {
                         <div
                           ref={browserStageRef}
                           tabIndex={browserControl ? 0 : -1}
-                          className={`relative flex items-center justify-center outline-none ${browserControl ? "cursor-crosshair" : "cursor-default"}`}
-                          onMouseMove={onBrowserMouseMove}
+                          className={`relative flex items-center justify-center outline-none touch-none ${browserControl ? "cursor-crosshair" : "cursor-default"}`}
+                          onPointerMove={onBrowserPointerMove}
+                          onPointerDown={onBrowserPointerDown}
+                          onPointerUp={onBrowserPointerUp}
+                          onPointerCancel={() => { browserPointerDownRef.current = null; }}
                           onWheel={sendBrowserWheel}
                           onKeyDown={onBrowserKeyDown}
                           onKeyUp={onBrowserKeyUp}
@@ -1530,7 +1689,6 @@ export default function App() {
                             alt="Browser preview"
                             className="max-h-full max-w-full select-none rounded-xl border border-surface-200 shadow-elevated"
                             draggable={false}
-                            onClick={sendBrowserClick}
                           />
                         </div>
                         {/* Control 模式提示 */}
