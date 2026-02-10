@@ -7,6 +7,14 @@ import { Button } from "./Button";
 
 export type RightTab = "plan" | "files" | "terminal";
 
+type WorkSpecView = {
+  goal?: string;
+  expectedOutputs: string[];
+  workspaceRoots: string[];
+  domainAllowlist: string[];
+  fileTypeAllowlist: string[];
+};
+
 type ToolRun = {
   id: string;
   tool: string;
@@ -17,6 +25,7 @@ type ToolRun = {
   status: "running" | "succeeded" | "failed" | "blocked" | "needs_approval" | "cancelled" | "unknown";
   preset?: string;
   subagentRunId?: string;
+  workSpec?: WorkSpecView;
 };
 
 type TerminalLogKind = "llm" | "tool" | "plan" | "approval" | "error";
@@ -35,6 +44,117 @@ type TerminalLogItem = {
   details?: string;
 };
 
+
+
+function cleanText(raw: unknown, maxLen = 220): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const text = raw.replace(/\s+/g, " ").trim();
+  if (!text) return undefined;
+  if (text.length <= maxLen) return text;
+  return `${text.slice(0, maxLen - 1)}…`;
+}
+
+function cleanStringList(raw: unknown, limit = 4, itemMaxLen = 100): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const item of raw) {
+    const value = cleanText(item, itemMaxLen);
+    if (!value) continue;
+    out.push(value);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function parseWorkSpecView(raw: unknown): WorkSpecView | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const ws = raw as Record<string, unknown>;
+  const goal = cleanText(ws.goal, 220);
+
+  const expectedOutputs = Array.isArray(ws.expected_outputs)
+    ? ws.expected_outputs
+      .map((item) => {
+        if (!item || typeof item !== "object") return undefined;
+        const rec = item as Record<string, unknown>;
+        const outputType = cleanText(rec.type, 40);
+        const outputPath = cleanText(rec.path, 120);
+        if (outputType && outputPath) return `${outputType}: ${outputPath}`;
+        return outputPath || outputType || cleanText(rec.format, 60);
+      })
+      .filter((item): item is string => Boolean(item))
+      .slice(0, 6)
+    : [];
+
+  const scopeRaw = ws.resource_scope && typeof ws.resource_scope === "object" ? (ws.resource_scope as Record<string, unknown>) : {};
+  const workspaceRoots = cleanStringList(scopeRaw.workspace_roots, 4, 120);
+  const domainAllowlist = cleanStringList(scopeRaw.domain_allowlist, 4, 100);
+  const fileTypeAllowlist = cleanStringList(scopeRaw.file_type_allowlist, 6, 40);
+
+  if (!goal && !expectedOutputs.length && !workspaceRoots.length && !domainAllowlist.length && !fileTypeAllowlist.length) {
+    return undefined;
+  }
+
+  return {
+    goal,
+    expectedOutputs,
+    workspaceRoots,
+    domainAllowlist,
+    fileTypeAllowlist,
+  };
+}
+
+function formatWorkSpecSummary(ws?: WorkSpecView): string | undefined {
+  if (!ws) return undefined;
+  const parts: string[] = [];
+  if (ws.goal) parts.push(`goal: ${ws.goal}`);
+  if (ws.expectedOutputs.length) parts.push(`outputs: ${ws.expectedOutputs.length}`);
+  if (ws.workspaceRoots.length) parts.push(`roots: ${ws.workspaceRoots.length}`);
+  if (ws.domainAllowlist.length) parts.push(`domains: ${ws.domainAllowlist.length}`);
+  if (ws.fileTypeAllowlist.length) parts.push(`types: ${ws.fileTypeAllowlist.length}`);
+  return parts.length ? parts.join(" · ") : undefined;
+}
+
+function formatWorkSpecDetails(ws?: WorkSpecView): string | undefined {
+  if (!ws) return undefined;
+  const lines: string[] = [];
+  if (ws.goal) lines.push(`goal: ${ws.goal}`);
+  if (ws.expectedOutputs.length) lines.push(`expected_outputs:\n- ${ws.expectedOutputs.join("\n- ")}`);
+  if (ws.workspaceRoots.length) lines.push(`workspace_roots: ${ws.workspaceRoots.join(", ")}`);
+  if (ws.domainAllowlist.length) lines.push(`domain_allowlist: ${ws.domainAllowlist.join(", ")}`);
+  if (ws.fileTypeAllowlist.length) lines.push(`file_type_allowlist: ${ws.fileTypeAllowlist.join(", ")}`);
+  return lines.length ? lines.join("\n") : undefined;
+}
+
+function joinDetails(parts: Array<string | undefined>): string | undefined {
+  const rows = parts.map((item) => String(item || "").trim()).filter(Boolean);
+  return rows.length ? rows.join("\n") : undefined;
+}
+
+function normalizeApproverDecision(raw: unknown): "allow" | "deny" | "escalate" | "unknown" {
+  const value = String(raw || "").trim().toLowerCase();
+  if (!value) return "unknown";
+  if (value === "allow") return "allow";
+  if (value === "deny") return "deny";
+  if (["require_approval", "needs_approval", "escalate"].includes(value)) return "escalate";
+  return "unknown";
+}
+
+function summarizeApproverTrace(raw: unknown): string | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const trace = raw as Record<string, unknown>;
+  const decision = cleanText(trace.decision ?? trace.final_decision, 40);
+  const parsed = cleanText(trace.parsed_decision ?? trace.parsed, 40);
+  const reason = cleanText(trace.reason, 260);
+  const error = cleanText(trace.error, 260);
+  const skipped = trace.skipped === true;
+  return joinDetails([
+    decision ? `decision: ${decision}` : undefined,
+    parsed ? `parsed: ${parsed}` : undefined,
+    skipped ? "skipped: true" : undefined,
+    error ? `error: ${error}` : undefined,
+    reason ? `reason: ${reason}` : undefined,
+  ]);
+}
 export const RightPanel = React.memo(function RightPanel(props: {
   currentSessionId: string | null;
   rightTab: RightTab;
@@ -160,6 +280,7 @@ export const RightPanel = React.memo(function RightPanel(props: {
     for (let i = start; i < events.length; i++) {
       const e = events[i];
       const ts = e.timestamp;
+      const p = e.payload as any;
 
       if (e.kind === "llm_request_started") {
         items.push({ id: e.event_id, ts, kind: "llm", level: "info", title: "LLM request started", status: "running" });
@@ -170,39 +291,45 @@ export const RightPanel = React.memo(function RightPanel(props: {
         continue;
       }
       if (e.kind === "llm_request_failed") {
-        const p = e.payload as any;
         const msg = String(p?.error || p?.message || "llm_request_failed");
         items.push({ id: e.event_id, ts, kind: "llm", level: "error", title: msg, status: "failed" });
         continue;
       }
 
       if (e.kind === "tool_call_start" || e.kind === "tool_call_end") {
-        const p = e.payload as any;
         const id = String(p.tool_execution_id || p.tool_call_id || e.event_id);
         const tr = toolById.get(id);
         const title = tr?.summary || String(p.summary || p.tool_name || "Tool");
-        const subtitle = tr?.tool || String(p.tool_name || "tool");
+        const baseSubtitle = tr?.tool || String(p.tool_name || "tool");
         const status = e.kind === "tool_call_start" ? "running" : (tr?.status ?? "unknown");
         const durationMs =
           e.kind === "tool_call_end" ? (tr?.durationMs ?? (typeof p.duration_ms === "number" ? p.duration_ms : undefined)) : undefined;
+        const workSpec = tr?.workSpec ?? parseWorkSpecView(p.work_spec);
+        const wsSummary = formatWorkSpecSummary(workSpec);
+        const wsDetails = formatWorkSpecDetails(workSpec);
         items.push({
           id: e.event_id,
           ts,
           kind: "tool",
           level: status === "failed" ? "error" : "info",
           title,
-          subtitle,
+          subtitle: wsSummary ? `${baseSubtitle} · ${wsSummary}` : baseSubtitle,
           status,
           durationMs,
           toolRunId: id,
           expandable: true,
-          details: `${subtitle}${tr?.preset ? `\nPreset: ${tr.preset}` : ""}${tr?.subagentRunId ? `\nSubagent: ${tr.subagentRunId}` : ""}`,
+          details: joinDetails([
+            baseSubtitle,
+            tr?.preset ? `preset: ${tr.preset}` : undefined,
+            tr?.subagentRunId ? `subagent: ${tr.subagentRunId}` : undefined,
+            wsDetails,
+          ]),
         });
         continue;
       }
 
       if (e.kind === "plan_update") {
-        const planLen = Array.isArray((e.payload as any)?.plan) ? ((e.payload as any).plan as any[]).length : undefined;
+        const planLen = Array.isArray(p?.plan) ? (p.plan as any[]).length : undefined;
         items.push({
           id: e.event_id,
           ts,
@@ -214,13 +341,138 @@ export const RightPanel = React.memo(function RightPanel(props: {
         continue;
       }
 
-      if (e.kind === "approval_required" || e.kind === "run_paused") {
-        items.push({ id: e.event_id, ts, kind: "approval", level: "info", title: "Paused", subtitle: "Approval required" });
+      if (e.kind === "subagent_approver_started") {
+        const inspection = p?.inspection as any;
+        const actionSummary = cleanText(inspection?.action_summary, 180) || cleanText(p?.tool_name, 80) || "Approver started";
+        const risk = cleanText(inspection?.risk_level, 40);
+        const reason = cleanText(inspection?.reason, 260);
+        items.push({
+          id: e.event_id,
+          ts,
+          kind: "approval",
+          level: "info",
+          title: `Approver started · ${actionSummary}`,
+          subtitle: risk ? `risk: ${risk}` : undefined,
+          status: "running",
+          expandable: true,
+          details: joinDetails([
+            reason ? `reason: ${reason}` : undefined,
+            formatWorkSpecDetails(parseWorkSpecView(p?.work_spec)),
+          ]),
+        });
+        continue;
+      }
+
+      if (e.kind === "subagent_approver_completed") {
+        const after = p?.inspection_after as any;
+        const decision = normalizeApproverDecision(after?.decision);
+        const status = decision === "allow" ? "succeeded" : decision === "deny" ? "blocked" : decision === "escalate" ? "needs_approval" : "unknown";
+        const actionSummary = cleanText(after?.action_summary, 180) || cleanText(p?.tool_name, 80) || "Approver completed";
+        const reason = cleanText(after?.reason, 260);
+        items.push({
+          id: e.event_id,
+          ts,
+          kind: "approval",
+          level: decision === "deny" ? "error" : "info",
+          title: `Approver decision · ${decision}`,
+          subtitle: actionSummary,
+          status,
+          expandable: true,
+          details: joinDetails([
+            reason ? `reason: ${reason}` : undefined,
+            summarizeApproverTrace(p?.approver_trace),
+          ]),
+        });
+        continue;
+      }
+
+      if (e.kind === "approval_required") {
+        const actionSummary = cleanText(p?.action_summary, 180) || "Approval required";
+        const risk = cleanText(p?.risk_level, 40);
+        const reason = cleanText(p?.reason, 260);
+        const approvalId = cleanText(p?.approval_id, 120);
+        items.push({
+          id: e.event_id,
+          ts,
+          kind: "approval",
+          level: "info",
+          title: actionSummary,
+          subtitle: risk ? `risk: ${risk}` : "Approval required",
+          status: "needs_approval",
+          expandable: true,
+          details: joinDetails([
+            approvalId ? `approval_id: ${approvalId}` : undefined,
+            reason ? `reason: ${reason}` : undefined,
+          ]),
+        });
+        continue;
+      }
+
+      if (e.kind === "run_paused") {
+        const pendingCount = Array.isArray(p?.pending_tools) ? p.pending_tools.length : undefined;
+        items.push({
+          id: e.event_id,
+          ts,
+          kind: "approval",
+          level: "info",
+          title: "Run paused",
+          subtitle: typeof pendingCount === "number" ? `pending tools: ${pendingCount}` : "Awaiting approval",
+          status: "needs_approval",
+          expandable: true,
+          details: cleanText(p?.approval_id, 120) ? `approval_id: ${String(p.approval_id)}` : undefined,
+        });
+        continue;
+      }
+
+      if (e.kind === "approval_granted") {
+        const approvalId = cleanText(p?.approval_id, 120);
+        items.push({
+          id: e.event_id,
+          ts,
+          kind: "approval",
+          level: "info",
+          title: "Approval granted",
+          subtitle: approvalId,
+          status: "succeeded",
+          expandable: true,
+          details: cleanText(p?.decision, 40) ? `decision: ${String(p.decision)}` : undefined,
+        });
+        continue;
+      }
+
+      if (e.kind === "approval_denied") {
+        const approvalId = cleanText(p?.approval_id, 120);
+        items.push({
+          id: e.event_id,
+          ts,
+          kind: "approval",
+          level: "error",
+          title: "Approval denied",
+          subtitle: approvalId,
+          status: "blocked",
+          expandable: true,
+          details: cleanText(p?.decision, 40) ? `decision: ${String(p.decision)}` : undefined,
+        });
+        continue;
+      }
+
+      if (e.kind === "run_resumed") {
+        const pendingCount = Number.isFinite(Number(p?.pending_tools_count)) ? Number(p.pending_tools_count) : undefined;
+        items.push({
+          id: e.event_id,
+          ts,
+          kind: "approval",
+          level: "info",
+          title: "Run resumed",
+          subtitle: typeof pendingCount === "number" ? `pending tools: ${pendingCount}` : undefined,
+          status: "running",
+          expandable: true,
+          details: cleanText(p?.approval_id, 120) ? `approval_id: ${String(p.approval_id)}` : undefined,
+        });
         continue;
       }
 
       if (e.kind === "operation_failed") {
-        const p = e.payload as any;
         const msg = String(p?.error || p?.message || "operation_failed");
         items.push({ id: e.event_id, ts, kind: "error", level: "error", title: msg, status: "failed" });
         continue;

@@ -312,6 +312,7 @@ class ToolExecutionContext:
     turn_id: str | None
     tool_execution_id: str
     event_bus: EventBus | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class ToolRuntime:

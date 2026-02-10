@@ -18,6 +18,7 @@ type TimelineRow = {
   kind: "llm" | "tool" | "plan" | "approval" | "error";
   title: string;
   subtitle?: string;
+  details?: string;
   status?: "running" | "succeeded" | "failed" | "blocked" | "needs_approval" | "cancelled" | "unknown";
   startedAt?: number;
   durationMs?: number;
@@ -93,7 +94,7 @@ export const Chat = React.memo(function Chat(props: {
     const parts: string[] = [];
     if (tools) parts.push(`Ran ${tools} tools`);
     if (hasPlan) parts.push("Plan updated");
-    if (hasApproval) parts.push("Paused");
+    if (hasApproval) parts.push("Approval flow");
     if (hasError) parts.push("Errors");
 
     const dur = durationMs ? `${durationMs}ms` : "—";
@@ -164,6 +165,12 @@ export const Chat = React.memo(function Chat(props: {
                               <div className="min-w-0 flex-1">
                                 <div className="truncate text-xs font-semibold text-ink-900">{r.title}</div>
                                 {r.subtitle ? <div className="mt-0.5 truncate font-mono text-[11px] text-ink-500">{r.subtitle}</div> : null}
+                                {r.details ? (
+                                  <details className="mt-1 rounded-lg border border-surface-200 bg-white/70 px-2 py-1.5">
+                                    <summary className="cursor-pointer text-[10px] font-medium text-ink-500">Details</summary>
+                                    <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap font-mono text-[10px] text-ink-600">{r.details}</pre>
+                                  </details>
+                                ) : null}
                                 {r.kind === "llm" && r.status === "running" && (liveThinking || liveAssistant) ? (
                                   <div className="mt-2 space-y-1">
                                     {liveThinking ? (

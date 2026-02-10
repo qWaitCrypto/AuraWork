@@ -138,6 +138,30 @@ class DAGPlanRunner:
             PlanState(plan=updated_items, goal=plan_state.goal, explanation=plan_state.explanation, updated_at=plan_state.updated_at)
         )
 
+    def release_running(self, node_id: str) -> bool:
+        """
+        Release a node from scheduler running-state without marking it completed/failed.
+
+        This is used when a dispatched node pauses for approval: the node should be
+        redispatchable after approval instead of staying stuck in `_running` forever.
+        """
+        if self._scheduler is None:
+            self.refresh_from_store()
+        if self._scheduler is None:
+            raise RuntimeError("Scheduler not initialized.")
+
+        if node_id not in self._scheduler._running:
+            return False
+
+        self._scheduler._running.discard(node_id)
+        if (
+            node_id not in self._scheduler._completed
+            and self._scheduler._in_degree.get(node_id, 0) == 0
+            and node_id not in self._scheduler._ready
+        ):
+            self._scheduler._ready.appendleft(node_id)
+        return True
+
     def get_goal(self) -> str | None:
         """Get the global goal of the current plan."""
         return self.plan_store.get().goal

@@ -77,9 +77,12 @@ async def _dispatch_single_node(
         return NodeDispatchResult(node_id=node.id, status="error", result=None, error=str(exc))
 
     status = str(result.get("status") or "unknown")
+    status_norm = status.strip().lower()
     report = _parse_report(result)
     if result.get("needs_approval") or report.get("needs_approval"):
         status = "needs_approval"
+    elif status_norm in {"needs_user_takeover", "user_takeover_required", "needs_takeover"}:
+        status = "needs_user_takeover"
     elif result.get("error") or status == "failed":
         status = "failed"
 
@@ -133,6 +136,60 @@ def _extract_receipts(result: dict[str, Any] | None) -> list[dict[str, Any]]:
     return []
 
 
+def _extract_takeover_request(*, result: dict[str, Any] | None, report: dict[str, Any]) -> dict[str, Any]:
+    next_step = report.get("next_step_suggestion") if isinstance(report.get("next_step_suggestion"), dict) else {}
+
+    reason = str(
+        report.get("reason")
+        or next_step.get("reason")
+        or next_step.get("message")
+        or "Browser task requires user takeover (CAPTCHA/login/2FA)."
+    ).strip()
+    action_summary = str(
+        report.get("action_summary")
+        or next_step.get("action_summary")
+        or "Please complete browser verification/login, then approve to resume."
+    ).strip()
+
+    out: dict[str, Any] = {
+        "kind": "user_takeover",
+        "mode": "user_takeover",
+        "action_summary": action_summary,
+        "risk_level": "medium",
+        "reason": reason,
+        "options": ["approve", "deny"],
+        "status": "needs_user_takeover",
+    }
+
+    current_url = report.get("current_url") or next_step.get("current_url")
+    if isinstance(current_url, str) and current_url.strip():
+        out["current_url"] = current_url.strip()
+
+    screenshot = report.get("screenshot") or next_step.get("screenshot")
+    if isinstance(screenshot, str) and screenshot.strip():
+        out["screenshot"] = screenshot.strip()
+
+    next_hint = report.get("next_step") or next_step.get("next_step")
+    if isinstance(next_hint, str) and next_hint.strip():
+        out["next_step"] = next_hint.strip()
+
+    if isinstance(result, dict):
+        run_id = result.get("subagent_run_id")
+        if isinstance(run_id, str) and run_id.strip():
+            out["subagent_run_id"] = run_id.strip()
+
+        browser_session = result.get("browser_agent_session")
+        if isinstance(browser_session, str) and browser_session.strip():
+            out["browser_agent_session"] = browser_session.strip()
+
+    if "browser_agent_session" not in out:
+        browser_session_report = report.get("browser_agent_session") if isinstance(report, dict) else None
+        if isinstance(browser_session_report, str) and browser_session_report.strip():
+            out["browser_agent_session"] = browser_session_report.strip()
+
+    return out
+
+
 class NodeCompletionHandler:
     """Process dispatch results into completion actions."""
 
@@ -168,6 +225,17 @@ class NodeCompletionHandler:
             if approval_request is None:
                 approval_request = {"reason": "Subagent requested approval"}
 
+            return NodeCompletionAction(
+                action="pause_for_approval",
+                node_id=node_id,
+                proposals=proposals,
+                approval_request=approval_request,
+                artifacts=artifacts,
+                receipts=receipts,
+            )
+
+        if dispatch_result.status == "needs_user_takeover":
+            approval_request = _extract_takeover_request(result=result, report=report)
             return NodeCompletionAction(
                 action="pause_for_approval",
                 node_id=node_id,

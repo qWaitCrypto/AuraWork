@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import mimetypes
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,10 +19,10 @@ from aura.runtime.protocol import Op, OpKind
 from aura.runtime.validate import validate_project_session
 from aura.runtime.agent_browser import (
     agent_browser_daemon_socket_dir,
-    agent_browser_daemon_stream_file,
+    agent_browser_daemon_stream_file_for_session,
     agent_browser_session_for_aura_session,
     agent_browser_socket_dir_for_project,
-    agent_browser_stream_port_file,
+    agent_browser_stream_port_file_for_session,
 )
 
 from .runtime import WebRuntime
@@ -520,29 +521,38 @@ def build_app(*, project_root: Path) -> FastAPI:
             return None
         return None
 
-    def _browser_stream_port(*, project_root: Path, session_id: str) -> int | None:
+    _AGENT_SESSION_TOKEN_RE = re.compile(r"^[A-Za-z0-9_\-]{1,120}$")
+
+    def _resolve_agent_session(*, session_id: str, agent_session: str | None) -> str:
+        requested = str(agent_session or "").strip()
+        if requested and _AGENT_SESSION_TOKEN_RE.match(requested):
+            return requested
+        return agent_browser_session_for_aura_session(session_id)
+
+    def _browser_stream_port(*, project_root: Path, session_id: str, agent_session: str | None = None) -> int | None:
         # Prefer daemon-written file (source of truth), then Aura's allocated port file.
-        p1 = agent_browser_daemon_stream_file(project_root, aura_session_id=session_id)
-        p2 = agent_browser_stream_port_file(project_root, aura_session_id=session_id)
+        resolved = _resolve_agent_session(session_id=session_id, agent_session=agent_session)
+        p1 = agent_browser_daemon_stream_file_for_session(agent_session=resolved)
+        p2 = agent_browser_stream_port_file_for_session(project_root, agent_session=resolved)
         return _read_int_file(p1) or _read_int_file(p2)
 
     @app.get("/api/sessions/{session_id}/browser/stream")
-    def get_browser_stream(session_id: str) -> dict[str, Any]:
+    def get_browser_stream(session_id: str, agent_session: str | None = None) -> dict[str, Any]:
         rt, _wid = _runtime_for_session(session_id)
         try:
             rt.ensure_session(session_id=session_id)
         except FileNotFoundError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
 
-        agent_session = agent_browser_session_for_aura_session(session_id)
+        resolved_agent_session = _resolve_agent_session(session_id=session_id, agent_session=agent_session)
         aura_state_dir = agent_browser_socket_dir_for_project(rt.project_root)
         daemon_socket_dir = agent_browser_daemon_socket_dir()
-        daemon_stream_file = agent_browser_daemon_stream_file(rt.project_root, aura_session_id=session_id)
-        aura_port_file = agent_browser_stream_port_file(rt.project_root, aura_session_id=session_id)
-        port = _browser_stream_port(project_root=rt.project_root, session_id=session_id)
+        daemon_stream_file = agent_browser_daemon_stream_file_for_session(agent_session=resolved_agent_session)
+        aura_port_file = agent_browser_stream_port_file_for_session(rt.project_root, agent_session=resolved_agent_session)
+        port = _browser_stream_port(project_root=rt.project_root, session_id=session_id, agent_session=resolved_agent_session)
         return {
             "enabled": os.environ.get("AURA_ENABLE_BROWSER_STREAMING") == "1",
-            "agent_session": agent_session,
+            "agent_session": resolved_agent_session,
             "aura_state_dir": str(aura_state_dir),
             "daemon_socket_dir": str(daemon_socket_dir),
             "daemon_stream_file": str(daemon_stream_file),
@@ -632,9 +642,13 @@ def build_app(*, project_root: Path) -> FastAPI:
                             if not approval_id or decision not in {"approve", "deny"}:
                                 await send({"type": "error", "message": "approval requires approval_id + decision=approve|deny"})
                                 continue
+                            payload: dict[str, Any] = {"approval_id": approval_id, "decision": decision}
+                            note = msg.get("note")
+                            if isinstance(note, str) and note.strip():
+                                payload["note"] = note.strip()
                             op = Op(
                                 kind=OpKind.APPROVAL_DECISION.value,
-                                payload={"approval_id": approval_id, "decision": decision},
+                                payload=payload,
                                 session_id=session_id,
                                 request_id=rt.new_request_id(),
                                 timestamp=rt.now_ts_ms(),
@@ -688,6 +702,9 @@ def build_app(*, project_root: Path) -> FastAPI:
             await ws.close(code=1008)
             return
 
+        requested_agent_session = ws.query_params.get("agent_session") if ws.query_params is not None else None
+        stream_agent_session = _resolve_agent_session(session_id=session_id, agent_session=requested_agent_session)
+
         await ws.accept()
 
         async def send(obj: dict[str, Any]) -> bool:
@@ -709,7 +726,7 @@ def build_app(*, project_root: Path) -> FastAPI:
         async def wait_for_port() -> int | None:
             # Wait until either the stream port is known (browser__run invoked) or the client disconnects.
             while True:
-                port = _browser_stream_port(project_root=rt.project_root, session_id=session_id)
+                port = _browser_stream_port(project_root=rt.project_root, session_id=session_id, agent_session=stream_agent_session)
                 if port:
                     return port
                 # Keep the connection responsive to pings while waiting.
@@ -743,7 +760,7 @@ def build_app(*, project_root: Path) -> FastAPI:
                             "connected": True,
                             "screencasting": True,
                             "port": port,
-                            "agent_session": agent_browser_session_for_aura_session(session_id),
+                            "agent_session": stream_agent_session,
                         }
                     )
 
@@ -782,7 +799,7 @@ def build_app(*, project_root: Path) -> FastAPI:
                                             "connected": True,
                                             "screencasting": False,
                                             "port": port,
-                                            "agent_session": agent_browser_session_for_aura_session(session_id),
+                                            "agent_session": stream_agent_session,
                                         }
                                     )
                                     raise RuntimeError("agent_browser_not_launched")

@@ -13,7 +13,8 @@ from typing import Any, ClassVar
 from ..stores import ArtifactStore
 from ..agent_browser import (
     agent_browser_session_for_aura_session,
-    ensure_agent_browser_stream_port,
+    agent_browser_session_for_subagent_run,
+    ensure_agent_browser_stream_port_for_session,
 )
 from .browser_steps import parse_browser_steps
 from .runtime import ToolExecutionContext
@@ -177,12 +178,28 @@ class BrowserRunTool:
 
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
+        agent_session: str | None = None
+        stream_port: int | None = None
+
         if context is not None:
-            agent_session = agent_browser_session_for_aura_session(context.session_id)
+            meta = context.metadata if isinstance(getattr(context, "metadata", None), dict) else {}
+            preferred_session = meta.get("aura_browser_agent_session") if isinstance(meta, dict) else None
+            if isinstance(preferred_session, str) and preferred_session.strip():
+                agent_session = preferred_session.strip()
+            else:
+                subagent_run_id = meta.get("aura_subagent_run_id") if isinstance(meta, dict) else None
+                if isinstance(subagent_run_id, str) and subagent_run_id.strip():
+                    agent_session = agent_browser_session_for_subagent_run(
+                        aura_session_id=context.session_id,
+                        subagent_run_id=subagent_run_id.strip(),
+                    )
+                else:
+                    agent_session = agent_browser_session_for_aura_session(context.session_id)
+
             env["AGENT_BROWSER_SESSION"] = agent_session
             if str(env.get("AURA_ENABLE_BROWSER_STREAMING") or "").strip() == "1":
-                port = ensure_agent_browser_stream_port(project_root, aura_session_id=context.session_id)
-                env["AGENT_BROWSER_STREAM_PORT"] = str(port)
+                stream_port = ensure_agent_browser_stream_port_for_session(project_root, agent_session=agent_session)
+                env["AGENT_BROWSER_STREAM_PORT"] = str(stream_port)
 
         results: list[dict[str, Any]] = []
         for step_argv in steps:
@@ -276,7 +293,12 @@ class BrowserRunTool:
             )
 
         ok = all(r.get("exit_code") == 0 and not r.get("timed_out") for r in results)
-        return {
+        out: dict[str, Any] = {
             "ok": ok,
             "steps": results,
         }
+        if isinstance(agent_session, str) and agent_session.strip():
+            out["agent_session"] = agent_session.strip()
+        if isinstance(stream_port, int) and 1 <= stream_port <= 65535:
+            out["stream_port"] = int(stream_port)
+        return out

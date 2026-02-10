@@ -146,6 +146,107 @@ def _normalize_tool_calls(tool_calls: list[ToolCall] | None) -> list[ToolCall]:
     return out
 
 
+def _clean_string_list(raw: Any, *, limit_items: int = 50, item_max_len: int = 240) -> list[str]:
+    out: list[str] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        s = " ".join(item.split()).strip()
+        if not s:
+            continue
+        if len(s) > item_max_len:
+            s = s[: item_max_len - 1] + "…"
+        out.append(s)
+        if len(out) >= limit_items:
+            break
+    return out
+
+
+def _public_work_spec_from_args(args: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(args, dict):
+        return None
+    ws = args.get("work_spec")
+    if not isinstance(ws, dict):
+        return None
+
+    out: dict[str, Any] = {}
+
+    goal = ws.get("goal")
+    if isinstance(goal, str):
+        goal_clean = " ".join(goal.split()).strip()
+        if goal_clean:
+            if len(goal_clean) > 400:
+                goal_clean = goal_clean[:399] + "…"
+            out["goal"] = goal_clean
+
+    expected_raw = ws.get("expected_outputs")
+    if isinstance(expected_raw, list):
+        expected_outputs: list[dict[str, str]] = []
+        for item in expected_raw:
+            if not isinstance(item, dict):
+                continue
+            rec: dict[str, str] = {}
+            for key, max_len in (("type", 80), ("format", 80), ("path", 320)):
+                v = item.get(key)
+                if not isinstance(v, str):
+                    continue
+                s = " ".join(v.split()).strip()
+                if not s:
+                    continue
+                if len(s) > max_len:
+                    s = s[: max_len - 1] + "…"
+                rec[key] = s
+            if rec:
+                expected_outputs.append(rec)
+            if len(expected_outputs) >= 50:
+                break
+        if expected_outputs:
+            out["expected_outputs"] = expected_outputs
+
+    scope_raw = ws.get("resource_scope")
+    if isinstance(scope_raw, dict):
+        scope: dict[str, Any] = {}
+        roots = _clean_string_list(scope_raw.get("workspace_roots"), limit_items=50, item_max_len=240)
+        domains = _clean_string_list(scope_raw.get("domain_allowlist"), limit_items=50, item_max_len=240)
+        ftypes = _clean_string_list(scope_raw.get("file_type_allowlist"), limit_items=50, item_max_len=120)
+        if roots:
+            scope["workspace_roots"] = roots
+        if domains:
+            scope["domain_allowlist"] = domains
+        if ftypes:
+            scope["file_type_allowlist"] = ftypes
+        if scope:
+            out["resource_scope"] = scope
+
+    inputs_raw = ws.get("inputs")
+    if isinstance(inputs_raw, list):
+        inputs: list[dict[str, str]] = []
+        for item in inputs_raw:
+            if not isinstance(item, dict):
+                continue
+            rec: dict[str, str] = {}
+            for key, max_len in (("type", 80), ("path", 320), ("description", 320)):
+                v = item.get(key)
+                if not isinstance(v, str):
+                    continue
+                s = " ".join(v.split()).strip()
+                if not s:
+                    continue
+                if len(s) > max_len:
+                    s = s[: max_len - 1] + "…"
+                rec[key] = s
+            if rec:
+                inputs.append(rec)
+            if len(inputs) >= 50:
+                break
+        if inputs:
+            out["inputs"] = inputs
+
+    return out or None
+
+
 _DEFAULT_EXPOSED_TOOL_NAMES: set[str] = {
     # Project filesystem (read + navigate)
     "project__read_text",
@@ -219,6 +320,7 @@ class AgnoAsyncEngine:
     # Future Web/Plugin/Cloud surfaces should follow `aura/runtime/surface.py`.
     _auto_compact_seen_turn_ids: set[str] = field(default_factory=set, init=False, repr=False)
     _event_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    _dag_runner: DAGPlanRunner | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.project_root = self.project_root.expanduser().resolve()
@@ -283,9 +385,10 @@ class AgnoAsyncEngine:
             registry.register(subagent_tool)
 
             dag_runner = DAGPlanRunner(plan_store=self.plan_store, max_parallel=3)
+            self._dag_runner = dag_runner
             registry.register(DAGExecuteNextTool(dag_runner=dag_runner, subagent_tool=subagent_tool))
         except Exception:
-            pass
+            self._dag_runner = None
 
         self.tool_registry = registry
         self.tool_runtime = tool_runtime
@@ -594,6 +697,9 @@ class AgnoAsyncEngine:
         pending = list(snapshot.pending_tools)
 
         approval_record: ApprovalRecord | None = None
+        approval_event_kind: EventKind | None = None
+        approval_event_decision: str | None = None
+        approval_event_details: dict[str, Any] | None = None
         # Clear approvals if all required decisions are present.
         approval_id = snapshot.approval_id
         if approval_id:
@@ -611,8 +717,38 @@ class AgnoAsyncEngine:
                     updated = replace(approval_record, status=status, decision=record_decision)
                     self.approval_store.update(updated)
                     approval_record = updated
+                    approval_event_kind = EventKind.APPROVAL_GRANTED if status is ApprovalStatus.GRANTED else EventKind.APPROVAL_DENIED
+                    approval_event_decision = "approve" if status is ApprovalStatus.GRANTED else "deny"
+                    approval_event_details = record_decision
             except Exception:
                 pass
+
+        if approval_record is not None and approval_event_kind is not None and approval_id:
+            await self._emit(
+                kind=approval_event_kind,
+                payload={
+                    "approval_id": approval_id,
+                    "run_id": run_id,
+                    "decision": approval_event_decision,
+                    "details": (approval_event_details or {}),
+                },
+                request_id=run_id,
+                turn_id=turn_id,
+                step_id=None,
+            )
+            if approval_event_kind is EventKind.APPROVAL_GRANTED:
+                await self._emit(
+                    kind=EventKind.RUN_RESUMED,
+                    payload={
+                        "run_id": run_id,
+                        "approval_id": approval_id,
+                        "decision": "approve",
+                        "pending_tools_count": len(pending),
+                    },
+                    request_id=run_id,
+                    turn_id=turn_id,
+                    step_id=None,
+                )
 
         # If this approval originated from a subagent run, auto-resume the delegated work
         # after the user approves, so the subagent continues without requiring the main agent
@@ -635,6 +771,26 @@ class AgnoAsyncEngine:
             # We already executed the approved tool calls (and re-dispatched the subagent).
             pending = []
             decision_map = {}
+
+        # For DAG browser-takeover pauses, approval means the human has completed
+        # CAPTCHA/login and we should re-dispatch `dag__execute_next` immediately.
+        if (
+            approval_record is not None
+            and isinstance(approval_record.resume_payload, dict)
+            and approval_record.resume_payload.get("source") == "dag"
+            and any(d.decision == "approve" for d in decisions)
+        ):
+            dag_payload = approval_record.resume_payload.get("dag")
+            if isinstance(dag_payload, dict) and dag_payload.get("takeover") is True:
+                await self._auto_resume_dag_after_takeover(
+                    approval_record=approval_record,
+                    request_id=run_id,
+                    turn_id=turn_id,
+                    timeout_s=timeout_s,
+                    cancel=cancel,
+                )
+                pending = []
+                decision_map = {}
 
         result = await self._run_tool_loop(
             request_id=run_id,
@@ -780,6 +936,73 @@ class AgnoAsyncEngine:
                     content=tool_message_sub,
                     tool_call_id=call_id,
                     tool_name="subagent__run",
+                )
+            )
+
+
+    async def _auto_resume_dag_after_takeover(
+        self,
+        *,
+        approval_record: ApprovalRecord,
+        request_id: str,
+        turn_id: str | None,
+        timeout_s: float | None,
+        cancel: CancellationToken | None,
+    ) -> None:
+        cancel = cancel or CancellationToken()
+        if cancel.cancelled:
+            return
+        if self.tool_registry is None or self.tool_runtime is None:
+            return
+        if self._history is None:
+            self._history = []
+
+        payload = approval_record.resume_payload if isinstance(approval_record.resume_payload, dict) else None
+        if not isinstance(payload, dict):
+            return
+        dag_payload = payload.get("dag")
+        if not isinstance(dag_payload, dict):
+            return
+        if dag_payload.get("takeover") is not True:
+            return
+
+        run_args = dag_payload.get("dag_execute_args")
+        if not isinstance(run_args, dict):
+            run_args = {}
+
+        async with AsyncExitStack() as stack:
+            mcp_functions, _mcp_specs = await self._load_mcp_tooling(stack=stack)
+
+            call_id = new_tool_call_id()
+            self._history.append(
+                CanonicalMessage(
+                    role=CanonicalMessageRole.ASSISTANT,
+                    content="",
+                    tool_calls=[ToolCall(tool_call_id=call_id, name="dag__execute_next", arguments=deepcopy(run_args))],
+                )
+            )
+
+            planned = self.tool_runtime.plan(
+                tool_execution_id=f"tool_{call_id}",
+                tool_name="dag__execute_next",
+                tool_call_id=call_id,
+                arguments=deepcopy(run_args),
+            )
+            inspection = self._inspect_tool(planned=planned, mcp_functions=mcp_functions)
+            tool_message = await self._execute_planned_after_decisions(
+                planned=planned,
+                inspection=inspection,
+                decision=None,
+                request_id=request_id,
+                turn_id=turn_id,
+                mcp_functions=mcp_functions,
+            )
+            self._history.append(
+                CanonicalMessage(
+                    role=CanonicalMessageRole.TOOL,
+                    content=tool_message,
+                    tool_call_id=call_id,
+                    tool_name="dag__execute_next",
                 )
             )
 
@@ -1293,7 +1516,7 @@ class AgnoAsyncEngine:
                             msg = None
                         if isinstance(msg, dict):
                             sub = msg.get("result")
-                            if isinstance(sub, dict) and str(sub.get("status") or "") == "needs_approval":
+                            if isinstance(sub, dict):
                                 report = sub.get("report")
                                 if isinstance(report, str):
                                     try:
@@ -1302,6 +1525,21 @@ class AgnoAsyncEngine:
                                         report_any = None
                                     report = report_any
 
+                                takeover_requested = False
+                                status_raw = str(sub.get("status") or "").strip().lower()
+                                if status_raw in {"needs_user_takeover", "user_takeover_required", "needs_takeover"}:
+                                    takeover_requested = True
+                                if isinstance(report, dict):
+                                    report_status = str(report.get("status") or "").strip().lower()
+                                    if report_status in {"needs_user_takeover", "user_takeover_required", "needs_takeover"}:
+                                        takeover_requested = True
+                                    if not takeover_requested:
+                                        next_step = report.get("next_step_suggestion")
+                                        if isinstance(next_step, dict):
+                                            rec = str(next_step.get("recommended") or next_step.get("action") or "").strip().lower()
+                                            if rec in {"needs_user_takeover", "user_takeover_required", "needs_takeover"}:
+                                                takeover_requested = True
+
                                 needs_raw = report.get("needs_approval") if isinstance(report, dict) else None
                                 needs_list: list[dict[str, Any]] = []
                                 if isinstance(needs_raw, dict):
@@ -1309,7 +1547,7 @@ class AgnoAsyncEngine:
                                 elif isinstance(needs_raw, list):
                                     needs_list = [x for x in needs_raw if isinstance(x, dict)]
 
-                                if needs_list and self.tool_runtime is not None:
+                                if (needs_list or takeover_requested) and self.tool_runtime is not None:
                                     pending_planned: list[PlannedToolCall] = []
                                     for req in needs_list:
                                         tool_name = req.get("tool_name")
@@ -1374,6 +1612,7 @@ class AgnoAsyncEngine:
                                                     # Needed to continue the delegated work after the user approves.
                                                     # This is safe to persist: it's a plain JSON dict (no local paths required here).
                                                     "run_args": dict(planned.arguments) if isinstance(planned.arguments, dict) else {},
+                                                    "takeover": False,
                                                 },
                                             },
                                         )
@@ -1389,48 +1628,326 @@ class AgnoAsyncEngine:
                                             error="Subagent requested approval.",
                                         )
 
+                                    if takeover_requested:
+                                        takeover_next = report.get("next_step_suggestion") if isinstance(report, dict) else None
+                                        if not isinstance(takeover_next, dict):
+                                            takeover_next = {}
+                                        focus_action = str(
+                                            (report.get("action_summary") if isinstance(report, dict) else None)
+                                            or takeover_next.get("action_summary")
+                                            or "Subagent requires user takeover. Complete verification/login and approve to resume."
+                                        ).strip()
+                                        focus_reason = str(
+                                            (report.get("reason") if isinstance(report, dict) else None)
+                                            or takeover_next.get("reason")
+                                            or takeover_next.get("message")
+                                            or "Browser task hit CAPTCHA/login/2FA and needs human takeover."
+                                        ).strip()
+
+                                        takeover_context: dict[str, Any] = {}
+                                        current_url = None
+                                        if isinstance(report, dict):
+                                            current_url = report.get("current_url")
+                                        if not isinstance(current_url, str) or not current_url.strip():
+                                            current_url = takeover_next.get("current_url")
+                                        if isinstance(current_url, str) and current_url.strip():
+                                            takeover_context["current_url"] = current_url.strip()
+
+                                        screenshot = None
+                                        if isinstance(report, dict):
+                                            screenshot = report.get("screenshot")
+                                        if not isinstance(screenshot, str) or not screenshot.strip():
+                                            screenshot = takeover_next.get("screenshot")
+                                        if isinstance(screenshot, str) and screenshot.strip():
+                                            takeover_context["screenshot"] = screenshot.strip()
+
+                                        next_step_hint = None
+                                        if isinstance(report, dict):
+                                            next_step_hint = report.get("next_step")
+                                        if not isinstance(next_step_hint, str) or not next_step_hint.strip():
+                                            next_step_hint = takeover_next.get("next_step")
+                                        if isinstance(next_step_hint, str) and next_step_hint.strip():
+                                            takeover_context["next_step"] = next_step_hint.strip()
+
+                                        sub_run_id = sub.get("subagent_run_id") if isinstance(sub, dict) else None
+                                        if isinstance(sub_run_id, str) and sub_run_id.strip():
+                                            takeover_context["subagent_run_id"] = sub_run_id.strip()
+                                        browser_agent_session = sub.get("browser_agent_session") if isinstance(sub, dict) else None
+                                        if isinstance(browser_agent_session, str) and browser_agent_session.strip():
+                                            takeover_context["browser_agent_session"] = browser_agent_session.strip()
+
+                                        class _PauseInspection:
+                                            action_summary: str = focus_action
+                                            risk_level: str = "medium"
+                                            reason: str = focus_reason
+                                            diff_ref: Any | None = None
+
+                                        approval_id = await self._pause_run(
+                                            request_id=request_id,
+                                            turn_id=turn_id,
+                                            planned_calls=[],
+                                            context_stats=context_stats,
+                                            model_profile_id=getattr(profile, "profile_id", None),
+                                            inspection=_PauseInspection(),
+                                            focus_tool_call_id=None,
+                                            resume_payload_extra={
+                                                "source": "subagent",
+                                                "subagent": {
+                                                    "subagent_run_id": sub.get("subagent_run_id"),
+                                                    "preset": sub.get("preset"),
+                                                    "origin_tool_call_id": planned.tool_call_id,
+                                                    "origin_tool_execution_id": planned.tool_execution_id,
+                                                    "transcript_ref": sub.get("transcript_ref"),
+                                                    "run_args": dict(planned.arguments) if isinstance(planned.arguments, dict) else {},
+                                                    "takeover": True,
+                                                    "takeover_context": takeover_context,
+                                                },
+                                            },
+                                        )
+                                        return RunResult(
+                                            status="needs_approval",
+                                            run_id=request_id,
+                                            session_id=self.session_id,
+                                            approval_id=approval_id,
+                                            pending_tools=[],
+                                            error="Subagent requested user takeover.",
+                                        )
+
                     # DAG approval passthrough: `dag__execute_next` may dispatch subagents that request
-                    # approvals for internal tool calls (e.g. shell commands). Convert those into a
-                    # first-class approval pause so the CLI/web UI can show a direct y/n prompt without
-                    # requiring an extra main-agent LLM turn.
+                    # approvals for internal tool calls (e.g. shell commands) or require browser takeover.
+                    # Convert those into first-class approval pauses for UI parity.
                     if planned.tool_name == "dag__execute_next":
                         try:
                             msg = json.loads(tool_message)
                         except Exception:
                             msg = None
 
-                        needs_list: list[dict[str, Any]] = []
+                        approval_entries: list[tuple[str | None, dict[str, Any]]] = []
                         blocked_node: str | None = None
+                        blocked_nodes: list[str] = []
+
+                        def _is_takeover_req(req_any: dict[str, Any]) -> bool:
+                            mode = str(req_any.get("mode") or req_any.get("kind") or req_any.get("status") or "").strip().lower()
+                            return mode in {"user_takeover", "needs_user_takeover", "user_takeover_required", "needs_takeover"}
+
                         if isinstance(msg, dict):
                             dag_res = msg.get("result")
                             if isinstance(dag_res, dict):
                                 blocked_node_raw = dag_res.get("blocked_node")
                                 if isinstance(blocked_node_raw, str) and blocked_node_raw.strip():
                                     blocked_node = blocked_node_raw.strip()
+                                    blocked_nodes.append(blocked_node)
+
+                                blocked_nodes_raw = dag_res.get("blocked_nodes")
+                                if isinstance(blocked_nodes_raw, list):
+                                    for node_any in blocked_nodes_raw:
+                                        if isinstance(node_any, str) and node_any.strip():
+                                            blocked_nodes.append(node_any.strip())
+
+                                node_results = dag_res.get("node_results")
+                                if isinstance(node_results, dict):
+                                    for node_id_any, node_any in node_results.items():
+                                        if not isinstance(node_any, dict):
+                                            continue
+                                        if str(node_any.get("status") or "") != "needs_approval":
+                                            continue
+                                        node_id = node_id_any.strip() if isinstance(node_id_any, str) and node_id_any.strip() else None
+                                        if node_id:
+                                            blocked_nodes.append(node_id)
+                                        req = node_any.get("approval_request")
+                                        if isinstance(req, dict):
+                                            req_copy = dict(req)
+                                            if node_id and not isinstance(req_copy.get("node_id"), str):
+                                                req_copy["node_id"] = node_id
+                                            approval_entries.append((node_id, req_copy))
+
                                 blocked = dag_res.get("blocked_approval")
                                 if isinstance(blocked, dict):
                                     reqs = blocked.get("requests")
                                     if isinstance(reqs, list):
-                                        needs_list = [r for r in reqs if isinstance(r, dict)]
+                                        for req_any in reqs:
+                                            if not isinstance(req_any, dict):
+                                                continue
+                                            req_copy = dict(req_any)
+                                            if blocked_node and not isinstance(req_copy.get("node_id"), str):
+                                                req_copy["node_id"] = blocked_node
+                                            approval_entries.append((blocked_node, req_copy))
                                     else:
-                                        needs_list = [blocked]
+                                        req_copy = dict(blocked)
+                                        if blocked_node and not isinstance(req_copy.get("node_id"), str):
+                                            req_copy["node_id"] = blocked_node
+                                        approval_entries.append((blocked_node, req_copy))
                                 elif isinstance(blocked, list):
-                                    needs_list = [r for r in blocked if isinstance(r, dict)]
-                                else:
-                                    node_results = dag_res.get("node_results")
-                                    if isinstance(node_results, dict):
-                                        for node_any in node_results.values():
-                                            if not isinstance(node_any, dict):
-                                                continue
-                                            if str(node_any.get("status") or "") != "needs_approval":
-                                                continue
-                                            req = node_any.get("approval_request")
-                                            if isinstance(req, dict):
-                                                needs_list.append(req)
+                                    for req_any in blocked:
+                                        if not isinstance(req_any, dict):
+                                            continue
+                                        req_copy = dict(req_any)
+                                        if blocked_node and not isinstance(req_copy.get("node_id"), str):
+                                            req_copy["node_id"] = blocked_node
+                                        approval_entries.append((blocked_node, req_copy))
 
-                        if needs_list and self.tool_runtime is not None:
+                                blocked_many = dag_res.get("blocked_approvals")
+                                if isinstance(blocked_many, list):
+                                    for item in blocked_many:
+                                        if not isinstance(item, dict):
+                                            continue
+                                        node_id_any = item.get("node_id")
+                                        node_id = node_id_any.strip() if isinstance(node_id_any, str) and node_id_any.strip() else None
+                                        if node_id:
+                                            blocked_nodes.append(node_id)
+                                        req_copy = dict(item)
+                                        if node_id and not isinstance(req_copy.get("node_id"), str):
+                                            req_copy["node_id"] = node_id
+                                        approval_entries.append((node_id, req_copy))
+
+                        # De-duplicate requests while preserving order.
+                        dedup: set[tuple[str, str, str, str, str, str]] = set()
+                        deduped_entries: list[tuple[str | None, dict[str, Any]]] = []
+                        for node_id, req in approval_entries:
+                            if not isinstance(req, dict):
+                                continue
+                            req_node = req.get("node_id")
+                            node_val = req_node.strip() if isinstance(req_node, str) and req_node.strip() else (node_id or "")
+                            mode = str(req.get("mode") or req.get("kind") or req.get("status") or "").strip().lower()
+                            tool_name = str(req.get("tool_name") or req.get("tool") or "").strip()
+                            tool_call_id = str(req.get("tool_call_id") or "").strip()
+                            current_url = str(req.get("current_url") or "").strip()
+                            action = str(req.get("action_summary") or req.get("summary") or req.get("reason") or "").strip()
+                            key = (node_val, mode, tool_name, tool_call_id, current_url, action)
+                            if key in dedup:
+                                continue
+                            dedup.add(key)
+                            deduped_entries.append((node_val or node_id, req))
+
+                        approval_entries = deduped_entries
+
+                        if approval_entries and self.tool_runtime is not None:
+                            # Release all blocked DAG nodes so they can be redispatched after each decision.
+                            if self._dag_runner is not None:
+                                release_nodes: set[str] = set()
+                                if blocked_node:
+                                    release_nodes.add(blocked_node)
+                                for node_id in blocked_nodes:
+                                    if isinstance(node_id, str) and node_id.strip():
+                                        release_nodes.add(node_id.strip())
+                                for node_id, req in approval_entries:
+                                    if isinstance(node_id, str) and node_id.strip():
+                                        release_nodes.add(node_id.strip())
+                                    req_node = req.get("node_id") if isinstance(req, dict) else None
+                                    if isinstance(req_node, str) and req_node.strip():
+                                        release_nodes.add(req_node.strip())
+                                for node_id in sorted(release_nodes):
+                                    try:
+                                        self._dag_runner.release_running(node_id)
+                                    except Exception:
+                                        pass
+
+                            # Serialize concurrent approvals/takeovers: focus one request at a time.
+                            focus_idx = 0
+                            for i_entry, (_node_id, req) in enumerate(approval_entries):
+                                if isinstance(req, dict) and _is_takeover_req(req):
+                                    focus_idx = i_entry
+                                    break
+
+                            focus_node, focus_req = approval_entries[focus_idx]
+                            queue_summary: list[dict[str, Any]] = []
+                            for i_entry, (node_id, req) in enumerate(approval_entries):
+                                if i_entry == focus_idx or not isinstance(req, dict):
+                                    continue
+                                queue_summary.append(
+                                    {
+                                        "node_id": node_id,
+                                        "mode": str(req.get("mode") or req.get("kind") or req.get("status") or "").strip().lower() or None,
+                                        "tool_name": str(req.get("tool_name") or req.get("tool") or "").strip() or None,
+                                        "action_summary": str(req.get("action_summary") or req.get("summary") or "").strip() or None,
+                                        "current_url": str(req.get("current_url") or "").strip() or None,
+                                        "subagent_run_id": str(req.get("subagent_run_id") or "").strip() or None,
+                                        "browser_agent_session": str(req.get("browser_agent_session") or req.get("agent_session") or "").strip() or None,
+                                    }
+                                )
+
+                            if _is_takeover_req(focus_req):
+                                base_action = str(focus_req.get("action_summary") or focus_req.get("summary") or "").strip()
+                                if focus_node:
+                                    prefix = f"DAG node {focus_node} requires user takeover"
+                                else:
+                                    prefix = "DAG requires user takeover"
+                                focus_action = f"{prefix}: {base_action}" if base_action else f"{prefix}. Complete verification/login and approve to resume."
+                                focus_reason = str(
+                                    focus_req.get("reason")
+                                    or "Browser task hit CAPTCHA/login/2FA and needs human takeover."
+                                ).strip()
+
+                                takeover_context: dict[str, Any] = {}
+                                current_url = focus_req.get("current_url")
+                                if isinstance(current_url, str) and current_url.strip():
+                                    takeover_context["current_url"] = current_url.strip()
+                                screenshot = focus_req.get("screenshot")
+                                if isinstance(screenshot, str) and screenshot.strip():
+                                    takeover_context["screenshot"] = screenshot.strip()
+                                next_step_hint = focus_req.get("next_step")
+                                if not isinstance(next_step_hint, str) or not next_step_hint.strip():
+                                    nss = focus_req.get("next_step_suggestion")
+                                    if isinstance(nss, dict):
+                                        next_step_hint = nss.get("next_step") or nss.get("message")
+                                if isinstance(next_step_hint, str) and next_step_hint.strip():
+                                    takeover_context["next_step"] = next_step_hint.strip()
+                                req_sub_run_id = focus_req.get("subagent_run_id")
+                                if isinstance(req_sub_run_id, str) and req_sub_run_id.strip():
+                                    takeover_context["subagent_run_id"] = req_sub_run_id.strip()
+                                req_browser_session = focus_req.get("browser_agent_session")
+                                if not isinstance(req_browser_session, str) or not req_browser_session.strip():
+                                    req_browser_session = focus_req.get("agent_session")
+                                if isinstance(req_browser_session, str) and req_browser_session.strip():
+                                    takeover_context["browser_agent_session"] = req_browser_session.strip()
+
+                                class _PauseInspection:
+                                    action_summary: str = focus_action
+                                    risk_level: str = "medium"
+                                    reason: str = focus_reason
+                                    diff_ref: Any | None = None
+
+                                approval_id = await self._pause_run(
+                                    request_id=request_id,
+                                    turn_id=turn_id,
+                                    planned_calls=[],
+                                    context_stats=context_stats,
+                                    model_profile_id=getattr(profile, "profile_id", None),
+                                    inspection=_PauseInspection(),
+                                    focus_tool_call_id=None,
+                                    resume_payload_extra={
+                                        "source": "dag",
+                                        "dag": {
+                                            "blocked_node": focus_node,
+                                            "origin_tool_call_id": planned.tool_call_id,
+                                            "origin_tool_execution_id": planned.tool_execution_id,
+                                            "dag_execute_args": dict(planned.arguments) if isinstance(planned.arguments, dict) else {},
+                                            "takeover": True,
+                                            "takeover_context": takeover_context,
+                                            "pending_queue": queue_summary,
+                                        },
+                                    },
+                                )
+                                return RunResult(
+                                    status="needs_approval",
+                                    run_id=request_id,
+                                    session_id=self.session_id,
+                                    approval_id=approval_id,
+                                    pending_tools=[],
+                                    error="DAG requested user takeover.",
+                                )
+
+                            focus_reqs_raw = focus_req.get("requests") if isinstance(focus_req, dict) else None
+                            focus_reqs: list[dict[str, Any]] = []
+                            if isinstance(focus_reqs_raw, list):
+                                focus_reqs = [r for r in focus_reqs_raw if isinstance(r, dict)]
+                            if not focus_reqs:
+                                focus_reqs = [focus_req]
+
                             pending_planned: list[PlannedToolCall] = []
-                            for req in needs_list:
+                            for req in focus_reqs:
+                                if not isinstance(req, dict):
+                                    continue
                                 tool_name = req.get("tool_name")
                                 if not isinstance(tool_name, str) or not tool_name.strip():
                                     tool_name = req.get("tool")
@@ -1464,10 +1981,9 @@ class AgnoAsyncEngine:
                                 )
 
                             if pending_planned:
-                                focus_req = needs_list[0]
                                 focus_action = str(focus_req.get("action_summary") or focus_req.get("summary") or "").strip()
-                                if blocked_node:
-                                    prefix = f"DAG node {blocked_node} requested approval"
+                                if focus_node:
+                                    prefix = f"DAG node {focus_node} requested approval"
                                 else:
                                     prefix = "DAG requested approval"
                                 if focus_action:
@@ -1495,11 +2011,12 @@ class AgnoAsyncEngine:
                                     resume_payload_extra={
                                         "source": "dag",
                                         "dag": {
-                                            "blocked_node": blocked_node,
+                                            "blocked_node": focus_node,
                                             "origin_tool_call_id": planned.tool_call_id,
                                             "origin_tool_execution_id": planned.tool_execution_id,
-                                            # Use this to optionally re-dispatch after approval.
                                             "dag_execute_args": dict(planned.arguments) if isinstance(planned.arguments, dict) else {},
+                                            "takeover": False,
+                                            "pending_queue": queue_summary,
                                         },
                                     },
                                 )
@@ -1511,10 +2028,9 @@ class AgnoAsyncEngine:
                                     pending_tools=[
                                         PendingToolCall(tool_call_id=p.tool_call_id, tool_name=p.tool_name, args=dict(p.arguments))
                                         for p in pending_planned
-	                                    ],
-	                                    error="DAG requested approval.",
-	                                )
-
+                                    ],
+                                    error="DAG requested approval.",
+                                )
                     # Fail-fast: stop executing further tool calls from the same assistant message after a failure.
                     # Close remaining tool calls as cancelled to keep tool-call pairing valid across providers.
                     try:
@@ -2227,6 +2743,7 @@ class AgnoAsyncEngine:
         )
 
     async def _execute_mcp_tool(self, *, planned: PlannedToolCall, fn: Any, request_id: str, turn_id: str | None) -> str:
+        work_spec_payload = _public_work_spec_from_args(planned.arguments)
         await self._emit(
             kind=EventKind.TOOL_CALL_START,
             payload={
@@ -2236,6 +2753,7 @@ class AgnoAsyncEngine:
                 "arguments_ref": planned.arguments_ref.to_dict(),
                 "summary": f"MCP: {planned.tool_name}",
                 "tool_kind": "mcp",
+                **({"work_spec": work_spec_payload} if work_spec_payload is not None else {}),
             },
             request_id=request_id,
             turn_id=turn_id,
@@ -2298,6 +2816,7 @@ class AgnoAsyncEngine:
                     "error_code": code.value,
                     "error": str(e),
                     "tool_kind": "mcp",
+                **({"work_spec": work_spec_payload} if work_spec_payload is not None else {}),
                 },
                 request_id=request_id,
                 turn_id=turn_id,
@@ -2342,6 +2861,7 @@ class AgnoAsyncEngine:
                 "error_code": error_code if status != "succeeded" else None,
                 "error": error if status != "succeeded" else None,
                 "tool_kind": "mcp",
+                **({"work_spec": work_spec_payload} if work_spec_payload is not None else {}),
             },
             request_id=request_id,
             turn_id=turn_id,
@@ -2579,15 +3099,20 @@ class AgnoAsyncEngine:
                 error_message=error_message,
             )
 
+        work_spec_payload = _public_work_spec_from_args(planned.arguments)
+        start_payload: dict[str, Any] = {
+            "tool_execution_id": planned.tool_execution_id,
+            "tool_name": planned.tool_name,
+            "tool_call_id": planned.tool_call_id,
+            "arguments_ref": planned.arguments_ref.to_dict(),
+            "summary": _summarize_tool_for_ui(planned.tool_name, planned.arguments),
+        }
+        if work_spec_payload is not None:
+            start_payload["work_spec"] = work_spec_payload
+
         await self._emit(
             kind=EventKind.TOOL_CALL_START,
-            payload={
-                "tool_execution_id": planned.tool_execution_id,
-                "tool_name": planned.tool_name,
-                "tool_call_id": planned.tool_call_id,
-                "arguments_ref": planned.arguments_ref.to_dict(),
-                "summary": _summarize_tool_for_ui(planned.tool_name, planned.arguments),
-            },
+            payload=start_payload,
             request_id=request_id,
             turn_id=turn_id,
             step_id=planned.tool_execution_id,
@@ -2599,6 +3124,7 @@ class AgnoAsyncEngine:
             turn_id=turn_id,
             tool_execution_id=planned.tool_execution_id,
             event_bus=self.event_bus,
+            metadata={"aura_request_id": request_id, "aura_turn_id": turn_id},
         )
 
         started = time.monotonic()
@@ -2628,20 +3154,24 @@ class AgnoAsyncEngine:
                 ensure_ascii=False,
             )
             tool_message_ref = self.artifact_store.put(tool_message, kind="tool_message", meta={"summary": f"{planned.tool_name} tool_result (error)"})
+            end_payload: dict[str, Any] = {
+                "tool_execution_id": planned.tool_execution_id,
+                "tool_name": planned.tool_name,
+                "tool_call_id": planned.tool_call_id,
+                "summary": _summarize_tool_for_ui(planned.tool_name, planned.arguments),
+                "status": "failed",
+                "duration_ms": duration_ms,
+                "output_ref": output_ref.to_dict(),
+                "tool_message_ref": tool_message_ref.to_dict(),
+                "error_code": code.value,
+                "error": str(e),
+            }
+            if work_spec_payload is not None:
+                end_payload["work_spec"] = work_spec_payload
+
             await self._emit(
                 kind=EventKind.TOOL_CALL_END,
-                payload={
-                    "tool_execution_id": planned.tool_execution_id,
-                    "tool_name": planned.tool_name,
-                    "tool_call_id": planned.tool_call_id,
-                    "summary": _summarize_tool_for_ui(planned.tool_name, planned.arguments),
-                    "status": "failed",
-                    "duration_ms": duration_ms,
-                    "output_ref": output_ref.to_dict(),
-                    "tool_message_ref": tool_message_ref.to_dict(),
-                    "error_code": code.value,
-                    "error": str(e),
-                },
+                payload=end_payload,
                 request_id=request_id,
                 turn_id=turn_id,
                 step_id=planned.tool_execution_id,
@@ -2681,21 +3211,25 @@ class AgnoAsyncEngine:
                 )
             except Exception:
                 details = None
+        end_payload: dict[str, Any] = {
+            "tool_execution_id": planned.tool_execution_id,
+            "tool_name": planned.tool_name,
+            "tool_call_id": planned.tool_call_id,
+            "summary": _summarize_tool_for_ui(planned.tool_name, planned.arguments),
+            "status": status,
+            "duration_ms": duration_ms,
+            "output_ref": output_ref.to_dict(),
+            "tool_message_ref": tool_message_ref.to_dict(),
+            "error_code": error_code if status != "succeeded" else None,
+            "error": error if status != "succeeded" else None,
+            "details": details,
+        }
+        if work_spec_payload is not None:
+            end_payload["work_spec"] = work_spec_payload
+
         await self._emit(
             kind=EventKind.TOOL_CALL_END,
-            payload={
-                "tool_execution_id": planned.tool_execution_id,
-                "tool_name": planned.tool_name,
-                "tool_call_id": planned.tool_call_id,
-                "summary": _summarize_tool_for_ui(planned.tool_name, planned.arguments),
-                "status": status,
-                "duration_ms": duration_ms,
-                "output_ref": output_ref.to_dict(),
-                "tool_message_ref": tool_message_ref.to_dict(),
-                "error_code": error_code if status != "succeeded" else None,
-                "error": error if status != "succeeded" else None,
-                "details": details,
-            },
+            payload=end_payload,
             request_id=request_id,
             turn_id=turn_id,
             step_id=planned.tool_execution_id,
@@ -2809,6 +3343,9 @@ class AgnoAsyncEngine:
             "error_code": error_code,
             "error": error_message,
         }
+        work_spec_payload = _public_work_spec_from_args(planned.arguments)
+        if work_spec_payload is not None:
+            payload["work_spec"] = work_spec_payload
         raw_status = str(status or "").strip()
         if raw_status and raw_status.lower() != normalized_status:
             payload["status_legacy"] = raw_status

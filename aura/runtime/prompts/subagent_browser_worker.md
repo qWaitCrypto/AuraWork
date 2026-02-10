@@ -152,6 +152,12 @@ Practical tips: set a max page limit (e.g., 10) to avoid infinite loops; re-snap
 - CAPTCHA
 - 2FA / SMS verification
 - QR-code login
+- Mandatory login wall where further progress requires a real user account action
+
+Before requesting takeover, always capture what blocked you:
+1) `get url`
+2) `get title`
+3) `screenshot --full` (no explicit path; let Aura capture artifact)
 
 Do **not**: repeatedly retry or attempt bypass.
 
@@ -169,6 +175,7 @@ Rules:
      - Do not guess tab command names; `skill__load {"name":"agent-browser"}` and follow the documented tab workflow.
 3) Record a blocker and switch source after repeated failures:
    - If the same navigation failure happens 2–3 times on a site, stop fighting it.
+   - For hard blocks (403/405/429/robots/login-wall with no progress), switch source immediately after evidence capture.
    - Move to an alternative allowlisted source that provides static HTML or accessible article pages.
 
 ### Standard takeover request payload
@@ -177,8 +184,12 @@ Rules:
   "status": "needs_user_takeover",
   "reason": "Encountered CAPTCHA verification",
   "current_url": "...",
-  "screenshot": "artifacts/captcha.png",
-  "next_step": "After you complete verification, I will re-snapshot and continue."
+  "screenshot": "artifact://...",
+  "next_step": "After you complete verification, I will re-snapshot and continue.",
+  "next_step_suggestion": {
+    "recommended": "needs_user_takeover",
+    "action": "needs_user_takeover"
+  }
 }
 ```
 

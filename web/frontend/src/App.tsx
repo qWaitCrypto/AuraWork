@@ -71,6 +71,7 @@ type TimelineRow = {
   toolRunId?: string;
   count?: number;
   onOpenTab?: "plan" | "terminal";
+  details?: string;
   thinkingLocator?: string;
 };
 
@@ -86,6 +87,14 @@ type ChatItem =
   | { kind: "message"; msg: ChatMessage }
   | { kind: "timeline"; card: TimelineCard };
 
+type WorkSpecView = {
+  goal?: string;
+  expectedOutputs: string[];
+  workspaceRoots: string[];
+  domainAllowlist: string[];
+  fileTypeAllowlist: string[];
+};
+
 type ToolRun = {
   id: string;
   tool: string;
@@ -98,6 +107,7 @@ type ToolRun = {
   subagentRunId?: string;
   requestId?: string | null;
   turnId?: string | null;
+  workSpec?: WorkSpecView;
 };
 
 type ViewMode = "work" | "stage";
@@ -148,6 +158,120 @@ function normalizeToolEndStatus(rawStatus: string | null | undefined):
   if (["failed", "error"].includes(st)) return "failed";
   return "unknown";
 }
+
+
+function cleanText(raw: unknown, maxLen = 240): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const text = raw.replace(/\s+/g, " ").trim();
+  if (!text) return undefined;
+  if (text.length <= maxLen) return text;
+  return `${text.slice(0, maxLen - 1)}…`;
+}
+
+function cleanStringList(raw: unknown, limit = 4, itemMaxLen = 120): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const item of raw) {
+    const value = cleanText(item, itemMaxLen);
+    if (!value) continue;
+    out.push(value);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function parseWorkSpecView(raw: unknown): WorkSpecView | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const ws = raw as Record<string, unknown>;
+  const goal = cleanText(ws.goal, 220);
+
+  const expectedOutputs = Array.isArray(ws.expected_outputs)
+    ? ws.expected_outputs
+      .map((item) => {
+        if (!item || typeof item !== "object") return undefined;
+        const rec = item as Record<string, unknown>;
+        const outputType = cleanText(rec.type, 40);
+        const outputPath = cleanText(rec.path, 120);
+        if (outputType && outputPath) return `${outputType}: ${outputPath}`;
+        return outputPath || outputType || cleanText(rec.format, 60);
+      })
+      .filter((item): item is string => Boolean(item))
+      .slice(0, 6)
+    : [];
+
+  const scopeRaw = ws.resource_scope && typeof ws.resource_scope === "object" ? (ws.resource_scope as Record<string, unknown>) : {};
+  const workspaceRoots = cleanStringList(scopeRaw.workspace_roots, 4, 120);
+  const domainAllowlist = cleanStringList(scopeRaw.domain_allowlist, 4, 100);
+  const fileTypeAllowlist = cleanStringList(scopeRaw.file_type_allowlist, 6, 40);
+
+  if (!goal && !expectedOutputs.length && !workspaceRoots.length && !domainAllowlist.length && !fileTypeAllowlist.length) {
+    return undefined;
+  }
+
+  return {
+    goal,
+    expectedOutputs,
+    workspaceRoots,
+    domainAllowlist,
+    fileTypeAllowlist,
+  };
+}
+
+function formatWorkSpecSummary(ws?: WorkSpecView): string | undefined {
+  if (!ws) return undefined;
+  const parts: string[] = [];
+  if (ws.goal) parts.push(`goal: ${ws.goal}`);
+  if (ws.expectedOutputs.length) parts.push(`outputs: ${ws.expectedOutputs.length}`);
+  if (ws.workspaceRoots.length) parts.push(`roots: ${ws.workspaceRoots.length}`);
+  if (ws.domainAllowlist.length) parts.push(`domains: ${ws.domainAllowlist.length}`);
+  if (ws.fileTypeAllowlist.length) parts.push(`types: ${ws.fileTypeAllowlist.length}`);
+  return parts.length ? parts.join(" · ") : undefined;
+}
+
+function formatWorkSpecDetails(ws?: WorkSpecView): string | undefined {
+  if (!ws) return undefined;
+  const lines: string[] = [];
+  if (ws.goal) lines.push(`goal: ${ws.goal}`);
+  if (ws.expectedOutputs.length) lines.push(`expected_outputs:\n- ${ws.expectedOutputs.join("\n- ")}`);
+  if (ws.workspaceRoots.length) lines.push(`workspace_roots: ${ws.workspaceRoots.join(", ")}`);
+  if (ws.domainAllowlist.length) lines.push(`domain_allowlist: ${ws.domainAllowlist.join(", ")}`);
+  if (ws.fileTypeAllowlist.length) lines.push(`file_type_allowlist: ${ws.fileTypeAllowlist.join(", ")}`);
+  return lines.length ? lines.join("\n") : undefined;
+}
+
+function joinDetails(parts: Array<string | undefined>): string | undefined {
+  const rows = parts.map((item) => String(item || "").trim()).filter(Boolean);
+  return rows.length ? rows.join("\n") : undefined;
+}
+
+function normalizeApproverDecision(raw: unknown): "allow" | "deny" | "escalate" | "unknown" {
+  const value = String(raw || "").trim().toLowerCase();
+  if (!value) return "unknown";
+  if (value === "allow") return "allow";
+  if (value === "deny") return "deny";
+  if (["require_approval", "needs_approval", "escalate"].includes(value)) return "escalate";
+  return "unknown";
+}
+
+function summarizeApproverTrace(raw: unknown): string | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const trace = raw as Record<string, unknown>;
+  const lines: string[] = [];
+  const decision = cleanText(trace.decision ?? trace.final_decision, 40);
+  const parsed = cleanText(trace.parsed_decision ?? trace.parsed, 40);
+  const reason = cleanText(trace.reason, 260);
+  const error = cleanText(trace.error, 260);
+  const skipped = trace.skipped === true;
+
+  if (decision) lines.push(`decision: ${decision}`);
+  if (parsed) lines.push(`parsed: ${parsed}`);
+  if (skipped) lines.push("skipped: true");
+  if (error) lines.push(`error: ${error}`);
+  if (reason) lines.push(`reason: ${reason}`);
+
+  return lines.length ? lines.join("\n") : undefined;
+}
+
 
 export default function App() {
   const appendMany = useEventStore((s) => s.appendMany);
@@ -234,6 +358,7 @@ export default function App() {
   });
   const browserFrameRef = useRef<{ data: string; metadata: any; ts: number }>({ data: "", metadata: null, ts: 0 });
   const browserFrameRafRef = useRef<number | null>(null);
+  const browserStreamTargetRef = useRef<string>("");
   const [browserFrameTick, setBrowserFrameTick] = useState(0);
   const [browserStreamState, setBrowserStreamState] = useState<{
     wsOpen: boolean;
@@ -439,7 +564,13 @@ export default function App() {
 
     // Refresh approvals at most once per batch.
     for (const e of batch) {
-      if (e.kind === "approval_required" || e.kind === "run_paused") {
+      if (
+        e.kind === "approval_required"
+        || e.kind === "run_paused"
+        || e.kind === "approval_granted"
+        || e.kind === "approval_denied"
+        || e.kind === "run_resumed"
+      ) {
         refreshApprovals().catch(() => { });
         break;
       }
@@ -564,32 +695,71 @@ export default function App() {
     }
     if (!currentSessionId) return;
 
-    // Reset UI state (keep last frame so switching back is instant).
-    setBrowserStreamState((s) => ({ ...s, wsOpen: false, lastError: undefined }));
+    const targetAgentSession = (() => {
+      for (const rec of approvals) {
+        const payload = (rec as any)?.resume_payload;
+        if (!payload || typeof payload !== "object") continue;
+        let ctx: any = null;
+        const sub = (payload as any).subagent;
+        if (sub && typeof sub === "object" && sub.takeover === true && sub.takeover_context && typeof sub.takeover_context === "object") {
+          ctx = sub.takeover_context;
+        }
+        const dag = (payload as any).dag;
+        if (!ctx && dag && typeof dag === "object" && dag.takeover === true && dag.takeover_context && typeof dag.takeover_context === "object") {
+          ctx = dag.takeover_context;
+        }
+        if (!ctx || typeof ctx !== "object") continue;
+        const raw = typeof ctx.browser_agent_session === "string"
+          ? ctx.browser_agent_session
+          : typeof ctx.agent_session === "string"
+            ? ctx.agent_session
+            : "";
+        const v = raw.trim();
+        if (v) return v;
+      }
+      return "";
+    })();
+    if (browserStreamTargetRef.current !== targetAgentSession) {
+      browserStreamTargetRef.current = targetAgentSession;
+      browserFrameRef.current = { data: "", metadata: null, ts: 0 };
+      setBrowserFrameTick((t) => t + 1);
+    }
 
-    const ws = connectBrowserStreamWs(currentSessionId, (msg: BrowserStreamMsg) => {
-      if (msg.type === "frame" && typeof (msg as any).data === "string") {
-        browserFrameRef.current = { data: (msg as any).data, metadata: (msg as any).metadata ?? null, ts: Date.now() };
-        setBrowserStreamState((s) => ({ ...s, lastFrameAt: Date.now(), lastError: undefined }));
-        bumpBrowserFrame();
-        return;
-      }
-      if (msg.type === "status") {
-        setBrowserStreamState((s) => ({
-          ...s,
-          upstreamPort: typeof (msg as any).port === "number" ? (msg as any).port : s.upstreamPort,
-          agentSession: typeof (msg as any).agent_session === "string" ? (msg as any).agent_session : s.agentSession,
-          lastStatusAt: Date.now(),
-          lastError: undefined,
-        }));
-        return;
-      }
-      if (msg.type === "error") {
-        const m = String((msg as any).message || "browser_stream_error");
-        setBrowserStreamState((s) => ({ ...s, lastError: m }));
-        return;
-      }
-    });
+    setBrowserStreamState((s) => ({
+      ...s,
+      wsOpen: false,
+      upstreamPort: undefined,
+      agentSession: targetAgentSession || undefined,
+      lastError: undefined,
+    }));
+
+    const ws = connectBrowserStreamWs(
+      currentSessionId,
+      (msg: BrowserStreamMsg) => {
+        if (msg.type === "frame" && typeof (msg as any).data === "string") {
+          browserFrameRef.current = { data: (msg as any).data, metadata: (msg as any).metadata ?? null, ts: Date.now() };
+          setBrowserStreamState((s) => ({ ...s, lastFrameAt: Date.now(), lastError: undefined }));
+          bumpBrowserFrame();
+          return;
+        }
+        if (msg.type === "status") {
+          setBrowserStreamState((s) => ({
+            ...s,
+            upstreamPort: typeof (msg as any).port === "number" ? (msg as any).port : s.upstreamPort,
+            agentSession: typeof (msg as any).agent_session === "string" ? (msg as any).agent_session : s.agentSession,
+            lastStatusAt: Date.now(),
+            lastError: undefined,
+          }));
+          return;
+        }
+        if (msg.type === "error") {
+          const m = String((msg as any).message || "browser_stream_error");
+          setBrowserStreamState((s) => ({ ...s, lastError: m }));
+          return;
+        }
+      },
+      { agentSession: targetAgentSession || undefined },
+    );
 
     browserWsRef.current = ws;
     ws.addEventListener("open", () => setBrowserStreamState((s) => ({ ...s, wsOpen: true, lastError: undefined })));
@@ -601,7 +771,7 @@ export default function App() {
       } catch { }
       if (browserWsRef.current === ws) browserWsRef.current = null;
     };
-  }, [viewMode, currentSessionId]);
+  }, [viewMode, currentSessionId, approvals]);
 
   const latestPlan = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i--) {
@@ -749,6 +919,7 @@ export default function App() {
       const id = String(p.tool_execution_id || p.tool_call_id || e.event_id);
       const tool = String(p.tool_name || "tool");
       const summary = String(p.summary || tool);
+      const workSpec = parseWorkSpecView(p.work_spec);
 
       if (e.kind === "tool_call_start") {
         byId.set(id, {
@@ -761,6 +932,7 @@ export default function App() {
           subagentRunId: p.subagent_run_id,
           requestId: e.request_id ?? null,
           turnId: e.turn_id ?? null,
+          workSpec,
         });
       } else {
         const prev = byId.get(id);
@@ -774,6 +946,7 @@ export default function App() {
             status: "unknown",
             requestId: e.request_id ?? null,
             turnId: e.turn_id ?? null,
+            workSpec,
           }),
           tool,
           summary,
@@ -784,6 +957,7 @@ export default function App() {
           subagentRunId: p.subagent_run_id ?? prev?.subagentRunId,
           requestId: prev?.requestId ?? (e.request_id ?? null),
           turnId: prev?.turnId ?? (e.turn_id ?? null),
+          workSpec: workSpec ?? prev?.workSpec,
         });
       }
     }
@@ -869,11 +1043,14 @@ export default function App() {
       for (const id of toolIds) {
         const tr = toolById.get(id);
         if (!tr) continue;
+        const wsSummary = formatWorkSpecSummary(tr.workSpec);
+        const wsDetails = formatWorkSpecDetails(tr.workSpec);
         rows.push({
           key: `tool:${id}`,
           kind: "tool",
           title: tr.summary,
-          subtitle: tr.tool,
+          subtitle: wsSummary ? `${tr.tool} · ${wsSummary}` : tr.tool,
+          details: wsDetails,
           status: tr.status,
           startedAt: tr.startedAt,
           endedAt: tr.endedAt,
@@ -892,15 +1069,138 @@ export default function App() {
           kind: "plan",
           title: "Plan updated",
           subtitle: typeof planLen === "number" ? `${planLen} steps` : undefined,
+          startedAt: e.timestamp,
           onOpenTab: "plan",
         });
       }
 
-      // Paused/approval
+      // Approval lifecycle (required/paused/granted/denied/resumed) + approver traces
       for (const e of g.events) {
-        if (e.kind === "run_paused" || e.kind === "approval_required") {
-          rows.push({ key: `pause:${e.event_id}`, kind: "approval", title: "Paused", subtitle: "Approval required" });
-          break;
+        const payload = e.payload as any;
+
+        if (e.kind === "subagent_approver_started") {
+          const inspection = payload?.inspection as any;
+          const actionSummary = cleanText(inspection?.action_summary, 180) || cleanText(payload?.tool_name, 80) || "Approver started";
+          const risk = cleanText(inspection?.risk_level, 40);
+          const reason = cleanText(inspection?.reason, 260);
+          const ws = parseWorkSpecView(payload?.work_spec);
+          rows.push({
+            key: `approver_start:${e.event_id}`,
+            kind: "approval",
+            title: `Approver started · ${actionSummary}`,
+            subtitle: risk ? `risk: ${risk}` : undefined,
+            details: joinDetails([
+              reason ? `reason: ${reason}` : undefined,
+              formatWorkSpecDetails(ws),
+            ]),
+            status: "running",
+            startedAt: e.timestamp,
+            onOpenTab: "terminal",
+          });
+          continue;
+        }
+
+        if (e.kind === "subagent_approver_completed") {
+          const after = payload?.inspection_after as any;
+          const decision = normalizeApproverDecision(after?.decision);
+          const status = decision === "allow" ? "succeeded" : decision === "deny" ? "blocked" : decision === "escalate" ? "needs_approval" : "unknown";
+          const actionSummary = cleanText(after?.action_summary, 180) || cleanText(payload?.tool_name, 80) || "Approver completed";
+          const reason = cleanText(after?.reason, 260);
+          const trace = summarizeApproverTrace(payload?.approver_trace);
+          rows.push({
+            key: `approver_done:${e.event_id}`,
+            kind: "approval",
+            title: `Approver decision · ${decision}`,
+            subtitle: actionSummary,
+            details: joinDetails([
+              reason ? `reason: ${reason}` : undefined,
+              trace,
+            ]),
+            status,
+            startedAt: e.timestamp,
+            onOpenTab: "terminal",
+          });
+          continue;
+        }
+
+        if (e.kind === "approval_required") {
+          const actionSummary = cleanText(payload?.action_summary, 180) || "Approval required";
+          const risk = cleanText(payload?.risk_level, 40);
+          const reason = cleanText(payload?.reason, 260);
+          const approvalId = cleanText(payload?.approval_id, 120);
+          rows.push({
+            key: `approval_required:${e.event_id}`,
+            kind: "approval",
+            title: actionSummary,
+            subtitle: risk ? `risk: ${risk}` : "Approval required",
+            details: joinDetails([
+              approvalId ? `approval_id: ${approvalId}` : undefined,
+              reason ? `reason: ${reason}` : undefined,
+            ]),
+            status: "needs_approval",
+            startedAt: e.timestamp,
+            onOpenTab: "terminal",
+          });
+          continue;
+        }
+
+        if (e.kind === "run_paused") {
+          const pendingCount = Array.isArray(payload?.pending_tools) ? payload.pending_tools.length : undefined;
+          rows.push({
+            key: `run_paused:${e.event_id}`,
+            kind: "approval",
+            title: "Run paused",
+            subtitle: typeof pendingCount === "number" ? `pending tools: ${pendingCount}` : "Awaiting approval",
+            details: cleanText(payload?.approval_id, 120) ? `approval_id: ${String(payload.approval_id)}` : undefined,
+            status: "needs_approval",
+            startedAt: e.timestamp,
+            onOpenTab: "terminal",
+          });
+          continue;
+        }
+
+        if (e.kind === "approval_granted") {
+          const approvalId = cleanText(payload?.approval_id, 120);
+          rows.push({
+            key: `approval_granted:${e.event_id}`,
+            kind: "approval",
+            title: "Approval granted",
+            subtitle: approvalId,
+            details: cleanText(payload?.decision, 40) ? `decision: ${String(payload.decision)}` : undefined,
+            status: "succeeded",
+            startedAt: e.timestamp,
+            onOpenTab: "terminal",
+          });
+          continue;
+        }
+
+        if (e.kind === "approval_denied") {
+          const approvalId = cleanText(payload?.approval_id, 120);
+          rows.push({
+            key: `approval_denied:${e.event_id}`,
+            kind: "approval",
+            title: "Approval denied",
+            subtitle: approvalId,
+            details: cleanText(payload?.decision, 40) ? `decision: ${String(payload.decision)}` : undefined,
+            status: "blocked",
+            startedAt: e.timestamp,
+            onOpenTab: "terminal",
+          });
+          continue;
+        }
+
+        if (e.kind === "run_resumed") {
+          const pendingCount = Number.isFinite(Number(payload?.pending_tools_count)) ? Number(payload.pending_tools_count) : undefined;
+          rows.push({
+            key: `run_resumed:${e.event_id}`,
+            kind: "approval",
+            title: "Run resumed",
+            subtitle: typeof pendingCount === "number" ? `pending tools: ${pendingCount}` : undefined,
+            details: cleanText(payload?.approval_id, 120) ? `approval_id: ${String(payload.approval_id)}` : undefined,
+            status: "running",
+            startedAt: e.timestamp,
+            onOpenTab: "terminal",
+          });
         }
       }
 
@@ -909,7 +1209,7 @@ export default function App() {
         if (e.kind !== "operation_failed" && e.kind !== "llm_request_failed") continue;
         const p = e.payload as any;
         const msg = String(p?.error || p?.message || e.kind);
-        rows.push({ key: `err:${e.event_id}`, kind: "error", title: msg, status: "failed" });
+        rows.push({ key: `err:${e.event_id}`, kind: "error", title: msg, status: "failed", startedAt: e.timestamp });
       }
 
       if (rows.length) {
@@ -1019,15 +1319,105 @@ export default function App() {
     else setDiffText(null);
   }, [activeApproval]);
 
+  function decideApprovalById(approvalId: string, decision: "approve" | "deny", note?: string) {
+    if (!approvalId || !currentSessionId) return;
+    const payload: { type: "approval"; approval_id: string; decision: "approve" | "deny"; note?: string } = {
+      type: "approval",
+      approval_id: approvalId,
+      decision,
+    };
+    if (typeof note === "string" && note.trim()) payload.note = note.trim();
+    wsSend(wsRef.current, payload);
+    refreshApprovals().catch(() => { });
+  }
+
   function decideApproval(decision: "approve" | "deny") {
     if (!activeApproval || !currentSessionId) return;
-    wsSend(wsRef.current, { type: "approval", approval_id: activeApproval.approval_id, decision });
+    decideApprovalById(activeApproval.approval_id, decision);
     popApproval();
-    refreshApprovals().catch(() => { });
   }
 
   const modelProfiles = bootstrap?.model_profiles || [];
   const approvalsCount = approvals.length;
+
+  const takeoverApproval = useMemo(() => {
+    for (const a of approvals) {
+      const payload = (a as any)?.resume_payload;
+      if (!payload || typeof payload !== "object") continue;
+      const sub = (payload as any).subagent;
+      if (sub && typeof sub === "object" && sub.takeover === true) return a;
+      const dag = (payload as any).dag;
+      if (dag && typeof dag === "object" && dag.takeover === true) return a;
+    }
+    return null;
+  }, [approvals]);
+
+  const takeoverContext = useMemo(() => {
+    if (!takeoverApproval) return null;
+    const payload = (takeoverApproval as any)?.resume_payload;
+    if (!payload || typeof payload !== "object") return null;
+    const sub = (payload as any).subagent;
+    if (sub && typeof sub === "object") {
+      const ctx = sub.takeover_context;
+      if (ctx && typeof ctx === "object") return ctx as any;
+    }
+    const dag = (payload as any).dag;
+    if (dag && typeof dag === "object") {
+      const ctx = dag.takeover_context;
+      if (ctx && typeof ctx === "object") return ctx as any;
+    }
+    return null;
+  }, [takeoverApproval]);
+
+  const takeoverQueue = useMemo(() => {
+    if (!takeoverApproval) return [] as any[];
+    const payload = (takeoverApproval as any)?.resume_payload;
+    if (!payload || typeof payload !== "object") return [] as any[];
+    const dag = (payload as any).dag;
+    if (!dag || typeof dag !== "object") return [] as any[];
+    const raw = (dag as any).pending_queue;
+    if (!Array.isArray(raw)) return [] as any[];
+    return raw.filter((item) => item && typeof item === "object");
+  }, [takeoverApproval]);
+
+  const takeoverStreamAgentSession = useMemo(() => {
+    const ctx: any = takeoverContext;
+    if (!ctx || typeof ctx !== "object") return null;
+    const raw = typeof ctx.browser_agent_session === "string"
+      ? ctx.browser_agent_session
+      : typeof ctx.agent_session === "string"
+        ? ctx.agent_session
+        : "";
+    const val = raw.trim();
+    return val || null;
+  }, [takeoverContext]);
+
+  const activeApprovalIsTakeover = useMemo(() => {
+    if (!activeApproval) return false;
+    const payload = (activeApproval as any)?.resume_payload;
+    if (!payload || typeof payload !== "object") return false;
+    const sub = (payload as any).subagent;
+    if (sub && typeof sub === "object" && sub.takeover === true) return true;
+    const dag = (payload as any).dag;
+    return !!(dag && typeof dag === "object" && dag.takeover === true);
+  }, [activeApproval]);
+
+  const activeTakeoverContext = useMemo(() => {
+    if (!activeApproval) return null;
+    const payload = (activeApproval as any)?.resume_payload;
+    if (!payload || typeof payload !== "object") return null;
+    const sub = (payload as any).subagent;
+    if (sub && typeof sub === "object") {
+      const ctx = sub.takeover_context;
+      if (ctx && typeof ctx === "object") return ctx as any;
+    }
+    const dag = (payload as any).dag;
+    if (dag && typeof dag === "object") {
+      const ctx = dag.takeover_context;
+      if (ctx && typeof ctx === "object") return ctx as any;
+    }
+    return null;
+  }, [activeApproval]);
 
   const currentSession = useMemo(() => {
     if (!currentSessionId) return null;
@@ -1066,6 +1456,11 @@ export default function App() {
       localStorage.setItem("AURA_WEB_VIEW", viewMode);
     } catch { }
   }, [viewMode]);
+
+  useEffect(() => {
+    if (!takeoverApproval) return;
+    if (viewMode !== "stage") setViewMode("stage");
+  }, [takeoverApproval?.approval_id, viewMode]);
 
   const activePlanIndex = useMemo(() => {
     for (let i = 0; i < currentPlan.length; i++) {
@@ -1600,6 +1995,49 @@ export default function App() {
                   </div>
                 </div>
 
+                {takeoverApproval ? (
+                  <div className="border-b border-amber-200 bg-amber-50 px-4 py-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <div className="text-xs font-semibold text-amber-800">Human takeover required</div>
+                          {takeoverQueue.length > 0 ? (
+                            <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800">queue +{takeoverQueue.length}</span>
+                          ) : null}
+                        </div>
+                        <div className="truncate text-[11px] text-amber-700">
+                          {(takeoverApproval.action_summary || "Complete CAPTCHA/login in the browser view, then resume.") as string}
+                        </div>
+                        {typeof (takeoverContext as any)?.current_url === "string" && (takeoverContext as any).current_url ? (
+                          <div className="truncate font-mono text-[10px] text-amber-700/80">{String((takeoverContext as any).current_url)}</div>
+                        ) : null}
+                        {typeof takeoverStreamAgentSession === "string" && takeoverStreamAgentSession ? (
+                          <div className="truncate font-mono text-[10px] text-amber-700/70">session: {takeoverStreamAgentSession}</div>
+                        ) : null}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Button
+                          variant="primary"
+                          onClick={() => {
+                            decideApprovalById(takeoverApproval.approval_id, "approve", "user_takeover_completed");
+                            if (activeApproval?.approval_id === takeoverApproval.approval_id) popApproval();
+                          }}
+                        >
+                          Resume
+                        </Button>
+                        <Button
+                          onClick={() => {
+                            decideApprovalById(takeoverApproval.approval_id, "deny", "user_takeover_cancelled");
+                            if (activeApproval?.approval_id === takeoverApproval.approval_id) popApproval();
+                          }}
+                        >
+                          Cancel
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+
                 {/* Browser 视图 - 白色主题 */}
                 <div className="flex min-h-0 flex-1 flex-col bg-surface-50">
                   {/* 紧凑顶部栏 */}
@@ -1621,6 +2059,9 @@ export default function App() {
                       {browserStreamState.lastFrameAt && (
                         <span className="text-[10px] text-ink-400">{fmtTime(browserStreamState.lastFrameAt)}</span>
                       )}
+                      {browserStreamState.agentSession ? (
+                        <span className="max-w-[220px] truncate font-mono text-[10px] text-ink-400">{browserStreamState.agentSession}</span>
+                      ) : null}
                     </div>
                     <div className="flex items-center gap-2">
                       {/* Observe/Control 切换按钮 - 胶囊样式 */}
@@ -1894,16 +2335,15 @@ export default function App() {
       </Modal>
 
       <Modal
-        open={Boolean(activeApproval)}
+        open={Boolean(activeApproval && !activeApprovalIsTakeover)}
         title="Approval required"
-        onClose={() => {
-          popApproval();
-        }}
+        dismissible={false}
+        onClose={() => { }}
         footer={
           <div className="flex justify-end gap-2">
-            <Button onClick={() => decideApproval("deny")}>Deny</Button>
+            <Button onClick={() => decideApproval("deny")}>{activeApprovalIsTakeover ? "Cancel" : "Deny"}</Button>
             <Button variant="primary" onClick={() => decideApproval("approve")}>
-              Approve
+              {activeApprovalIsTakeover ? "Resume" : "Approve"}
             </Button>
           </div>
         }
@@ -1925,6 +2365,14 @@ export default function App() {
               <div className="text-xs text-ink-500">Summary</div>
               <div className="mt-1 text-sm text-ink-900">{activeApproval.action_summary}</div>
               {activeApproval.reason ? <div className="mt-2 text-xs text-ink-700">{activeApproval.reason}</div> : null}
+              {activeApprovalIsTakeover ? (
+                <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800">
+                  Complete verification/login in Browser view, then click <span className="font-semibold">Resume</span>.
+                </div>
+              ) : null}
+              {typeof (activeTakeoverContext as any)?.current_url === "string" && (activeTakeoverContext as any).current_url ? (
+                <div className="mt-2 font-mono text-[10px] text-ink-600">{String((activeTakeoverContext as any).current_url)}</div>
+              ) : null}
             </div>
 
             <div className="rounded-xl border border-surface-200 bg-surface-50 p-3">

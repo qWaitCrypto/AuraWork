@@ -21,6 +21,33 @@ from .types import (
 ENV_FILENAME = "env"
 MODELS_FILENAME = "models.json"
 
+
+def _with_openai_codex_reasoning_defaults(*, provider_kind: ProviderKind, default_params: dict[str, Any]) -> dict[str, Any]:
+    if provider_kind is not ProviderKind.OPENAI_CODEX:
+        return default_params
+
+    out = dict(default_params or {})
+
+    effort: str | None = None
+    reasoning_effort = out.get("reasoning_effort")
+    if isinstance(reasoning_effort, str) and reasoning_effort.strip():
+        effort = reasoning_effort.strip()
+
+    reasoning = out.get("reasoning")
+    if isinstance(reasoning, dict):
+        raw_effort = reasoning.get("effort")
+        if isinstance(raw_effort, str) and raw_effort.strip():
+            effort = raw_effort.strip()
+
+    if effort is None:
+        effort = "high"
+
+    merged_reasoning = dict(reasoning) if isinstance(reasoning, dict) else {}
+    merged_reasoning["effort"] = effort
+    out["reasoning"] = merged_reasoning
+    return out
+
+
 def default_global_models_path() -> Path:
     override = os.environ.get("NOVELAIRE_GLOBAL_MODELS_PATH")
     if override:
@@ -261,6 +288,11 @@ def _parse_registry_profile(profile_id: str, profile_dict: dict[str, Any], *, so
                 )
         else:
             default_params.setdefault("max_tokens", max_tokens)
+
+    default_params = _with_openai_codex_reasoning_defaults(
+        provider_kind=provider_kind,
+        default_params=default_params,
+    )
 
     if provider_kind is ProviderKind.ANTHROPIC and "max_tokens" not in default_params:
         raise ModelConfigError(f"{source}:profiles.{profile_id}: max_tokens is required for provider_kind=anthropic")
@@ -622,6 +654,11 @@ def _parse_profile(profile_id: str, profile_dict: dict[str, Any], *, source: str
     if "default_params" in profile_dict and profile_dict["default_params"] is not None:
         default_params_obj = _ensure_dict(profile_dict["default_params"], ctx=f"{source}:profiles.{profile_id}.default_params")
         default_params = dict(default_params_obj)
+
+    default_params = _with_openai_codex_reasoning_defaults(
+        provider_kind=provider_kind,
+        default_params=default_params,
+    )
 
     capabilities = ModelCapabilities()
     if "capabilities" in profile_dict and profile_dict["capabilities"] is not None:

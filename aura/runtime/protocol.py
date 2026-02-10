@@ -55,6 +55,7 @@ class EventKind(str, Enum):
     PLAN_UPDATE = "plan_update"
 
     RUN_PAUSED = "run_paused"
+    RUN_RESUMED = "run_resumed"
 
 
 class OpKind(str, Enum):

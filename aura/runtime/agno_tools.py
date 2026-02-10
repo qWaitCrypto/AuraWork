@@ -223,6 +223,7 @@ def build_agno_toolset(
                     turn_id=meta.get("aura_turn_id"),
                     tool_execution_id=planned.tool_execution_id,
                     event_bus=event_bus,
+                    metadata=(dict(meta) if isinstance(meta, dict) else None),
                 )
 
                 tool = tool_runtime.get_tool(bound_tool_name)

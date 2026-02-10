@@ -9,12 +9,13 @@ from typing import Any
 
 from ..ids import new_id, new_tool_call_id, now_ts_ms
 from ..llm.errors import ModelResolutionError
+from ..agent_browser import agent_browser_session_for_subagent_run
 from ..llm.router import ModelRouter
 from ..llm.types import ModelRequirements, ModelRole, ToolSpec
 from ..llm.tool_schema_compat import adapt_tool_specs_for_profile
 from ..models import WorkSpec
 from ..orchestrator_helpers import _summarize_text, _summarize_tool_for_ui
-from ..protocol import Event, EventKind
+from ..protocol import Event, EventKind, EVENT_SCHEMA_VERSION
 from ..prompts.template import render_prompt_template
 from ..stores import ArtifactStore
 from ..tools.runtime import InspectionDecision, ToolExecutionContext, ToolRuntime
@@ -276,6 +277,36 @@ def _json_or_text(text: str) -> Any:
         return text
 
 
+def _report_requests_user_takeover(report: Any) -> bool:
+    if not isinstance(report, dict):
+        return False
+
+    status_raw = str(report.get("status") or "").strip().lower()
+    if status_raw in {"needs_user_takeover", "user_takeover_required", "needs_takeover"}:
+        return True
+
+    next_step = report.get("next_step_suggestion")
+    if isinstance(next_step, dict):
+        rec = str(next_step.get("recommended") or "").strip().lower()
+        if rec in {"needs_user_takeover", "user_takeover_required", "needs_takeover"}:
+            return True
+        action = str(next_step.get("action") or "").strip().lower()
+        if action in {"needs_user_takeover", "user_takeover_required", "needs_takeover"}:
+            return True
+
+    return False
+
+
+def _work_spec_public_payload(work_spec: WorkSpec | None) -> dict[str, Any] | None:
+    if work_spec is None:
+        return None
+    try:
+        payload = work_spec.to_public_dict()
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _context_to_text(extra_context: Any) -> str:
     if not isinstance(extra_context, dict):
         return ""
@@ -386,10 +417,16 @@ def run_subagent(
     request_id = exec_context.request_id if exec_context is not None else None
     turn_id = exec_context.turn_id if exec_context is not None else None
     event_bus = exec_context.event_bus if exec_context is not None else None
+    browser_agent_session = (
+        agent_browser_session_for_subagent_run(aura_session_id=session_id, subagent_run_id=subagent_run_id)
+        if isinstance(session_id, str) and session_id.strip()
+        else None
+    )
 
     receipts: list[SubagentReceipt] = []
     executed_tool_calls = 0
     needs_approval: dict[str, Any] | None = None
+    work_spec_payload = _work_spec_public_payload(work_spec)
 
     def _emit_event(*, kind: EventKind, payload: dict[str, Any]) -> None:
         nonlocal executed_tool_calls
@@ -422,6 +459,8 @@ def run_subagent(
         step_id = payload.get("tool_execution_id")
         payload_out = dict(payload or {})
         payload_out.setdefault("source", "subagent")
+        if work_spec_payload is not None:
+            payload_out.setdefault("work_spec", work_spec_payload)
         event = Event(
             kind=kind.value,
             payload=payload_out,
@@ -432,7 +471,7 @@ def run_subagent(
             request_id=request_id,
             turn_id=turn_id,
             step_id=step_id if isinstance(step_id, str) else None,
-            schema_version=None,
+            schema_version=EVENT_SCHEMA_VERSION,
         )
         event_bus.publish(event)
 
@@ -617,7 +656,7 @@ def run_subagent(
         else:
             assistant_text = _extract_text(out)
             report = _json_or_text(assistant_text)
-            status = "completed"
+            status = "needs_user_takeover" if _report_requests_user_takeover(report) else "completed"
 
         # Handle agno confirmation pauses. Aura decides allow/deny/approval; subagent never creates approvals.
         pause_guard = 0
@@ -726,7 +765,11 @@ def run_subagent(
                             "risk_level": updated.risk_level,
                             "action_summary": updated.action_summary,
                             "reason": updated.reason,
-                            "error_code": (updated.error_code.value if updated.error_code is not None else None),
+                            "error_code": (
+                                updated.error_code.value
+                                if updated.error_code is not None
+                                else (inspection.error_code.value if inspection.error_code is not None else None)
+                            ),
                         },
                         "approver_trace": trace,
                     },
@@ -878,7 +921,16 @@ def run_subagent(
             assistant_text = _extract_text(out)
             report = _json_or_text(assistant_text)
 
+    if status == "completed" and _report_requests_user_takeover(report):
+        status = "needs_user_takeover"
+
     error_code: str | None = None
+    if status == "needs_user_takeover":
+        error_code = "approval_pending"
+        if isinstance(report, dict):
+            report = dict(report)
+            report.setdefault("status", "needs_user_takeover")
+
     warnings: list[dict[str, str]] = []
     if status == "completed" and out is not None and _run_output_exceeded_tool_call_limit(out):
         warnings.append(
@@ -907,6 +959,7 @@ def run_subagent(
 
     transcript = {
         "subagent_run_id": subagent_run_id,
+        "browser_agent_session": browser_agent_session,
         "preset": preset.name,
         "status": status,
         "selected_role": selected_role.value,
@@ -931,6 +984,7 @@ def run_subagent(
     return {
         "ok": status == "completed",
         "subagent_run_id": subagent_run_id,
+        "browser_agent_session": browser_agent_session,
         "preset": preset.name,
         "status": status,
         "needs_approval": [needs_approval] if needs_approval is not None else [],

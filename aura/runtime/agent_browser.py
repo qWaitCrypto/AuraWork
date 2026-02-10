@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import socket
 import tempfile
-import hashlib
 from pathlib import Path
 
 from .project import RuntimePaths
+
+
+_SAFE_SESSION_TOKEN_RE = re.compile(r"[^a-zA-Z0-9_\-]+")
+
+
+def _sanitize_agent_session_token(raw: str) -> str:
+    token = str(raw or "").strip()
+    if not token:
+        return ""
+    token = _SAFE_SESSION_TOKEN_RE.sub("_", token).strip("_")
+    return token[:120]
 
 
 def agent_browser_session_for_aura_session(aura_session_id: str) -> str:
@@ -34,6 +45,21 @@ def agent_browser_session_for_aura_session(aura_session_id: str) -> str:
     return f"aura_{digest}"
 
 
+def agent_browser_session_for_subagent_run(*, aura_session_id: str, subagent_run_id: str) -> str:
+    """
+    Derive a deterministic browser session ID for a subagent run.
+
+    This isolates parallel browser workers so takeover/approval flows can switch
+    to the correct viewport without interfering with other runs.
+    """
+
+    sid = str(aura_session_id or "").strip()
+    rid = str(subagent_run_id or "").strip()
+    if not rid:
+        return agent_browser_session_for_aura_session(sid)
+    return agent_browser_session_for_aura_session(f"{sid}::{rid}")
+
+
 def agent_browser_socket_dir_for_project(project_root: Path) -> Path:
     """
     Directory used by Aura to store agent-browser-related state for this project.
@@ -47,14 +73,29 @@ def agent_browser_socket_dir_for_project(project_root: Path) -> Path:
     return paths.state_dir / "agent-browser"
 
 
+def agent_browser_stream_port_file_for_session(project_root: Path, *, agent_session: str) -> Path:
+    safe_session = _sanitize_agent_session_token(agent_session)
+    if not safe_session:
+        safe_session = "aura_default"
+    return agent_browser_socket_dir_for_project(project_root) / f"{safe_session}.aura_stream_port"
+
+
 def agent_browser_stream_port_file(project_root: Path, *, aura_session_id: str) -> Path:
     session = agent_browser_session_for_aura_session(aura_session_id)
-    return agent_browser_socket_dir_for_project(project_root) / f"{session}.aura_stream_port"
+    return agent_browser_stream_port_file_for_session(project_root, agent_session=session)
+
+
+def agent_browser_daemon_stream_file_for_session(*, agent_session: str) -> Path:
+    safe_session = _sanitize_agent_session_token(agent_session)
+    if not safe_session:
+        safe_session = "aura_default"
+    return agent_browser_daemon_socket_dir() / f"{safe_session}.stream"
 
 
 def agent_browser_daemon_stream_file(project_root: Path, *, aura_session_id: str) -> Path:
+    _ = project_root
     session = agent_browser_session_for_aura_session(aura_session_id)
-    return agent_browser_daemon_socket_dir() / f"{session}.stream"
+    return agent_browser_daemon_stream_file_for_session(agent_session=session)
 
 
 def agent_browser_daemon_socket_dir() -> Path:
@@ -88,8 +129,8 @@ def allocate_loopback_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def ensure_agent_browser_stream_port(project_root: Path, *, aura_session_id: str) -> int:
-    port_file = agent_browser_stream_port_file(project_root, aura_session_id=aura_session_id)
+def ensure_agent_browser_stream_port_for_session(project_root: Path, *, agent_session: str) -> int:
+    port_file = agent_browser_stream_port_file_for_session(project_root, agent_session=agent_session)
     port_file.parent.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -103,3 +144,8 @@ def ensure_agent_browser_stream_port(project_root: Path, *, aura_session_id: str
     port = allocate_loopback_port()
     port_file.write_text(f"{port}\n", encoding="utf-8")
     return port
+
+
+def ensure_agent_browser_stream_port(project_root: Path, *, aura_session_id: str) -> int:
+    session = agent_browser_session_for_aura_session(aura_session_id)
+    return ensure_agent_browser_stream_port_for_session(project_root, agent_session=session)

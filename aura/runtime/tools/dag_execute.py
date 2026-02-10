@@ -97,7 +97,9 @@ class DAGExecuteNextTool:
                     "node_results": {},
                     "all_proposals": [],
                     "blocked_node": None,
+                    "blocked_nodes": [],
                     "blocked_approval": None,
+                    "blocked_approvals": [],
                     "error_code": "no_plan_loaded",
                     "message": "No plan loaded. Call `update_plan` before `dag__execute_next`.",
                     "diagnostics": {},
@@ -118,7 +120,9 @@ class DAGExecuteNextTool:
                 "node_results": {},
                 "all_proposals": [],
                 "blocked_node": None,
+                "blocked_nodes": [],
                 "blocked_approval": None,
+                "blocked_approvals": [],
                 "message": message,
                 "diagnostics": diagnostics,
             }
@@ -166,7 +170,9 @@ class DAGExecuteNextTool:
                 "node_results": {},
                 "all_proposals": [],
                 "blocked_node": None,
+                "blocked_nodes": [],
                 "blocked_approval": None,
+                "blocked_approvals": [],
                 "error_code": "missing_node_contract",
                 "message": (
                     "DAG nodes are missing required execution metadata. "
@@ -198,7 +204,9 @@ class DAGExecuteNextTool:
 
         node_results: dict[str, dict[str, Any]] = {}
         blocked_node: str | None = None
+        blocked_nodes: list[str] = []
         blocked_approval: dict[str, Any] | None = None
+        blocked_approvals: list[dict[str, Any]] = []
 
         for action in actions:
             node_id = action.node_id
@@ -219,6 +227,11 @@ class DAGExecuteNextTool:
                     "receipts_count": len(action.receipts),
                 }
             elif action.action == "pause_for_approval":
+                blocked_nodes.append(node_id)
+                if isinstance(action.approval_request, dict):
+                    req_copy = dict(action.approval_request)
+                    req_copy.setdefault("node_id", node_id)
+                    blocked_approvals.append(req_copy)
                 if blocked_node is None:
                     blocked_node = node_id
                     blocked_approval = action.approval_request
@@ -250,7 +263,9 @@ class DAGExecuteNextTool:
             "node_results": node_results,
             "all_proposals": all_proposals,
             "blocked_node": blocked_node,
+            "blocked_nodes": blocked_nodes,
             "blocked_approval": blocked_approval,
+            "blocked_approvals": blocked_approvals,
         }
 
     @staticmethod
