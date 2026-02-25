@@ -9,7 +9,7 @@ export const Sidebar = React.memo(function Sidebar(props: {
   sessions: SessionSummary[];
   currentSessionId: string | null;
   onSelectSession: (id: string) => void;
-  onDeleteSession: (id: string) => void;
+  onRequestDeleteSession: (session: SessionSummary) => void;
   onOpenWorkspacePicker: () => void;
 
   // Status / derived signals (App computes these for current session)
@@ -28,7 +28,7 @@ export const Sidebar = React.memo(function Sidebar(props: {
     sessions,
     currentSessionId,
     onSelectSession,
-    onDeleteSession,
+    onRequestDeleteSession,
     onOpenWorkspacePicker,
     approvalsCount,
     lastEventKind,
@@ -39,8 +39,30 @@ export const Sidebar = React.memo(function Sidebar(props: {
     onCreateSession,
   } = props;
 
+  function shortSessionId(sessionId: string) {
+    const raw = String(sessionId || "").trim();
+    const compact = raw.startsWith("sess_") ? raw.slice(5) : raw;
+    return compact.slice(0, 8) || raw;
+  }
+
+  function formatSessionStamp(ts: number | null | undefined) {
+    if (typeof ts !== "number") return null;
+    try {
+      return new Date(ts).toLocaleString([], {
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    } catch {
+      return null;
+    }
+  }
+
   function sessionLabel(s: SessionSummary) {
-    return s.session_id;
+    const stamp = formatSessionStamp(s.created_at ?? s.updated_at ?? null);
+    if (stamp) return `Session ${stamp}`;
+    return `Session ${shortSessionId(s.session_id)}`;
   }
 
   return (
@@ -50,7 +72,7 @@ export const Sidebar = React.memo(function Sidebar(props: {
         <button
           className="group flex w-full items-center justify-between rounded-lg border border-transparent px-3 py-2.5 shadow-soft transition-colors hover:border-surface-200 hover:bg-surface-0 hover:shadow-medium"
           onClick={onOpenWorkspacePicker}
-          title="选择/新建工作目录"
+          title="Select / New Workspace"
           type="button"
         >
           <div className="flex min-w-0 items-center gap-3">
@@ -142,7 +164,7 @@ export const Sidebar = React.memo(function Sidebar(props: {
                           {sessionLabel(s)}
                         </div>
                         <div className={active ? "mt-1 truncate text-xs text-ink-500" : "mt-1 truncate text-xs text-ink-400"}>
-                          {active ? subtitle : updated ? `Completed · ${new Date(updated).toLocaleString()}` : subtitle}
+                          {active ? subtitle : updated ? `Completed · ${new Date(updated).toLocaleString()} · ${shortSessionId(s.session_id)}` : subtitle}
                         </div>
                         {s.project_root ? (
                           <div className={active ? "mt-1 truncate font-mono text-[10px] text-ink-400" : "mt-1 truncate font-mono text-[10px] text-ink-400"} title={s.project_root}>
@@ -162,11 +184,7 @@ export const Sidebar = React.memo(function Sidebar(props: {
                   "opacity-0 group-hover:opacity-100 hover:bg-rose-50 hover:text-rose-600",
                 ].join(" ")}
                 title="Delete session"
-                onClick={() => {
-                  const ok = window.confirm(`Delete session ${s.session_id}? This cannot be undone.`);
-                  if (!ok) return;
-                  onDeleteSession(s.session_id);
-                }}
+                onClick={() => onRequestDeleteSession(s)}
               >
                 <Trash2 className="h-4 w-4" />
               </button>

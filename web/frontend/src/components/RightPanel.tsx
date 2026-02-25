@@ -1,9 +1,10 @@
-import React, { useEffect, useMemo, useState } from "react";
-import type { ApprovalRecord } from "../lib/types";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ApprovalRecord, AuraEvent, PlanEnvelope, PlanStep, SessionMeta } from "../lib/types";
 import { apiFetchWorkspaceFileText, apiListWorkspaceFiles, type WorkspaceFileEntry } from "../lib/api";
 import { httpBase } from "../lib/backendBase";
 import { Badge } from "./Badge";
 import { Button } from "./Button";
+import { useVirtualWindow } from "../hooks/useVirtualWindow";
 
 export type RightTab = "plan" | "files" | "terminal";
 
@@ -44,6 +45,10 @@ type TerminalLogItem = {
   details?: string;
 };
 
+
+const TERMINAL_ROW_GAP_PX = 12;
+const TERMINAL_VIRTUALIZE_THRESHOLD = 120;
+const TERMINAL_OVERSCAN_PX = 860;
 
 
 function cleanText(raw: unknown, maxLen = 220): string | undefined {
@@ -161,11 +166,11 @@ export const RightPanel = React.memo(function RightPanel(props: {
   setRightTab: (t: RightTab) => void;
 
   // Plan
-  latestPlan: any;
+  latestPlan: PlanEnvelope | null;
   planStats: { pending: number; in_progress: number; completed: number; failed: number; total: number; percent: number };
   planCount: number;
   activePlanIndex: number;
-  currentPlan: any[];
+  currentPlan: PlanStep[];
   hasRunningTool: boolean;
   statusLabel: string;
   statusTone: "orange" | "gray";
@@ -182,11 +187,11 @@ export const RightPanel = React.memo(function RightPanel(props: {
   ensureText: (loc: string) => Promise<string | null>;
 
   // Terminal
-  events: any[];
+  events: AuraEvent[];
   toolRuns: ToolRun[];
 
   // Session settings
-  sessionMeta: any;
+  sessionMeta: SessionMeta | null;
   onChangeApprovalMode: (mode: string) => void;
   onToggleStreaming: (enabled: boolean) => void;
 
@@ -221,6 +226,7 @@ export const RightPanel = React.memo(function RightPanel(props: {
   } = props;
 
   const [terminalFilter, setTerminalFilter] = useState<"all" | "llm" | "tools" | "plan" | "approvals" | "errors">("all");
+  const terminalListRef = useRef<HTMLDivElement>(null);
   const [workspaceDir, setWorkspaceDir] = useState<string>("");
   const [workspaceEntries, setWorkspaceEntries] = useState<WorkspaceFileEntry[]>([]);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
@@ -252,9 +258,9 @@ export const RightPanel = React.memo(function RightPanel(props: {
     try {
       const data = await apiListWorkspaceFiles(currentSessionId, workspaceDir, { limit: 800 });
       setWorkspaceEntries(Array.isArray(data.entries) ? data.entries : []);
-    } catch (e: any) {
+    } catch (error: unknown) {
       setWorkspaceEntries([]);
-      setWorkspaceErr(String(e?.message || e || "workspace_files_failed"));
+      setWorkspaceErr(String((error as { message?: unknown } | null)?.message || error || "workspace_files_failed"));
     } finally {
       setWorkspaceLoading(false);
     }
@@ -280,7 +286,7 @@ export const RightPanel = React.memo(function RightPanel(props: {
     for (let i = start; i < events.length; i++) {
       const e = events[i];
       const ts = e.timestamp;
-      const p = e.payload as any;
+      const p = e.payload as Record<string, unknown>;
 
       if (e.kind === "llm_request_started") {
         items.push({ id: e.event_id, ts, kind: "llm", level: "info", title: "LLM request started", status: "running" });
@@ -329,7 +335,7 @@ export const RightPanel = React.memo(function RightPanel(props: {
       }
 
       if (e.kind === "plan_update") {
-        const planLen = Array.isArray(p?.plan) ? (p.plan as any[]).length : undefined;
+        const planLen = Array.isArray(p.plan) ? p.plan.length : undefined;
         items.push({
           id: e.event_id,
           ts,
@@ -342,7 +348,7 @@ export const RightPanel = React.memo(function RightPanel(props: {
       }
 
       if (e.kind === "subagent_approver_started") {
-        const inspection = p?.inspection as any;
+        const inspection = p.inspection && typeof p.inspection === "object" ? (p.inspection as Record<string, unknown>) : {};
         const actionSummary = cleanText(inspection?.action_summary, 180) || cleanText(p?.tool_name, 80) || "Approver started";
         const risk = cleanText(inspection?.risk_level, 40);
         const reason = cleanText(inspection?.reason, 260);
@@ -364,7 +370,7 @@ export const RightPanel = React.memo(function RightPanel(props: {
       }
 
       if (e.kind === "subagent_approver_completed") {
-        const after = p?.inspection_after as any;
+        const after = p.inspection_after && typeof p.inspection_after === "object" ? (p.inspection_after as Record<string, unknown>) : {};
         const decision = normalizeApproverDecision(after?.decision);
         const status = decision === "allow" ? "succeeded" : decision === "deny" ? "blocked" : decision === "escalate" ? "needs_approval" : "unknown";
         const actionSummary = cleanText(after?.action_summary, 180) || cleanText(p?.tool_name, 80) || "Approver completed";
@@ -493,6 +499,37 @@ export const RightPanel = React.memo(function RightPanel(props: {
     return filtered.slice(-MAX);
   }, [eventsKey, terminalFilter, toolRuns.length]);
 
+  const estimateTerminalRowSize = useCallback((item: TerminalLogItem) => {
+    let height = 76;
+    if (item.subtitle) height += 16;
+    if (typeof item.durationMs === "number") height += 2;
+    if (item.expandable) height += 22;
+    if (item.status === "needs_approval" || item.status === "blocked") height += 4;
+    if (item.details && item.details.length > 180) height += 12;
+    return Math.min(200, height);
+  }, []);
+
+  const terminalVirtualWindow = useVirtualWindow({
+    containerRef: terminalListRef,
+    items: terminalLogItems,
+    estimateSize: estimateTerminalRowSize,
+    threshold: TERMINAL_VIRTUALIZE_THRESHOLD,
+    overscanPx: TERMINAL_OVERSCAN_PX,
+    gapPx: TERMINAL_ROW_GAP_PX,
+    enabled: rightTab === "terminal",
+  });
+
+  const visibleTerminalLogItems = terminalVirtualWindow.enabled
+    ? terminalLogItems.slice(terminalVirtualWindow.start, terminalVirtualWindow.end)
+    : terminalLogItems;
+
+  const terminalTopPadding = terminalVirtualWindow.enabled
+    ? Math.max(0, terminalVirtualWindow.topPadding - (terminalVirtualWindow.start > 0 ? TERMINAL_ROW_GAP_PX : 0))
+    : 0;
+  const terminalBottomPadding = terminalVirtualWindow.enabled
+    ? Math.max(0, terminalVirtualWindow.bottomPadding - (terminalVirtualWindow.end < terminalVirtualWindow.total ? TERMINAL_ROW_GAP_PX : 0))
+    : 0;
+
   const DagPanel = React.lazy(() => import("./DagPanel"));
 
   return (
@@ -565,7 +602,7 @@ export const RightPanel = React.memo(function RightPanel(props: {
                   {planStats.total ? (
                     activePlanIndex >= 0 ? (
                       <>
-                        Step {activePlanIndex + 1} of {planStats.total} · {String((currentPlan[activePlanIndex] as any)?.step || (currentPlan[activePlanIndex] as any)?.id)}
+                        Step {activePlanIndex + 1} of {planStats.total} · {String(currentPlan[activePlanIndex]?.step || currentPlan[activePlanIndex]?.id || "")}
                       </>
                     ) : (
                       <>
@@ -592,7 +629,7 @@ export const RightPanel = React.memo(function RightPanel(props: {
               </div>
 
               <div className="mt-3 flex items-center justify-between">
-                <Badge tone={statusTone as any}>{statusLabel}</Badge>
+                <Badge tone={statusTone}>{statusLabel}</Badge>
                 {planCount ? <Badge tone="gray">{planCount} steps</Badge> : null}
               </div>
 
@@ -705,8 +742,8 @@ export const RightPanel = React.memo(function RightPanel(props: {
                           try {
                             const data = await apiFetchWorkspaceFileText(currentSessionId, next, { maxBytes: 220_000 });
                             setWorkspacePreview({ text: data.text, truncated: data.truncated, bytes: data.bytes });
-                          } catch (e: any) {
-                            setWorkspacePreview({ text: String(e?.message || e || "preview_failed"), truncated: false, bytes: 0 });
+                          } catch (error: unknown) {
+                            setWorkspacePreview({ text: String((error as { message?: unknown } | null)?.message || error || "preview_failed"), truncated: false, bytes: 0 });
                           } finally {
                             setWorkspacePreviewLoading(false);
                           }
@@ -781,10 +818,11 @@ export const RightPanel = React.memo(function RightPanel(props: {
             </div>
 
             {/* Log List */}
-            <div className="flex-1 overflow-y-auto bg-surface-50/50 p-3">
+            <div ref={terminalListRef} className="flex-1 overflow-y-auto bg-surface-50/50 p-3">
               {terminalLogItems.length ? (
                 <div className="space-y-3">
-                  {terminalLogItems.map((it) => {
+                  {terminalVirtualWindow.enabled && terminalTopPadding > 0 ? <div aria-hidden style={{ height: terminalTopPadding }} /> : null}
+                  {visibleTerminalLogItems.map((it) => {
                     const isError = it.level === "error" || it.status === "failed";
                     const isRunning = it.status === "running";
                     const isSuccess = it.status === "succeeded";
@@ -822,7 +860,7 @@ export const RightPanel = React.memo(function RightPanel(props: {
                             {typeof it.durationMs === "number" && (
                               <span className="font-mono text-[10px] text-ink-400">{it.durationMs}ms</span>
                             )}
-                            <Badge tone={tone as any}>{it.status || it.level}</Badge>
+                            <Badge tone={tone}>{it.status || it.level}</Badge>
                           </div>
                         </div>
 
@@ -846,6 +884,7 @@ export const RightPanel = React.memo(function RightPanel(props: {
                       </div>
                     );
                   })}
+                  {terminalVirtualWindow.enabled && terminalBottomPadding > 0 ? <div aria-hidden style={{ height: terminalBottomPadding }} /> : null}
                 </div>
               ) : (
                 <div className="flex h-32 items-center justify-center rounded-xl border border-dashed border-surface-200 text-sm text-ink-400">

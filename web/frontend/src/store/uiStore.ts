@@ -1,18 +1,18 @@
 import { create } from "zustand";
-import type { ApprovalRecord, Bootstrap, SessionSummary } from "../lib/types";
+import type { ApprovalRecord, Bootstrap, SessionMeta, SessionSummary } from "../lib/types";
 
 type State = {
   bootstrap: Bootstrap | null;
   sessions: SessionSummary[];
   currentSessionId: string | null;
-  sessionMeta: any | null;
+  sessionMeta: SessionMeta | null;
   approvals: ApprovalRecord[];
   activeApproval: ApprovalRecord | null;
 
   setBootstrap: (b: Bootstrap) => void;
   setSessions: (s: SessionSummary[]) => void;
   setCurrentSession: (id: string | null) => void;
-  setSessionMeta: (meta: any) => void;
+  setSessionMeta: (meta: SessionMeta | null) => void;
   setApprovals: (a: ApprovalRecord[]) => void;
   popApproval: () => void;
 };

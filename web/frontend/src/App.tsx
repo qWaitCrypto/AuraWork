@@ -1,20 +1,15 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
-  ArrowUp,
   Bot,
   History,
   Loader2,
   MessageCircle,
   Monitor,
-  Paperclip,
-  Plus,
   Settings,
 } from "lucide-react";
-import { apiBootstrap, apiCreateSession, apiDeleteSession, apiFetchArtifact, apiGetApprovals, apiGetSession, apiRegisterWorkspace } from "./lib/api";
-import { isDesktop, waitForBackendGlobals } from "./lib/backendBase";
-import type { ApprovalRecord, AuraEvent, SessionSummary, WorkspaceRecord } from "./lib/types";
-import { connectBrowserStreamWs, connectSessionWs, wsSend, type BrowserStreamMsg, type ServerMsg } from "./lib/ws";
-import { useArtifactStore } from "./store/artifactStore";
+import type { AuraEvent, PlanEnvelope, PlanStep, SessionSummary, TakeoverContext, WorkspaceRecord } from "./lib/types";
+import { wsSend } from "./lib/ws";
+import { useArtifactStore, useArtifactSessionFetched, useArtifactSessionLoading, useArtifactSessionTexts } from "./store/artifactStore";
 import { useEventStore } from "./store/eventStore";
 import { useUiStore } from "./store/uiStore";
 import { Badge } from "./components/Badge";
@@ -24,6 +19,12 @@ import { Chat } from "./components/Chat";
 import { RightPanel } from "./components/RightPanel";
 import { Sidebar } from "./components/Sidebar";
 import { Topbar } from "./components/Topbar";
+import { ChatInput } from "./components/ChatInput";
+import { WorkspacePickerModal } from "./components/WorkspacePickerModal";
+import { ApprovalModal } from "./components/ApprovalModal";
+import { useBrowserInput } from "./hooks/useBrowserInput";
+import { useSessionWs } from "./hooks/useSessionWs";
+import { useBrowserStream } from "./hooks/useBrowserStream";
 
 function fmtTime(ms: number) {
   try {
@@ -105,12 +106,29 @@ type ToolRun = {
   status: "running" | "succeeded" | "failed" | "blocked" | "needs_approval" | "cancelled" | "unknown";
   preset?: string;
   subagentRunId?: string;
+  browserAgentSession?: string;
   requestId?: string | null;
   turnId?: string | null;
   workSpec?: WorkSpecView;
 };
 
 type ViewMode = "work" | "stage";
+type ThemeMode = "light" | "dark";
+
+function resolveInitialTheme(): ThemeMode {
+  try {
+    const stored = localStorage.getItem("AURA_WEB_THEME");
+    if (stored === "light" || stored === "dark") return stored;
+  } catch {
+  }
+
+  try {
+    if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) return "dark";
+  } catch {
+  }
+
+  return "light";
+}
 
 
 function toolCategory(toolName: string) {
@@ -273,8 +291,49 @@ function summarizeApproverTrace(raw: unknown): string | undefined {
 }
 
 
+function asRecord(raw: unknown): Record<string, unknown> | null {
+  return raw && typeof raw === "object" ? (raw as Record<string, unknown>) : null;
+}
+
+function parsePlanEnvelope(raw: unknown): PlanEnvelope | null {
+  const rec = asRecord(raw);
+  if (!rec || !Array.isArray(rec.plan)) return null;
+  const plan = rec.plan.filter((item): item is PlanStep => Boolean(item && typeof item === "object"));
+  return {
+    ...rec,
+    plan,
+  } as PlanEnvelope;
+}
+
+function parseTakeoverContextFromPayload(raw: unknown): TakeoverContext | null {
+  const payload = asRecord(raw);
+  if (!payload) return null;
+
+  const sub = asRecord(payload.subagent);
+  if (sub?.takeover === true) {
+    const ctx = asRecord(sub.takeover_context);
+    if (ctx) return ctx as TakeoverContext;
+  }
+
+  const dag = asRecord(payload.dag);
+  if (dag?.takeover === true) {
+    const ctx = asRecord(dag.takeover_context);
+    if (ctx) return ctx as TakeoverContext;
+  }
+
+  return null;
+}
+
+function parsePendingQueueFromPayload(raw: unknown): Record<string, unknown>[] {
+  const payload = asRecord(raw);
+  if (!payload) return [];
+  const dag = asRecord(payload.dag);
+  if (!dag || !Array.isArray(dag.pending_queue)) return [];
+  return dag.pending_queue.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"));
+}
+
+
 export default function App() {
-  const appendMany = useEventStore((s) => s.appendMany);
   const clearEvents = useEventStore((s) => s.clear);
   const events = useEventStore((s) => s.events);
 
@@ -285,69 +344,34 @@ export default function App() {
   const activeApproval = useUiStore((s) => s.activeApproval);
   const approvals = useUiStore((s) => s.approvals);
 
-  const setBootstrap = useUiStore((s) => s.setBootstrap);
-  const setSessions = useUiStore((s) => s.setSessions);
   const setCurrentSession = useUiStore((s) => s.setCurrentSession);
   const setSessionMeta = useUiStore((s) => s.setSessionMeta);
   const setApprovals = useUiStore((s) => s.setApprovals);
-  const popApproval = useUiStore((s) => s.popApproval);
 
   const ensureTextRaw = useArtifactStore((s) => s.ensureText);
-  const primeArtifactText = useArtifactStore((s) => s.primeText);
-  const artifactTextsRaw = useArtifactStore((s) => s.texts);
-  const artifactFetchedRaw = useArtifactStore((s) => s.fetched);
-  const artifactLoadingRaw = useArtifactStore((s) => s.loading);
-
-  const artifactTexts = useMemo<Record<string, string>>(() => {
-    if (!currentSessionId) return {};
-    const prefix = `${currentSessionId}::`;
-    const out: Record<string, string> = {};
-    for (const [k, v] of Object.entries(artifactTextsRaw)) {
-      if (!k.startsWith(prefix)) continue;
-      out[k.slice(prefix.length)] = v;
-    }
-    return out;
-  }, [artifactTextsRaw, currentSessionId]);
-
-  const artifactFetched = useMemo<Record<string, boolean>>(() => {
-    if (!currentSessionId) return {};
-    const prefix = `${currentSessionId}::`;
-    const out: Record<string, boolean> = {};
-    for (const [k, v] of Object.entries(artifactFetchedRaw)) {
-      if (!k.startsWith(prefix)) continue;
-      out[k.slice(prefix.length)] = Boolean(v);
-    }
-    return out;
-  }, [artifactFetchedRaw, currentSessionId]);
-
-  const artifactLoading = useMemo<Record<string, boolean>>(() => {
-    if (!currentSessionId) return {};
-    const prefix = `${currentSessionId}::`;
-    const out: Record<string, boolean> = {};
-    for (const [k, v] of Object.entries(artifactLoadingRaw)) {
-      if (!k.startsWith(prefix)) continue;
-      out[k.slice(prefix.length)] = v;
-    }
-    return out;
-  }, [artifactLoadingRaw, currentSessionId]);
+  const artifactTexts = useArtifactSessionTexts(currentSessionId);
+  const artifactFetched = useArtifactSessionFetched(currentSessionId);
+  const artifactLoading = useArtifactSessionLoading(currentSessionId);
 
   const ensureText = async (locator: string) => {
     if (!currentSessionId) return null;
     return ensureTextRaw(currentSessionId, locator);
   };
 
+  const {
+    connected,
+    pendingUserMessage,
+    wsRef,
+    sendChat: sendChatWs,
+    decideApprovalById: decideApprovalByIdWs,
+    deleteSession: deleteSessionWs,
+    refreshBootstrap,
+    refreshApprovals,
+  } = useSessionWs();
 
-
-  const wsRef = useRef<WebSocket | null>(null);
-  const browserWsRef = useRef<WebSocket | null>(null);
-  const currentSessionIdRef = useRef<string | null>(null);
-  const [connected, setConnected] = useState(false);
   const [draft, setDraft] = useState("");
-  const [pendingUserMessage, setPendingUserMessage] = useState<{ id: string; text: string; ts: number } | null>(null);
-  const [diffText, setDiffText] = useState<string | null>(null);
-  const [diffLoading, setDiffLoading] = useState(false);
   const [rightTab, setRightTab] = useState<"plan" | "files" | "terminal">("plan");
-  const [tick, setTick] = useState(0);
+  const [nowTs, setNowTs] = useState(() => Date.now());
   const [viewMode, setViewMode] = useState<ViewMode>(() => {
     try {
       const v = localStorage.getItem("AURA_WEB_VIEW");
@@ -356,434 +380,51 @@ export default function App() {
       return "work";
     }
   });
-  const browserFrameRef = useRef<{ data: string; metadata: any; ts: number }>({ data: "", metadata: null, ts: 0 });
-  const browserFrameRafRef = useRef<number | null>(null);
-  const browserStreamTargetRef = useRef<string>("");
-  const [browserFrameTick, setBrowserFrameTick] = useState(0);
-  const [browserStreamState, setBrowserStreamState] = useState<{
-    wsOpen: boolean;
-    upstreamPort?: number;
-    agentSession?: string;
-    lastError?: string;
-    lastStatusAt?: number;
-    lastFrameAt?: number;
-  }>({ wsOpen: false });
-  const [browserControl, setBrowserControl] = useState(false);
-  const [browserControlFocused, setBrowserControlFocused] = useState(false);
-  const browserImgRef = useRef<HTMLImageElement | null>(null);
-  const browserStageRef = useRef<HTMLDivElement | null>(null);
-  const browserMouseMoveRef = useRef<{ x: number; y: number; modifiers: number; buttons?: number } | null>(null);
-  const browserMouseMoveRafRef = useRef<number | null>(null);
+  const [theme, setTheme] = useState<ThemeMode>(() => resolveInitialTheme());
+  const [deleteSessionTarget, setDeleteSessionTarget] = useState<SessionSummary | null>(null);
+  const [deleteSessionBusy, setDeleteSessionBusy] = useState(false);
+  const [deleteSessionError, setDeleteSessionError] = useState<string | null>(null);
+
+  const {
+    browserFrameRef,
+    browserStreamState,
+    browserControl,
+    browserControlFocused,
+    browserImgRef,
+    browserStageRef,
+    browserMouseMoveRef,
+    browserMouseMoveRafRef,
+    browserWsRef,
+    setBrowserControl,
+    setBrowserControlFocused,
+  } = useBrowserStream({
+    viewMode,
+    currentSessionId,
+    approvals,
+    events,
+  });
 
   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
-  const [workspacePathDraft, setWorkspacePathDraft] = useState("");
-  const [workspaceBusy, setWorkspaceBusy] = useState(false);
-  const [workspaceErr, setWorkspaceErr] = useState<string | null>(null);
 
-  const workspaces = (bootstrap as any)?.workspaces as WorkspaceRecord[] | undefined;
+  const workspaces = bootstrap?.workspaces;
   const workspacesList: WorkspaceRecord[] = Array.isArray(workspaces) ? workspaces : [];
 
   function openWorkspacePicker() {
-    setWorkspaceErr(null);
     setWorkspacePickerOpen(true);
   }
 
-  async function createSessionInWorkspace(workspaceId: string) {
-    const wid = String(workspaceId || "").trim();
-    if (!wid) return;
-    setWorkspaceBusy(true);
-    setWorkspaceErr(null);
-    try {
-      const { session_id } = await apiCreateSession(wid);
-      await refreshBootstrap();
-      setCurrentSession(session_id);
-      setWorkspacePickerOpen(false);
-    } catch (e: any) {
-      setWorkspaceErr(String(e?.message || e || "create_session_failed"));
-    } finally {
-      setWorkspaceBusy(false);
-    }
-  }
-
-  async function registerAndCreateSession(projectRoot: string) {
-    const pr = String(projectRoot || "").trim();
-    if (!pr) return;
-    setWorkspaceBusy(true);
-    setWorkspaceErr(null);
-    try {
-      const ws = (await apiRegisterWorkspace(pr)) as WorkspaceRecord;
-      setWorkspacePathDraft("");
-      await createSessionInWorkspace(ws.workspace_id);
-    } catch (e: any) {
-      setWorkspaceErr(String(e?.message || e || "register_workspace_failed"));
-      setWorkspaceBusy(false);
-    }
-  }
-
-  useEffect(() => {
-    if (!workspacePickerOpen) return;
-    refreshBootstrap().catch(() => { });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workspacePickerOpen]);
-
-  function workspaceLabel(w: WorkspaceRecord) {
-    const root = String(w.project_root || "");
-    return basename(root);
-  }
-
-  function workspaceSubtitle(w: WorkspaceRecord) {
-    return String(w.project_root || "");
-  }
-
-  function fmtTs(ts: number | null | undefined) {
-    if (typeof ts !== "number") return "";
-    try {
-      return new Date(ts).toLocaleString();
-    } catch {
-      return "";
-    }
-  }
-
-  const wsEventQueueRef = useRef<AuraEvent[]>([]);
-  const wsFlushScheduledRef = useRef(false);
-  const liveStreamRef = useRef<{ open: boolean; text: string; thinking: string; startedAt: number }>({
-    open: false,
-    text: "",
-    thinking: "",
-    startedAt: 0,
-  });
-
-  function uiDebugEnabled() {
-    try {
-      return localStorage.getItem("AURA_WEB_DEBUG") === "1";
-    } catch {
-      return false;
-    }
-  }
-
-  useEffect(() => {
-    currentSessionIdRef.current = currentSessionId;
-  }, [currentSessionId]);
-
-  function bumpBrowserFrame() {
-    if (browserFrameRafRef.current != null) return;
-    browserFrameRafRef.current = requestAnimationFrame(() => {
-      browserFrameRafRef.current = null;
-      setBrowserFrameTick((t) => t + 1);
-    });
-  }
-
-  function flushWsEvents() {
-    wsFlushScheduledRef.current = false;
-    const batch = wsEventQueueRef.current;
-    if (!batch.length) return;
-    wsEventQueueRef.current = [];
-
-    // Maintain a simple streaming buffer so we can "pin" the streamed output to the
-    // server-provided artifact locator when the terminal event arrives.
-    const stream = liveStreamRef.current;
-    const debug = uiDebugEnabled();
-    for (const e of batch) {
-      if (e.kind === "llm_request_started") {
-        stream.open = true;
-        stream.startedAt = e.timestamp;
-        stream.text = "";
-        stream.thinking = "";
-        if (debug) console.debug("[ui] llm_request_started", { event_id: e.event_id, request_id: e.request_id, turn_id: e.turn_id });
-        continue;
-      }
-
-      if (e.kind === "llm_response_delta") {
-        if (!stream.open) {
-          stream.open = true;
-          stream.startedAt = e.timestamp;
-          stream.text = "";
-          stream.thinking = "";
-          if (debug) console.warn("[ui] llm_response_delta without llm_request_started (recovering)", { event_id: e.event_id });
-        }
-        stream.text += String((e.payload as any).text_delta || "");
-        continue;
-      }
-      if (e.kind === "llm_thinking_delta") {
-        if (!stream.open) {
-          stream.open = true;
-          stream.startedAt = e.timestamp;
-          stream.text = "";
-          stream.thinking = "";
-          if (debug) console.warn("[ui] llm_thinking_delta without llm_request_started (recovering)", { event_id: e.event_id });
-        }
-        stream.thinking += String((e.payload as any).thinking_delta || "");
-        continue;
-      }
-
-      if (e.kind === "llm_response_completed") {
-        stream.open = false;
-        const p = e.payload as any;
-        const outRef = p?.output_ref;
-        const locator = outRef?.locator;
-        const toolCallsLen = Array.isArray(p?.tool_calls) ? p.tool_calls.length : 0;
-        const finalText = typeof p?.final_text === "string" ? p.final_text : "";
-        const text = finalText || stream.text;
-        if (debug) {
-          console.debug("[ui] llm_response_completed", {
-            event_id: e.event_id,
-            provider_kind: p?.provider_kind,
-            model: p?.model,
-            locator,
-            text_len: text.length,
-            thinking_len: stream.thinking.length,
-            tool_calls_len: toolCallsLen,
-          });
-        }
-        const sid = currentSessionIdRef.current;
-        if (sid && typeof locator === "string" && locator.trim() && text) {
-          primeArtifactText(sid, locator, text);
-        } else if (debug) {
-          const level = toolCallsLen > 0 && !text ? "debug" : "warn";
-          (console as any)[level]("[ui] did not prime artifact text", { sid, locator, text_len: text.length, tool_calls_len: toolCallsLen });
-        }
-        continue;
-      }
-
-      if (e.kind === "llm_request_failed") {
-        stream.open = false;
-        if (debug) console.warn("[ui] llm_request_failed", { event_id: e.event_id, payload: e.payload });
-        continue;
-      }
-    }
-
-    appendMany(batch);
-
-    // Clear optimistic chat message when the server acknowledges a chat op.
-    for (const e of batch) {
-      if (e.kind === "operation_started" && String((e.payload as any)?.op_kind || "") === "chat") {
-        setPendingUserMessage(null);
-        break;
-      }
-    }
-
-    // Refresh approvals at most once per batch.
-    for (const e of batch) {
-      if (
-        e.kind === "approval_required"
-        || e.kind === "run_paused"
-        || e.kind === "approval_granted"
-        || e.kind === "approval_denied"
-        || e.kind === "run_resumed"
-      ) {
-        refreshApprovals().catch(() => { });
-        break;
-      }
-    }
-  }
-
-  function enqueueWsEvent(e: AuraEvent) {
-    wsEventQueueRef.current.push(e);
-    if (wsFlushScheduledRef.current) return;
-    wsFlushScheduledRef.current = true;
-    requestAnimationFrame(flushWsEvents);
-  }
-
-  async function refreshBootstrap() {
-    const b = await apiBootstrap();
-    setBootstrap(b);
-    setSessions(b.sessions || []);
-    if (!currentSessionId && b.sessions?.length) setCurrentSession(b.sessions[0].session_id);
-    return b;
-  }
-
-  async function refreshApprovals() {
-    if (!currentSessionId) return;
-    const a = await apiGetApprovals(currentSessionId);
-    setApprovals(a);
-  }
-
-  useEffect(() => {
-    waitForBackendGlobals()
-      .catch(() => { })
-      .finally(() => {
-        refreshBootstrap().catch(() => { });
-      });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    if (!currentSessionId) {
-      // Ensure we close any previous session sockets when the active session becomes null
-      // (e.g. deleting the last session).
-      try {
-        wsRef.current?.close();
-      } catch { }
-      wsRef.current = null;
-      try {
-        browserWsRef.current?.close();
-      } catch { }
-      browserWsRef.current = null;
-      setConnected(false);
-      setPendingUserMessage(null);
-      clearEvents();
-      setSessionMeta(null);
-      setApprovals([]);
-      liveStreamRef.current.open = false;
-      liveStreamRef.current.text = "";
-      liveStreamRef.current.thinking = "";
-      liveStreamRef.current.startedAt = 0;
-      browserFrameRef.current = { data: "", metadata: null, ts: 0 };
-      setBrowserFrameTick(0);
-      setBrowserStreamState({ wsOpen: false });
-      setBrowserControl(false);
-      setBrowserControlFocused(false);
-      return;
-    }
-    clearEvents();
-    setSessionMeta(null);
-    setApprovals([]);
-    setConnected(false);
-    setPendingUserMessage(null);
-    liveStreamRef.current.open = false;
-    liveStreamRef.current.text = "";
-    liveStreamRef.current.thinking = "";
-    liveStreamRef.current.startedAt = 0;
-    browserFrameRef.current = { data: "", metadata: null, ts: 0 };
-    setBrowserFrameTick(0);
-    setBrowserStreamState({ wsOpen: false });
-
-    if (wsRef.current) {
-      try {
-        wsRef.current.close();
-      } catch { }
-    }
-
-    const ws = connectSessionWs(currentSessionId, (msg: ServerMsg) => {
-      if (msg.type === "session_meta") {
-        setSessionMeta(msg.meta);
-        return;
-      }
-      if (msg.type === "replay") {
-        appendMany(msg.events || []);
-        return;
-      }
-      if (msg.type === "event") {
-        const e = msg.event as AuraEvent;
-        enqueueWsEvent(e);
-        return;
-      }
-    });
-
-    ws.addEventListener("open", () => setConnected(true));
-    ws.addEventListener("close", () => setConnected(false));
-    wsRef.current = ws;
-
-    apiGetSession(currentSessionId)
-      .then((meta) => setSessionMeta(meta))
-      .catch(() => { });
-    refreshApprovals().catch(() => { });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentSessionId]);
-
-  useEffect(() => {
-    // Browser stream is only used in Stage view.
-    if (viewMode !== "stage") {
-      if (browserWsRef.current) {
-        try {
-          browserWsRef.current.close();
-        } catch { }
-        browserWsRef.current = null;
-      }
-      setBrowserControl(false);
-      return;
-    }
-    if (!currentSessionId) return;
-
-    const targetAgentSession = (() => {
-      for (const rec of approvals) {
-        const payload = (rec as any)?.resume_payload;
-        if (!payload || typeof payload !== "object") continue;
-        let ctx: any = null;
-        const sub = (payload as any).subagent;
-        if (sub && typeof sub === "object" && sub.takeover === true && sub.takeover_context && typeof sub.takeover_context === "object") {
-          ctx = sub.takeover_context;
-        }
-        const dag = (payload as any).dag;
-        if (!ctx && dag && typeof dag === "object" && dag.takeover === true && dag.takeover_context && typeof dag.takeover_context === "object") {
-          ctx = dag.takeover_context;
-        }
-        if (!ctx || typeof ctx !== "object") continue;
-        const raw = typeof ctx.browser_agent_session === "string"
-          ? ctx.browser_agent_session
-          : typeof ctx.agent_session === "string"
-            ? ctx.agent_session
-            : "";
-        const v = raw.trim();
-        if (v) return v;
-      }
-      return "";
-    })();
-    if (browserStreamTargetRef.current !== targetAgentSession) {
-      browserStreamTargetRef.current = targetAgentSession;
-      browserFrameRef.current = { data: "", metadata: null, ts: 0 };
-      setBrowserFrameTick((t) => t + 1);
-    }
-
-    setBrowserStreamState((s) => ({
-      ...s,
-      wsOpen: false,
-      upstreamPort: undefined,
-      agentSession: targetAgentSession || undefined,
-      lastError: undefined,
-    }));
-
-    const ws = connectBrowserStreamWs(
-      currentSessionId,
-      (msg: BrowserStreamMsg) => {
-        if (msg.type === "frame" && typeof (msg as any).data === "string") {
-          browserFrameRef.current = { data: (msg as any).data, metadata: (msg as any).metadata ?? null, ts: Date.now() };
-          setBrowserStreamState((s) => ({ ...s, lastFrameAt: Date.now(), lastError: undefined }));
-          bumpBrowserFrame();
-          return;
-        }
-        if (msg.type === "status") {
-          setBrowserStreamState((s) => ({
-            ...s,
-            upstreamPort: typeof (msg as any).port === "number" ? (msg as any).port : s.upstreamPort,
-            agentSession: typeof (msg as any).agent_session === "string" ? (msg as any).agent_session : s.agentSession,
-            lastStatusAt: Date.now(),
-            lastError: undefined,
-          }));
-          return;
-        }
-        if (msg.type === "error") {
-          const m = String((msg as any).message || "browser_stream_error");
-          setBrowserStreamState((s) => ({ ...s, lastError: m }));
-          return;
-        }
-      },
-      { agentSession: targetAgentSession || undefined },
-    );
-
-    browserWsRef.current = ws;
-    ws.addEventListener("open", () => setBrowserStreamState((s) => ({ ...s, wsOpen: true, lastError: undefined })));
-    ws.addEventListener("close", () => setBrowserStreamState((s) => ({ ...s, wsOpen: false })));
-
-    return () => {
-      try {
-        ws.close();
-      } catch { }
-      if (browserWsRef.current === ws) browserWsRef.current = null;
-    };
-  }, [viewMode, currentSessionId, approvals]);
-
-  const latestPlan = useMemo(() => {
+  const latestPlan = useMemo<PlanEnvelope | null>(() => {
     for (let i = events.length - 1; i >= 0; i--) {
-      const e = events[i];
-      if (e.kind === "plan_update" && Array.isArray((e.payload as any)?.plan)) return e.payload as any;
+      const event = events[i];
+      if (event.kind !== "plan_update") continue;
+      const parsed = parsePlanEnvelope(event.payload);
+      if (parsed) return parsed;
     }
-    const metaPlan = (sessionMeta as any)?.plan;
-    return Array.isArray(metaPlan) ? ({ plan: metaPlan } as any) : null;
-  }, [events, sessionMeta]);
+    return parsePlanEnvelope({ plan: sessionMeta?.plan ?? [] });
+  }, [events, sessionMeta?.plan]);
 
-  const currentPlan = useMemo(() => {
-    return Array.isArray((latestPlan as any)?.plan) ? ((latestPlan as any).plan as any[]) : [];
+  const currentPlan = useMemo<PlanStep[]>(() => {
+    return latestPlan?.plan ?? [];
   }, [latestPlan]);
 
   const planCount = currentPlan.length;
@@ -817,8 +458,8 @@ export default function App() {
         continue;
       }
       if (!open) continue;
-      if (e.kind === "llm_thinking_delta") thinkingBuf += String((e.payload as any).thinking_delta || "");
-      if (e.kind === "llm_response_delta") assistantBuf += String((e.payload as any).text_delta || "");
+      if (e.kind === "llm_thinking_delta") thinkingBuf += typeof e.payload.thinking_delta === "string" ? e.payload.thinking_delta : "";
+      if (e.kind === "llm_response_delta") assistantBuf += typeof e.payload.text_delta === "string" ? e.payload.text_delta : "";
       if (e.kind === "llm_response_completed" || e.kind === "llm_request_failed") {
         open = false;
         startedAt = 0;
@@ -845,31 +486,30 @@ export default function App() {
       if (e.kind === "llm_response_delta") {
         const stepId = typeof e.step_id === "string" ? e.step_id : null;
         if (!stepId) continue;
-        const delta = String((e.payload as any)?.text_delta || "");
+        const delta = typeof e.payload.text_delta === "string" ? e.payload.text_delta : "";
         if (!delta) continue;
         llmTextLenByStep.set(stepId, (llmTextLenByStep.get(stepId) || 0) + delta.length);
         continue;
       }
-      if (e.kind === "operation_started" && String((e.payload as any)?.op_kind) === "chat") {
-        const ref = (e.payload as any)?.input_ref;
-        if (ref?.locator)
+      if (e.kind === "operation_started" && String(e.payload.op_kind || "") === "chat") {
+        const ref = asRecord(e.payload.input_ref);
+        if (typeof ref?.locator === "string")
           out.push({
             id: e.event_id,
             role: "user",
             ts: e.timestamp,
-            locator: String(ref.locator),
-            summary: ref.summary,
+            locator: ref.locator,
+            summary: typeof ref.summary === "string" ? ref.summary : undefined,
             requestId: e.request_id ?? null,
             turnId: e.turn_id ?? null,
           });
         continue;
       }
       if (e.kind === "llm_response_completed") {
-        const payload = e.payload as any;
-        const ref = payload?.output_ref;
-        const toolCalls = Array.isArray(payload?.tool_calls) ? payload.tool_calls : [];
+        const ref = asRecord(e.payload.output_ref);
+        const toolCalls = Array.isArray(e.payload.tool_calls) ? e.payload.tool_calls : [];
         const summary = typeof ref?.summary === "string" ? ref.summary : "";
-        const finalText = typeof payload?.final_text === "string" ? payload.final_text : "";
+        const finalText = typeof e.payload.final_text === "string" ? e.payload.final_text : "";
         const finalTextLen = finalText.trim().length;
         const stepId = typeof e.step_id === "string" ? e.step_id : null;
         const textLen = stepId ? (llmTextLenByStep.get(stepId) || 0) : 0;
@@ -889,21 +529,19 @@ export default function App() {
           requestId: e.request_id ?? null,
           turnId: e.turn_id ?? null,
         };
-        if (ref?.locator) msg.locator = String(ref.locator);
+        if (typeof ref?.locator === "string") msg.locator = ref.locator;
         if (summary) msg.summary = summary;
         if (finalTextLen > 0) msg.text = finalText;
         if (msg.locator || msg.text) out.push(msg);
         continue;
       }
       if (e.kind === "llm_request_failed") {
-        const p = e.payload as any;
-        const msg = String(p?.error || p?.message || "llm_request_failed");
+        const msg = String(e.payload.error || e.payload.message || "llm_request_failed");
         out.push({ id: e.event_id, role: "system", ts: e.timestamp, text: msg, requestId: e.request_id ?? null, turnId: e.turn_id ?? null });
         continue;
       }
       if (e.kind === "operation_failed") {
-        const p = e.payload as any;
-        const msg = String(p?.error || p?.message || "operation_failed");
+        const msg = String(e.payload.error || e.payload.message || "operation_failed");
         out.push({ id: e.event_id, role: "system", ts: e.timestamp, text: msg, requestId: e.request_id ?? null, turnId: e.turn_id ?? null });
         continue;
       }
@@ -915,11 +553,14 @@ export default function App() {
     const byId = new Map<string, ToolRun>();
     for (const e of events) {
       if (e.kind !== "tool_call_start" && e.kind !== "tool_call_end") continue;
-      const p = e.payload as any;
-      const id = String(p.tool_execution_id || p.tool_call_id || e.event_id);
-      const tool = String(p.tool_name || "tool");
-      const summary = String(p.summary || tool);
-      const workSpec = parseWorkSpecView(p.work_spec);
+      const payload = e.payload;
+      const id = String(payload.tool_execution_id || payload.tool_call_id || e.event_id);
+      const tool = String(payload.tool_name || "tool");
+      const summary = String(payload.summary || tool);
+      const workSpec = parseWorkSpecView(payload.work_spec);
+      const preset = typeof payload.preset === "string" ? payload.preset : undefined;
+      const subagentRunId = typeof payload.subagent_run_id === "string" ? payload.subagent_run_id : undefined;
+      const browserAgentSession = typeof payload.browser_agent_session === "string" ? payload.browser_agent_session : undefined;
 
       if (e.kind === "tool_call_start") {
         byId.set(id, {
@@ -928,15 +569,22 @@ export default function App() {
           summary,
           startedAt: e.timestamp,
           status: "running",
-          preset: p.preset,
-          subagentRunId: p.subagent_run_id,
+          preset,
+          subagentRunId,
+          browserAgentSession,
           requestId: e.request_id ?? null,
           turnId: e.turn_id ?? null,
           workSpec,
         });
       } else {
         const prev = byId.get(id);
-        const status = normalizeToolEndStatus(p.status ?? p.status_legacy ?? "unknown");
+        const status = normalizeToolEndStatus(
+          typeof payload.status === "string"
+            ? payload.status
+            : typeof payload.status_legacy === "string"
+              ? payload.status_legacy
+              : "unknown",
+        );
         byId.set(id, {
           ...(prev || {
             id,
@@ -951,10 +599,11 @@ export default function App() {
           tool,
           summary,
           endedAt: e.timestamp,
-          durationMs: typeof p.duration_ms === "number" ? p.duration_ms : prev?.durationMs,
+          durationMs: typeof payload.duration_ms === "number" ? payload.duration_ms : prev?.durationMs,
           status,
-          preset: p.preset ?? prev?.preset,
-          subagentRunId: p.subagent_run_id ?? prev?.subagentRunId,
+          preset: preset ?? prev?.preset,
+          subagentRunId: subagentRunId ?? prev?.subagentRunId,
+          browserAgentSession: browserAgentSession ?? prev?.browserAgentSession,
           requestId: prev?.requestId ?? (e.request_id ?? null),
           turnId: prev?.turnId ?? (e.turn_id ?? null),
           workSpec: workSpec ?? prev?.workSpec,
@@ -1016,7 +665,7 @@ export default function App() {
         const status = llmFailed ? "failed" : llmEnd ? "succeeded" : "running";
         const durationMs = startedAt && endedAt ? Math.max(0, endedAt - startedAt) : undefined;
         const thinkingLocator = (() => {
-          const ref = (llmEnd?.payload as any)?.thinking_ref;
+          const ref = asRecord(llmEnd?.payload.thinking_ref);
           const loc = ref?.locator;
           return typeof loc === "string" && loc.trim() ? loc : undefined;
         })();
@@ -1036,8 +685,8 @@ export default function App() {
       const toolIds = new Set<string>();
       for (const e of g.events) {
         if (e.kind !== "tool_call_start" && e.kind !== "tool_call_end") continue;
-        const p = e.payload as any;
-        const id = String(p.tool_execution_id || p.tool_call_id || e.event_id);
+        const payload = e.payload;
+        const id = String(payload.tool_execution_id || payload.tool_call_id || e.event_id);
         toolIds.add(id);
       }
       for (const id of toolIds) {
@@ -1063,7 +712,7 @@ export default function App() {
       // Plan updates
       for (const e of g.events) {
         if (e.kind !== "plan_update") continue;
-        const planLen = Array.isArray((e.payload as any)?.plan) ? ((e.payload as any).plan as any[]).length : undefined;
+        const planLen = Array.isArray(e.payload.plan) ? e.payload.plan.length : undefined;
         rows.push({
           key: `plan:${e.event_id}`,
           kind: "plan",
@@ -1076,14 +725,14 @@ export default function App() {
 
       // Approval lifecycle (required/paused/granted/denied/resumed) + approver traces
       for (const e of g.events) {
-        const payload = e.payload as any;
+        const payload = e.payload;
 
         if (e.kind === "subagent_approver_started") {
-          const inspection = payload?.inspection as any;
-          const actionSummary = cleanText(inspection?.action_summary, 180) || cleanText(payload?.tool_name, 80) || "Approver started";
+          const inspection = asRecord(payload.inspection);
+          const actionSummary = cleanText(inspection?.action_summary, 180) || cleanText(payload.tool_name, 80) || "Approver started";
           const risk = cleanText(inspection?.risk_level, 40);
           const reason = cleanText(inspection?.reason, 260);
-          const ws = parseWorkSpecView(payload?.work_spec);
+          const ws = parseWorkSpecView(payload.work_spec);
           rows.push({
             key: `approver_start:${e.event_id}`,
             kind: "approval",
@@ -1101,12 +750,12 @@ export default function App() {
         }
 
         if (e.kind === "subagent_approver_completed") {
-          const after = payload?.inspection_after as any;
+          const after = asRecord(payload.inspection_after);
           const decision = normalizeApproverDecision(after?.decision);
           const status = decision === "allow" ? "succeeded" : decision === "deny" ? "blocked" : decision === "escalate" ? "needs_approval" : "unknown";
-          const actionSummary = cleanText(after?.action_summary, 180) || cleanText(payload?.tool_name, 80) || "Approver completed";
+          const actionSummary = cleanText(after?.action_summary, 180) || cleanText(payload.tool_name, 80) || "Approver completed";
           const reason = cleanText(after?.reason, 260);
-          const trace = summarizeApproverTrace(payload?.approver_trace);
+          const trace = summarizeApproverTrace(payload.approver_trace);
           rows.push({
             key: `approver_done:${e.event_id}`,
             kind: "approval",
@@ -1124,10 +773,10 @@ export default function App() {
         }
 
         if (e.kind === "approval_required") {
-          const actionSummary = cleanText(payload?.action_summary, 180) || "Approval required";
-          const risk = cleanText(payload?.risk_level, 40);
-          const reason = cleanText(payload?.reason, 260);
-          const approvalId = cleanText(payload?.approval_id, 120);
+          const actionSummary = cleanText(payload.action_summary, 180) || "Approval required";
+          const risk = cleanText(payload.risk_level, 40);
+          const reason = cleanText(payload.reason, 260);
+          const approvalId = cleanText(payload.approval_id, 120);
           rows.push({
             key: `approval_required:${e.event_id}`,
             kind: "approval",
@@ -1145,13 +794,13 @@ export default function App() {
         }
 
         if (e.kind === "run_paused") {
-          const pendingCount = Array.isArray(payload?.pending_tools) ? payload.pending_tools.length : undefined;
+          const pendingCount = Array.isArray(payload.pending_tools) ? payload.pending_tools.length : undefined;
           rows.push({
             key: `run_paused:${e.event_id}`,
             kind: "approval",
             title: "Run paused",
             subtitle: typeof pendingCount === "number" ? `pending tools: ${pendingCount}` : "Awaiting approval",
-            details: cleanText(payload?.approval_id, 120) ? `approval_id: ${String(payload.approval_id)}` : undefined,
+            details: cleanText(payload.approval_id, 120) ? `approval_id: ${String(payload.approval_id)}` : undefined,
             status: "needs_approval",
             startedAt: e.timestamp,
             onOpenTab: "terminal",
@@ -1160,13 +809,13 @@ export default function App() {
         }
 
         if (e.kind === "approval_granted") {
-          const approvalId = cleanText(payload?.approval_id, 120);
+          const approvalId = cleanText(payload.approval_id, 120);
           rows.push({
             key: `approval_granted:${e.event_id}`,
             kind: "approval",
             title: "Approval granted",
             subtitle: approvalId,
-            details: cleanText(payload?.decision, 40) ? `decision: ${String(payload.decision)}` : undefined,
+            details: cleanText(payload.decision, 40) ? `decision: ${String(payload.decision)}` : undefined,
             status: "succeeded",
             startedAt: e.timestamp,
             onOpenTab: "terminal",
@@ -1175,13 +824,13 @@ export default function App() {
         }
 
         if (e.kind === "approval_denied") {
-          const approvalId = cleanText(payload?.approval_id, 120);
+          const approvalId = cleanText(payload.approval_id, 120);
           rows.push({
             key: `approval_denied:${e.event_id}`,
             kind: "approval",
             title: "Approval denied",
             subtitle: approvalId,
-            details: cleanText(payload?.decision, 40) ? `decision: ${String(payload.decision)}` : undefined,
+            details: cleanText(payload.decision, 40) ? `decision: ${String(payload.decision)}` : undefined,
             status: "blocked",
             startedAt: e.timestamp,
             onOpenTab: "terminal",
@@ -1196,7 +845,7 @@ export default function App() {
             kind: "approval",
             title: "Run resumed",
             subtitle: typeof pendingCount === "number" ? `pending tools: ${pendingCount}` : undefined,
-            details: cleanText(payload?.approval_id, 120) ? `approval_id: ${String(payload.approval_id)}` : undefined,
+            details: cleanText(payload.approval_id, 120) ? `approval_id: ${String(payload.approval_id)}` : undefined,
             status: "running",
             startedAt: e.timestamp,
             onOpenTab: "terminal",
@@ -1207,8 +856,7 @@ export default function App() {
       // Errors
       for (const e of g.events) {
         if (e.kind !== "operation_failed" && e.kind !== "llm_request_failed") continue;
-        const p = e.payload as any;
-        const msg = String(p?.error || p?.message || e.kind);
+        const msg = String(e.payload.error || e.payload.message || e.kind);
         rows.push({ key: `err:${e.event_id}`, kind: "error", title: msg, status: "failed", startedAt: e.timestamp });
       }
 
@@ -1257,7 +905,8 @@ export default function App() {
     }
     for (const e of events) {
       if (e.kind !== "llm_response_completed") continue;
-      const loc = String(((e.payload as any)?.thinking_ref?.locator as any) || "").trim();
+      const thinkingRef = asRecord(e.payload.thinking_ref);
+      const loc = typeof thinkingRef?.locator === "string" ? thinkingRef.locator.trim() : "";
       if (!loc) continue;
       if (artifactFetched[loc]) continue;
       if (artifactLoading[loc]) continue;
@@ -1272,151 +921,98 @@ export default function App() {
     openWorkspacePicker();
   }
 
-  async function deleteSession(sessionId: string) {
+  async function deleteSession(sessionId: string): Promise<boolean> {
     const sid = String(sessionId || "").trim();
-    if (!sid) return;
+    if (!sid) return false;
     try {
-      await apiDeleteSession(sid);
-      const b = await refreshBootstrap();
-      if (currentSessionIdRef.current === sid) {
-        const next = (b.sessions || []).find((s) => s.session_id !== sid)?.session_id || null;
-        setCurrentSession(next);
-      }
-    } catch (e: any) {
-      // Surface the failure to the console for now (UI toast system is not in place yet).
-      console.warn("[ui] delete session failed", e);
+      await deleteSessionWs(sid);
+      return true;
+    } catch (error: unknown) {
+      console.warn("[ui] delete session failed", error);
+      return false;
     }
+  }
+
+  function requestDeleteSession(session: SessionSummary) {
+    setDeleteSessionTarget(session);
+    setDeleteSessionError(null);
+  }
+
+  function closeDeleteSessionModal() {
+    if (deleteSessionBusy) return;
+    setDeleteSessionTarget(null);
+    setDeleteSessionError(null);
+  }
+
+  async function confirmDeleteSession() {
+    if (!deleteSessionTarget || deleteSessionBusy) return;
+    setDeleteSessionBusy(true);
+    setDeleteSessionError(null);
+    const ok = await deleteSession(deleteSessionTarget.session_id);
+    setDeleteSessionBusy(false);
+    if (ok) {
+      setDeleteSessionTarget(null);
+      return;
+    }
+    setDeleteSessionError("Failed to delete session. Please try again.");
   }
 
   function sendChat() {
     const text = draft.trim();
     if (!text) return;
-    setPendingUserMessage({ id: `pending_${Date.now()}`, text, ts: Date.now() });
-    if (!wsSend(wsRef.current, { type: "chat", text })) {
-      setPendingUserMessage(null);
-      return;
-    }
-    setDraft("");
+    const ok = sendChatWs(text);
+    if (ok) setDraft("");
   }
 
-  async function loadDiff(rec: ApprovalRecord) {
-    setDiffText(null);
-    const diffRef = (rec as any).diff_ref;
-    if (!diffRef?.locator) return;
-    setDiffLoading(true);
-    try {
-      if (!currentSessionId) throw new Error("no session");
-      setDiffText(await apiFetchArtifact(currentSessionId, String(diffRef.locator)));
-    } catch {
-      setDiffText("(Failed to load diff preview)");
-    } finally {
-      setDiffLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    if (activeApproval) loadDiff(activeApproval).catch(() => { });
-    else setDiffText(null);
-  }, [activeApproval]);
 
   function decideApprovalById(approvalId: string, decision: "approve" | "deny", note?: string) {
-    if (!approvalId || !currentSessionId) return;
-    const payload: { type: "approval"; approval_id: string; decision: "approve" | "deny"; note?: string } = {
-      type: "approval",
-      approval_id: approvalId,
-      decision,
-    };
-    if (typeof note === "string" && note.trim()) payload.note = note.trim();
-    wsSend(wsRef.current, payload);
-    refreshApprovals().catch(() => { });
+    decideApprovalByIdWs(approvalId, decision, note);
   }
 
   function decideApproval(decision: "approve" | "deny") {
-    if (!activeApproval || !currentSessionId) return;
-    decideApprovalById(activeApproval.approval_id, decision);
-    popApproval();
+    if (!activeApproval) return;
+    decideApprovalByIdWs(activeApproval.approval_id, decision);
   }
 
   const modelProfiles = bootstrap?.model_profiles || [];
   const approvalsCount = approvals.length;
 
   const takeoverApproval = useMemo(() => {
-    for (const a of approvals) {
-      const payload = (a as any)?.resume_payload;
-      if (!payload || typeof payload !== "object") continue;
-      const sub = (payload as any).subagent;
-      if (sub && typeof sub === "object" && sub.takeover === true) return a;
-      const dag = (payload as any).dag;
-      if (dag && typeof dag === "object" && dag.takeover === true) return a;
+    for (const approval of approvals) {
+      if (parseTakeoverContextFromPayload(approval.resume_payload)) return approval;
     }
     return null;
   }, [approvals]);
 
   const takeoverContext = useMemo(() => {
     if (!takeoverApproval) return null;
-    const payload = (takeoverApproval as any)?.resume_payload;
-    if (!payload || typeof payload !== "object") return null;
-    const sub = (payload as any).subagent;
-    if (sub && typeof sub === "object") {
-      const ctx = sub.takeover_context;
-      if (ctx && typeof ctx === "object") return ctx as any;
-    }
-    const dag = (payload as any).dag;
-    if (dag && typeof dag === "object") {
-      const ctx = dag.takeover_context;
-      if (ctx && typeof ctx === "object") return ctx as any;
-    }
-    return null;
+    return parseTakeoverContextFromPayload(takeoverApproval.resume_payload);
   }, [takeoverApproval]);
 
   const takeoverQueue = useMemo(() => {
-    if (!takeoverApproval) return [] as any[];
-    const payload = (takeoverApproval as any)?.resume_payload;
-    if (!payload || typeof payload !== "object") return [] as any[];
-    const dag = (payload as any).dag;
-    if (!dag || typeof dag !== "object") return [] as any[];
-    const raw = (dag as any).pending_queue;
-    if (!Array.isArray(raw)) return [] as any[];
-    return raw.filter((item) => item && typeof item === "object");
+    if (!takeoverApproval) return [] as Record<string, unknown>[];
+    return parsePendingQueueFromPayload(takeoverApproval.resume_payload);
   }, [takeoverApproval]);
 
   const takeoverStreamAgentSession = useMemo(() => {
-    const ctx: any = takeoverContext;
-    if (!ctx || typeof ctx !== "object") return null;
-    const raw = typeof ctx.browser_agent_session === "string"
-      ? ctx.browser_agent_session
-      : typeof ctx.agent_session === "string"
-        ? ctx.agent_session
+    if (!takeoverContext) return null;
+    const raw = typeof takeoverContext.browser_agent_session === "string"
+      ? takeoverContext.browser_agent_session
+      : typeof takeoverContext.agent_session === "string"
+        ? takeoverContext.agent_session
         : "";
-    const val = raw.trim();
-    return val || null;
+    const value = raw.trim();
+    return value || null;
   }, [takeoverContext]);
 
   const activeApprovalIsTakeover = useMemo(() => {
     if (!activeApproval) return false;
-    const payload = (activeApproval as any)?.resume_payload;
-    if (!payload || typeof payload !== "object") return false;
-    const sub = (payload as any).subagent;
-    if (sub && typeof sub === "object" && sub.takeover === true) return true;
-    const dag = (payload as any).dag;
-    return !!(dag && typeof dag === "object" && dag.takeover === true);
+    return Boolean(parseTakeoverContextFromPayload(activeApproval.resume_payload));
   }, [activeApproval]);
 
   const activeTakeoverContext = useMemo(() => {
     if (!activeApproval) return null;
-    const payload = (activeApproval as any)?.resume_payload;
-    if (!payload || typeof payload !== "object") return null;
-    const sub = (payload as any).subagent;
-    if (sub && typeof sub === "object") {
-      const ctx = sub.takeover_context;
-      if (ctx && typeof ctx === "object") return ctx as any;
-    }
-    const dag = (payload as any).dag;
-    if (dag && typeof dag === "object") {
-      const ctx = dag.takeover_context;
-      if (ctx && typeof ctx === "object") return ctx as any;
-    }
-    return null;
+    return parseTakeoverContextFromPayload(activeApproval.resume_payload);
   }, [activeApproval]);
 
   const currentSession = useMemo(() => {
@@ -1441,13 +1037,14 @@ export default function App() {
   const statusLabel = isPaused ? "Paused" : hasRunningTool ? "Executing" : "Idle";
   const statusTone = isPaused ? "orange" : hasRunningTool ? "orange" : "gray";
 
-  const startTs = events.length ? events[0].timestamp : Date.now();
-  const endTs = hasRunningTool ? Date.now() : lastEvent?.timestamp ?? Date.now();
-  const elapsedMs = endTs - startTs + tick * 0;
+  const startTs = events.length ? events[0].timestamp : nowTs;
+  const endTs = hasRunningTool ? nowTs : lastEvent?.timestamp ?? nowTs;
+  const elapsedMs = endTs - startTs;
 
   useEffect(() => {
     if (!hasRunningTool) return;
-    const id = window.setInterval(() => setTick((t) => t + 1), 1000);
+    setNowTs(Date.now());
+    const id = window.setInterval(() => setNowTs(Date.now()), 1000);
     return () => window.clearInterval(id);
   }, [hasRunningTool]);
 
@@ -1458,13 +1055,21 @@ export default function App() {
   }, [viewMode]);
 
   useEffect(() => {
+    const root = document.documentElement;
+    root.dataset.theme = theme;
+    try {
+      localStorage.setItem("AURA_WEB_THEME", theme);
+    } catch { }
+  }, [theme]);
+
+  useEffect(() => {
     if (!takeoverApproval) return;
     if (viewMode !== "stage") setViewMode("stage");
   }, [takeoverApproval?.approval_id, viewMode]);
 
   const activePlanIndex = useMemo(() => {
     for (let i = 0; i < currentPlan.length; i++) {
-      const st = String((currentPlan[i] as any)?.status || "");
+      const st = String(currentPlan[i]?.status || "");
       if (st === "in_progress") return i;
     }
     return -1;
@@ -1472,7 +1077,7 @@ export default function App() {
 
   const activeTaskTitle = useMemo(() => {
     if (activePlanIndex < 0) return null;
-    const it: any = currentPlan[activePlanIndex];
+    const it = currentPlan[activePlanIndex];
     if (!it) return null;
     return String(it.step || it.id || "").trim() || null;
   }, [activePlanIndex, currentPlan]);
@@ -1488,7 +1093,7 @@ export default function App() {
       locs.push(loc);
     }
     for (const a of approvals) {
-      const diff = (a as any)?.diff_ref?.locator;
+      const diff = a.diff_ref?.locator;
       if (diff && !seen.has(diff)) {
         seen.add(diff);
         locs.push(String(diff));
@@ -1497,13 +1102,6 @@ export default function App() {
     return locs.slice(-30).reverse();
   }, [approvals, chatMessages]);
 
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  function autosizeTextarea() {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.style.height = "0px";
-    el.style.height = `${Math.min(el.scrollHeight, 240)}px`;
-  }
 
   function openRightTabInWorkView(tab: "plan" | "terminal") {
     setRightTab(tab);
@@ -1530,260 +1128,19 @@ export default function App() {
   const browserFrameSrc = browserFrameRef.current.data ? `data:image/jpeg;base64,${browserFrameRef.current.data}` : null;
   const browserFrameMeta = browserFrameRef.current.metadata;
   const browserFrameTs = browserFrameRef.current.ts;
-  const _browserFrameTick = browserFrameTick;
-  const browserPointerDownRef = useRef<{ pointerId: number; button: "left" | "middle" | "right"; clickCount: number } | null>(null);
 
-  function browserModifiers(e: { altKey?: boolean; ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean }): number {
-    // Chrome DevTools Protocol modifiers: Alt=1, Ctrl=2, Meta=4, Shift=8
-    return (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
-  }
-
-  function browserVKeyCode(key: string): number | null {
-    switch (key) {
-      case "Backspace":
-        return 8;
-      case "Tab":
-        return 9;
-      case "Enter":
-        return 13;
-      case "Escape":
-        return 27;
-      case "ArrowLeft":
-        return 37;
-      case "ArrowUp":
-        return 38;
-      case "ArrowRight":
-        return 39;
-      case "ArrowDown":
-        return 40;
-      case "Delete":
-        return 46;
-      default:
-        return null;
-    }
-  }
-
-  function browserButtonFromMouseButton(btn: number): "left" | "middle" | "right" {
-    if (btn === 1) return "middle";
-    if (btn === 2) return "right";
-    return "left";
-  }
-
-  function browserButtonFromButtonsMask(buttons: number | undefined): "none" | "left" | "middle" | "right" {
-    const v = typeof buttons === "number" ? buttons : 0;
-    if (v & 1) return "left";
-    if (v & 4) return "middle";
-    if (v & 2) return "right";
-    return "none";
-  }
-
-  function browserDevicePointFromClient(clientX: number, clientY: number): { x: number; y: number } | null {
-    const img = browserImgRef.current;
-    if (!img) return null;
-
-    const meta = browserFrameRef.current.metadata;
-    const deviceWidth = Number(meta?.deviceWidth || img.naturalWidth || 0);
-    const deviceHeight = Number(meta?.deviceHeight || img.naturalHeight || 0);
-    if (!deviceWidth || !deviceHeight) return null;
-
-    const rect = img.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return null;
-    const relX = (clientX - rect.left) / rect.width;
-    const relY = (clientY - rect.top) / rect.height;
-    if (!Number.isFinite(relX) || !Number.isFinite(relY)) return null;
-    if (relX < 0 || relY < 0 || relX > 1 || relY > 1) return null;
-
-    const x = Math.round(relX * deviceWidth);
-    const y = Math.round(relY * deviceHeight);
-    if (x < 0 || y < 0 || x > deviceWidth || y > deviceHeight) return null;
-    return { x, y };
-  }
-
-  function sendBrowserMouseEvent(payload: any) {
-    const ws = browserWsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    try {
-      ws.send(JSON.stringify(payload));
-    } catch { }
-  }
-
-  function sendBrowserKeyboardEvent(payload: any) {
-    const ws = browserWsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    try {
-      ws.send(JSON.stringify(payload));
-    } catch { }
-  }
-
-  function focusBrowserControl() {
-    const el = browserStageRef.current;
-    if (!el) return;
-    try {
-      el.focus();
-      setBrowserControlFocused(true);
-    } catch { }
-  }
-
-  function onBrowserPointerMove(e: React.PointerEvent) {
-    if (!browserControl) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const p = browserDevicePointFromClient(e.clientX, e.clientY);
-    if (!p) return;
-    browserMouseMoveRef.current = {
-      x: p.x,
-      y: p.y,
-      modifiers: browserModifiers(e),
-      buttons: typeof (e as any).buttons === "number" ? (e as any).buttons : undefined,
-    };
-    if (browserMouseMoveRafRef.current != null) return;
-    browserMouseMoveRafRef.current = requestAnimationFrame(() => {
-      browserMouseMoveRafRef.current = null;
-      const cur = browserMouseMoveRef.current;
-      if (!cur) return;
-      const down = browserPointerDownRef.current;
-      const button = down?.button ?? browserButtonFromButtonsMask(cur.buttons);
-      const clickCount = down?.clickCount ?? 0;
-      sendBrowserMouseEvent({
-        type: "input_mouse",
-        eventType: "mouseMoved",
-        x: cur.x,
-        y: cur.y,
-        modifiers: cur.modifiers,
-        button,
-        clickCount,
-        buttons: cur.buttons,
-      });
-    });
-  }
-
-  function onBrowserPointerDown(e: React.PointerEvent) {
-    if (!browserControl) return;
-    focusBrowserControl();
-    try {
-      browserStageRef.current?.setPointerCapture(e.pointerId);
-    } catch { }
-    const p = browserDevicePointFromClient(e.clientX, e.clientY);
-    if (!p) return;
-    const modifiers = browserModifiers(e);
-    const button = browserButtonFromMouseButton((e as any).button ?? 0);
-    const clickCount = 1;
-    browserPointerDownRef.current = { pointerId: e.pointerId, button, clickCount };
-    e.preventDefault();
-    e.stopPropagation();
-    sendBrowserMouseEvent({ type: "input_mouse", eventType: "mouseMoved", x: p.x, y: p.y, modifiers });
-    sendBrowserMouseEvent({
-      type: "input_mouse",
-      eventType: "mousePressed",
-      x: p.x,
-      y: p.y,
-      button,
-      clickCount,
-      modifiers,
-      buttons: typeof (e as any).buttons === "number" ? (e as any).buttons : undefined,
-    });
-  }
-
-  function onBrowserPointerUp(e: React.PointerEvent) {
-    if (!browserControl) return;
-    focusBrowserControl();
-    const p = browserDevicePointFromClient(e.clientX, e.clientY);
-    if (!p) return;
-    const modifiers = browserModifiers(e);
-    const down = browserPointerDownRef.current;
-    const button = down?.button ?? browserButtonFromMouseButton((e as any).button ?? 0);
-    const clickCount = down?.clickCount ?? 1;
-    e.preventDefault();
-    e.stopPropagation();
-    sendBrowserMouseEvent({ type: "input_mouse", eventType: "mouseMoved", x: p.x, y: p.y, modifiers });
-    sendBrowserMouseEvent({
-      type: "input_mouse",
-      eventType: "mouseReleased",
-      x: p.x,
-      y: p.y,
-      button,
-      clickCount,
-      modifiers,
-      buttons: typeof (e as any).buttons === "number" ? (e as any).buttons : undefined,
-    });
-    browserPointerDownRef.current = null;
-    try {
-      browserStageRef.current?.releasePointerCapture(e.pointerId);
-    } catch { }
-  }
-
-  function sendBrowserWheel(e: React.WheelEvent) {
-    if (!browserControl) return;
-    focusBrowserControl();
-    const p = browserDevicePointFromClient(e.clientX, e.clientY);
-    if (!p) return;
-    e.preventDefault();
-    const modifiers = browserModifiers(e);
-    const deltaX = Number.isFinite(e.deltaX) ? e.deltaX : 0;
-    const deltaY = Number.isFinite(e.deltaY) ? e.deltaY : 0;
-    sendBrowserMouseEvent({ type: "input_mouse", eventType: "mouseWheel", x: p.x, y: p.y, deltaX, deltaY, modifiers, button: "none", clickCount: 0 });
-  }
-
-  function onBrowserKeyDown(e: React.KeyboardEvent) {
-    if (!browserControl) return;
-    if (!browserControlFocused) return;
-    // Allow a quick escape hatch back to chat without sending the key to the browser.
-    if (e.key === "Escape") {
-      e.preventDefault();
-      e.stopPropagation();
-      setBrowserControl(false);
-      setBrowserControlFocused(false);
-      return;
-    }
-
-    e.preventDefault();
-    e.stopPropagation();
-
-    const modifiers = browserModifiers(e);
-    const key = String(e.key || "");
-    const code = String((e as any).code || "");
-    const vkey = browserVKeyCode(key);
-    const isPrintable = key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
-    // Some agent-browser builds do not handle `rawKeyDown` reliably; prefer `keyDown`.
-    const downType = "keyDown";
-    const text = isPrintable ? key : null;
-
-    sendBrowserKeyboardEvent({
-      type: "input_keyboard",
-      eventType: downType,
-      key,
-      code,
-      modifiers,
-      text: text ?? undefined,
-      unmodifiedText: text ?? undefined,
-      windowsVirtualKeyCode: vkey ?? undefined,
-      nativeVirtualKeyCode: vkey ?? undefined,
-    });
-    // Best-effort: emit a char event for printable text.
-    if (isPrintable) {
-      sendBrowserKeyboardEvent({ type: "input_keyboard", eventType: "char", text: key, key, code, modifiers });
-    }
-  }
-
-  function onBrowserKeyUp(e: React.KeyboardEvent) {
-    if (!browserControl) return;
-    if (!browserControlFocused) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const modifiers = browserModifiers(e);
-    const key = String(e.key || "");
-    const code = String((e as any).code || "");
-    const vkey = browserVKeyCode(key);
-    sendBrowserKeyboardEvent({
-      type: "input_keyboard",
-      eventType: "keyUp",
-      key,
-      code,
-      modifiers,
-      windowsVirtualKeyCode: vkey ?? undefined,
-      nativeVirtualKeyCode: vkey ?? undefined,
-    });
-  }
+  const browserInput = useBrowserInput({
+    browserControl,
+    browserControlFocused,
+    setBrowserControl,
+    setBrowserControlFocused,
+    browserWsRef,
+    browserImgRef,
+    browserStageRef,
+    browserFrameRef,
+    browserMouseMoveRef,
+    browserMouseMoveRafRef,
+  });
 
   return (
     <div className="h-full overflow-hidden bg-surface-50 text-ink-900 selection:bg-accent-100">
@@ -1818,9 +1175,11 @@ export default function App() {
             </div>
           </button>
           <button
-            className={[navButtonBase, navButtonInactive].join(" ")}
+            className={[navButtonBase, navButtonInactive, "opacity-40 cursor-not-allowed"].join(" ")}
             aria-label="History"
+            title="Coming soon"
             type="button"
+            disabled
           >
             <History className="h-5 w-5" />
             <div className="pointer-events-none absolute left-14 top-1/2 -translate-y-1/2 whitespace-nowrap rounded-lg bg-ink-900 px-2.5 py-1.5 text-xs font-medium text-white opacity-0 shadow-elevated transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
@@ -1830,9 +1189,11 @@ export default function App() {
 
           <div className="flex-1" />
           <button
-            className="group relative flex h-10 w-10 items-center justify-center rounded-lg text-ink-500 transition-colors hover:bg-surface-100 hover:text-ink-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-500/30"
+            className="group relative flex h-10 w-10 items-center justify-center rounded-lg text-ink-500 transition-colors opacity-40 cursor-not-allowed"
             aria-label="Settings"
+            title="Coming soon"
             type="button"
+            disabled
           >
             <Settings className="h-5 w-5" />
             <div className="pointer-events-none absolute left-14 top-1/2 -translate-y-1/2 whitespace-nowrap rounded-lg bg-ink-900 px-2.5 py-1.5 text-xs font-medium text-white opacity-0 shadow-elevated transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
@@ -1858,7 +1219,7 @@ export default function App() {
             setApprovals([]);
             setCurrentSession(id);
           }}
-          onDeleteSession={(id) => void deleteSession(id)}
+          onRequestDeleteSession={(session) => requestDeleteSession(session)}
           onOpenWorkspacePicker={() => openWorkspacePicker()}
           approvalsCount={approvalsCount}
           lastEventKind={lastEvent?.kind ?? null}
@@ -1878,16 +1239,18 @@ export default function App() {
                 modelProfiles={modelProfiles}
                 sessionMeta={sessionMeta}
                 onChangeChatProfile={(profileId) => wsSend(wsRef.current, { type: "settings", chat_profile_id: profileId || undefined })}
+                theme={theme}
+                onToggleTheme={() => setTheme((prev) => (prev === "dark" ? "light" : "dark"))}
               />
 
               <Chat
-                chatItems={chatItems as any}
+                chatItems={chatItems}
                 artifactTexts={artifactTexts}
                 liveAssistant={liveAssistant}
                 liveThinking={liveThinking}
                 llmRunning={llmRunning}
                 hasRunningTool={hasRunningTool}
-                toolRuns={toolRuns as any}
+                toolRuns={toolRuns}
                 activeTaskTitle={activeTaskTitle}
                 onPickSuggestion={(text) => setDraft(text)}
                 fmtTime={fmtTime}
@@ -1896,46 +1259,8 @@ export default function App() {
               />
 
               {/* Input Area */}
-              <div className="p-4 pb-6 max-w-3xl mx-auto w-full">
-                <div className="relative rounded-2xl border border-surface-200 bg-surface-0 shadow-elevated transition-all focus-within:border-accent-300 focus-within:ring-2 focus-within:ring-accent-100">
-                  <textarea
-                    ref={textareaRef}
-                    rows={1}
-                    placeholder="Message Aura..."
-                    className="max-h-48 w-full resize-none bg-transparent px-4 py-4 pr-24 text-sm text-ink-900 outline-none placeholder:text-ink-400 scrollbar-hide"
-                    value={draft}
-                    onChange={(e) => {
-                      setDraft(e.target.value);
-                      queueMicrotask(autosizeTextarea);
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && !e.shiftKey) {
-                        e.preventDefault();
-                        sendChat();
-                      }
-                    }}
-                    onInput={() => autosizeTextarea()}
-                  />
-                  <div className="absolute bottom-2 right-2 flex gap-1">
-                    <button
-                      className="rounded-lg p-2 text-ink-400 transition-colors hover:bg-surface-100 hover:text-ink-700"
-                      title="Attach file"
-                      type="button"
-                    >
-                      <Paperclip className="h-4 w-4" />
-                    </button>
-                    <button
-                      className="rounded-xl bg-accent-600 p-2.5 text-white shadow-medium transition-all hover:scale-105 hover:bg-accent-700 active:scale-95 disabled:opacity-60"
-                      title="Send"
-                      type="button"
-                      onClick={sendChat}
-                      disabled={!connected || !draft.trim()}
-                    >
-                      <ArrowUp className="h-4 w-4" />
-                    </button>
-                  </div>
-                </div>
-                <div className="mt-2 text-center text-[10px] text-ink-400">Aura may produce inaccurate information. Please verify important details.</div>
+              <div className="max-w-3xl mx-auto w-full">
+                <ChatInput draft={draft} onDraftChange={setDraft} onSend={sendChat} disabled={!connected} />
               </div>
             </main>
 
@@ -1950,7 +1275,7 @@ export default function App() {
               currentPlan={currentPlan}
               hasRunningTool={hasRunningTool}
               statusLabel={statusLabel}
-              statusTone={statusTone as any}
+              statusTone={statusTone}
               elapsedText={fmtElapsed(elapsedMs)}
               approvals={approvals}
               approvalsCount={approvalsCount}
@@ -1959,7 +1284,7 @@ export default function App() {
               artifactTexts={artifactTexts}
               ensureText={ensureText}
               events={events}
-              toolRuns={toolRuns as any}
+              toolRuns={toolRuns}
               sessionMeta={sessionMeta}
               onChangeApprovalMode={(mode) => wsSend(wsRef.current, { type: "settings", tool_approval_mode: mode })}
               onToggleStreaming={(enabled) => wsSend(wsRef.current, { type: "settings", llm_streaming: enabled })}
@@ -1974,6 +1299,8 @@ export default function App() {
               modelProfiles={modelProfiles}
               sessionMeta={sessionMeta}
               onChangeChatProfile={(profileId) => wsSend(wsRef.current, { type: "settings", chat_profile_id: profileId || undefined })}
+                theme={theme}
+                onToggleTheme={() => setTheme((prev) => (prev === "dark" ? "light" : "dark"))}
             />
 
             <div className="flex min-h-0 flex-1 overflow-hidden">
@@ -1986,7 +1313,7 @@ export default function App() {
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
-                    <Badge tone={statusTone as any}>{statusLabel}</Badge>
+                    <Badge tone={statusTone}>{statusLabel}</Badge>
                     {planStats.total ? <Badge tone="gray">{planStats.percent}%</Badge> : null}
                     {hasRunningBrowser ? <Badge tone="orange">browser</Badge> : null}
                     <Button onClick={() => setViewMode("work")} title="Back to Work view">
@@ -2008,8 +1335,8 @@ export default function App() {
                         <div className="truncate text-[11px] text-amber-700">
                           {(takeoverApproval.action_summary || "Complete CAPTCHA/login in the browser view, then resume.") as string}
                         </div>
-                        {typeof (takeoverContext as any)?.current_url === "string" && (takeoverContext as any).current_url ? (
-                          <div className="truncate font-mono text-[10px] text-amber-700/80">{String((takeoverContext as any).current_url)}</div>
+                        {typeof takeoverContext?.current_url === "string" && takeoverContext.current_url ? (
+                          <div className="truncate font-mono text-[10px] text-amber-700/80">{String(takeoverContext.current_url)}</div>
                         ) : null}
                         {typeof takeoverStreamAgentSession === "string" && takeoverStreamAgentSession ? (
                           <div className="truncate font-mono text-[10px] text-amber-700/70">session: {takeoverStreamAgentSession}</div>
@@ -2020,7 +1347,6 @@ export default function App() {
                           variant="primary"
                           onClick={() => {
                             decideApprovalById(takeoverApproval.approval_id, "approve", "user_takeover_completed");
-                            if (activeApproval?.approval_id === takeoverApproval.approval_id) popApproval();
                           }}
                         >
                           Resume
@@ -2028,7 +1354,6 @@ export default function App() {
                         <Button
                           onClick={() => {
                             decideApprovalById(takeoverApproval.approval_id, "deny", "user_takeover_cancelled");
-                            if (activeApproval?.approval_id === takeoverApproval.approval_id) popApproval();
                           }}
                         >
                           Cancel
@@ -2038,19 +1363,19 @@ export default function App() {
                   </div>
                 ) : null}
 
-                {/* Browser 视图 - 白色主题 */}
+                {/* Browser viewport */}
                 <div className="flex min-h-0 flex-1 flex-col bg-surface-50">
-                  {/* 紧凑顶部栏 */}
+                  {/* Compact top bar */}
                   <div className="flex items-center justify-between border-b border-surface-200 bg-surface-0 px-4 py-2">
                     <div className="flex items-center gap-3">
-                      {/* 连接状态指示灯 */}
+                      {/* Connection indicator */}
                       <div className="relative">
                         <span className={`block h-2 w-2 rounded-full ${browserStreamState.wsOpen ? "bg-emerald-500" : "bg-surface-300"}`} />
                         {browserStreamState.wsOpen && (
                           <span className="absolute inset-0 animate-ping rounded-full bg-emerald-500 opacity-40" />
                         )}
                       </div>
-                      {/* 分辨率和时间戳 */}
+                      {/* Resolution and timestamp */}
                       <span className="font-mono text-xs text-ink-600">
                         {browserFrameMeta?.deviceWidth && browserFrameMeta?.deviceHeight
                           ? `${browserFrameMeta.deviceWidth}×${browserFrameMeta.deviceHeight}`
@@ -2064,12 +1389,12 @@ export default function App() {
                       ) : null}
                     </div>
                     <div className="flex items-center gap-2">
-                      {/* Observe/Control 切换按钮 - 胶囊样式 */}
+                      {/* Observe/Control switch */}
                       <div className="flex rounded-full bg-surface-100 p-0.5">
                         <button
                           className={`rounded-full px-3 py-1 text-[11px] font-medium transition-all duration-200 ${!browserControl
-                              ? "bg-white text-ink-900 shadow-sm"
-                              : "text-ink-500 hover:text-ink-700"
+                            ? "bg-white text-ink-900 shadow-sm"
+                            : "text-ink-500 hover:text-ink-700"
                             }`}
                           onClick={() => { setBrowserControl(false); setBrowserControlFocused(false); }}
                           disabled={!browserFrameSrc}
@@ -2078,16 +1403,16 @@ export default function App() {
                         </button>
                         <button
                           className={`rounded-full px-3 py-1 text-[11px] font-medium transition-all duration-200 ${browserControl
-                              ? "bg-amber-500 text-white shadow-sm"
-                              : "text-ink-500 hover:text-ink-700"
+                            ? "bg-amber-500 text-white shadow-sm"
+                            : "text-ink-500 hover:text-ink-700"
                             }`}
-                          onClick={() => { setBrowserControl(true); queueMicrotask(() => focusBrowserControl()); }}
+                          onClick={() => { setBrowserControl(true); queueMicrotask(() => browserInput.focusBrowserControl()); }}
                           disabled={!browserFrameSrc}
                         >
                           Control
                         </button>
                       </div>
-                      {/* 图标按钮 */}
+                      {/* Icon controls */}
                       <button
                         className="flex h-7 w-7 items-center justify-center rounded-lg text-ink-400 transition-colors hover:bg-surface-100 hover:text-ink-700"
                         onClick={() => openRightTabInWorkView("plan")}
@@ -2105,22 +1430,22 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* 浏览器画面 */}
+                  {/* Browser frame */}
                   <div className="relative flex min-h-0 flex-1 items-center justify-center p-6">
                     {browserFrameSrc ? (
                       <>
-                        {/* 画面容器 */}
+                        {/* Frame container */}
                         <div
                           ref={browserStageRef}
                           tabIndex={browserControl ? 0 : -1}
                           className={`relative flex items-center justify-center outline-none touch-none ${browserControl ? "cursor-crosshair" : "cursor-default"}`}
-                          onPointerMove={onBrowserPointerMove}
-                          onPointerDown={onBrowserPointerDown}
-                          onPointerUp={onBrowserPointerUp}
-                          onPointerCancel={() => { browserPointerDownRef.current = null; }}
-                          onWheel={sendBrowserWheel}
-                          onKeyDown={onBrowserKeyDown}
-                          onKeyUp={onBrowserKeyUp}
+                          onPointerMove={browserInput.onPointerMove}
+                          onPointerDown={browserInput.onPointerDown}
+                          onPointerUp={browserInput.onPointerUp}
+                          onPointerCancel={() => { }}
+                          onWheel={browserInput.onWheel}
+                          onKeyDown={browserInput.onKeyDown}
+                          onKeyUp={browserInput.onKeyUp}
                           onBlur={() => setBrowserControlFocused(false)}
                           onFocus={() => setBrowserControlFocused(true)}
                         >
@@ -2132,7 +1457,7 @@ export default function App() {
                             draggable={false}
                           />
                         </div>
-                        {/* Control 模式提示 */}
+                        {/* Control mode hint */}
                         {browserControl && (
                           <div className="absolute bottom-8 right-8 rounded-full bg-ink-900/80 px-4 py-2 text-xs font-medium text-white backdrop-blur-sm">
                             {browserControlFocused ? "🎮 Active · Esc to exit" : "Click viewport to control"}
@@ -2140,7 +1465,7 @@ export default function App() {
                         )}
                       </>
                     ) : (
-                      /* 等待状态 */
+                      /* Waiting state */
                       <div className="flex flex-col items-center gap-4">
                         <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-surface-100">
                           <svg className="h-8 w-8 text-ink-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -2156,7 +1481,7 @@ export default function App() {
                     )}
                   </div>
 
-                  {/* 底部活动状态 */}
+                  {/* Bottom activity status */}
                   {lastBrowserRun && (
                     <div className="flex items-center gap-3 border-t border-surface-200 bg-surface-0 px-4 py-2">
                       <span className={`h-1.5 w-1.5 rounded-full ${lastBrowserRun.status === "running" ? "animate-pulse bg-amber-500" : "bg-emerald-500"}`} />
@@ -2176,13 +1501,13 @@ export default function App() {
 
               <section className="flex w-[420px] flex-shrink-0 flex-col border-l border-surface-200 bg-surface-0 textured-bg">
                 <Chat
-                  chatItems={chatItems as any}
+                  chatItems={chatItems}
                   artifactTexts={artifactTexts}
                   liveAssistant={liveAssistant}
                   liveThinking={liveThinking}
                   llmRunning={llmRunning}
                   hasRunningTool={hasRunningTool}
-                  toolRuns={toolRuns as any}
+                  toolRuns={toolRuns}
                   activeTaskTitle={activeTaskTitle}
                   onPickSuggestion={(text) => setDraft(text)}
                   fmtTime={fmtTime}
@@ -2190,203 +1515,66 @@ export default function App() {
                   onScrollToToolRun={(toolRunId) => openToolRunInWorkView(toolRunId)}
                 />
 
-                <div className="p-4 pb-6 w-full">
-                  <div className="relative rounded-2xl border border-surface-200 bg-surface-0 shadow-elevated transition-all focus-within:border-accent-300 focus-within:ring-2 focus-within:ring-accent-100">
-                    <textarea
-                      ref={textareaRef}
-                      rows={1}
-                      placeholder="Message Aura..."
-                      className="max-h-48 w-full resize-none bg-transparent px-4 py-4 pr-24 text-sm text-ink-900 outline-none placeholder:text-ink-400 scrollbar-hide"
-                      value={draft}
-                      onChange={(e) => {
-                        setDraft(e.target.value);
-                        queueMicrotask(autosizeTextarea);
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && !e.shiftKey) {
-                          e.preventDefault();
-                          sendChat();
-                        }
-                      }}
-                      onInput={() => autosizeTextarea()}
-                    />
-                    <div className="absolute bottom-2 right-2 flex gap-1">
-                      <button
-                        className="rounded-lg p-2 text-ink-400 transition-colors hover:bg-surface-100 hover:text-ink-700"
-                        title="Attach file"
-                        type="button"
-                      >
-                        <Paperclip className="h-4 w-4" />
-                      </button>
-                      <button
-                        className="rounded-xl bg-accent-600 p-2.5 text-white shadow-medium transition-all hover:scale-105 hover:bg-accent-700 active:scale-95 disabled:opacity-60"
-                        title="Send"
-                        type="button"
-                        onClick={sendChat}
-                        disabled={!connected || !draft.trim()}
-                      >
-                        <ArrowUp className="h-4 w-4" />
-                      </button>
-                    </div>
-                  </div>
-                  <div className="mt-2 text-center text-[10px] text-ink-400">Aura may produce inaccurate information. Please verify important details.</div>
-                </div>
+                <ChatInput draft={draft} onDraftChange={setDraft} onSend={sendChat} disabled={!connected} />
               </section>
             </div>
           </main>
         )
         }
 
-      </div >
+      </div>
+
+      <WorkspacePickerModal
+        open={workspacePickerOpen}
+        workspaces={workspacesList}
+        onClose={() => setWorkspacePickerOpen(false)}
+        onSessionCreated={(sid) => { setCurrentSession(sid); setWorkspacePickerOpen(false); }}
+        refreshBootstrap={refreshBootstrap}
+      />
 
       <Modal
-        open={workspacePickerOpen}
-        title="选择工作目录 (Workspace)"
-        onClose={() => {
-          if (workspaceBusy) return;
-          setWorkspacePickerOpen(false);
-        }}
-        footer={
-          <div className="flex items-center justify-between gap-2">
-            <div className="text-xs text-rose-600">{workspaceErr || ""}</div>
-            <div className="flex justify-end gap-2">
-              <Button
-                onClick={() => {
-                  if (workspaceBusy) return;
-                  setWorkspacePickerOpen(false);
-                }}
-              >
-                关闭
-              </Button>
-              <Button
-                variant="primary"
-                onClick={() => {
-                  void registerAndCreateSession(workspacePathDraft);
-                }}
-                disabled={workspaceBusy || !workspacePathDraft.trim()}
-              >
-                {workspaceBusy ? "处理中…" : "新建并进入"}
-              </Button>
-            </div>
+        open={Boolean(deleteSessionTarget)}
+        title="Delete session"
+        onClose={closeDeleteSessionModal}
+        dismissible={!deleteSessionBusy}
+        footer={(
+          <div className="flex items-center justify-end gap-2">
+            <Button type="button" variant="ghost" onClick={closeDeleteSessionModal} disabled={deleteSessionBusy}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              className="border border-rose-200 bg-rose-600 text-white hover:bg-rose-700 disabled:opacity-60"
+              onClick={() => void confirmDeleteSession()}
+              disabled={deleteSessionBusy}
+            >
+              {deleteSessionBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              Delete
+            </Button>
           </div>
-        }
+        )}
       >
-        <div className="space-y-4">
+        <div className="space-y-3 text-sm text-ink-700">
+          <p>Delete this session permanently? This action cannot be undone.</p>
           <div className="rounded-xl border border-surface-200 bg-surface-50 p-3">
-            <div className="text-xs font-semibold text-ink-700">已注册的工作目录</div>
-            <div className="mt-2 space-y-2">
-              {workspacesList.length ? (
-                workspacesList.map((w) => (
-                  <button
-                    key={w.workspace_id}
-                    className="flex w-full items-start justify-between gap-3 rounded-lg border border-surface-200 bg-surface-0 p-3 text-left hover:bg-surface-50 disabled:opacity-60"
-                    onClick={() => void createSessionInWorkspace(w.workspace_id)}
-                    disabled={workspaceBusy}
-                    title={workspaceSubtitle(w)}
-                    type="button"
-                  >
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-semibold text-ink-900">{workspaceLabel(w)}</div>
-                      <div className="truncate font-mono text-[10px] text-ink-500">{workspaceSubtitle(w)}</div>
-                      {w.last_used_at ? <div className="mt-1 text-[10px] text-ink-400">最近使用：{fmtTs(w.last_used_at)}</div> : null}
-                    </div>
-                    <div className="font-mono text-[10px] text-ink-400">{w.workspace_id}</div>
-                  </button>
-                ))
-              ) : (
-                <div className="text-sm text-ink-500">暂无已注册 workspace。</div>
-              )}
-            </div>
+            <div className="font-mono text-xs text-ink-800">{deleteSessionTarget?.session_id || ""}</div>
+            {deleteSessionTarget?.project_root ? (
+              <div className="mt-1 truncate font-mono text-[11px] text-ink-500" title={deleteSessionTarget.project_root}>
+                {deleteSessionTarget.project_root}
+              </div>
+            ) : null}
           </div>
-
-          <div className="rounded-xl border border-surface-200 bg-surface-50 p-3">
-            <div className="text-xs font-semibold text-ink-700">注册新目录并进入</div>
-            <div className="mt-2 flex items-center gap-2">
-              <input
-                className="w-full rounded-lg border border-surface-200 bg-surface-0 px-3 py-2 text-sm font-mono"
-                placeholder="例如：D:/Work/MyProject 或 /mnt/d/Work/MyProject"
-                value={workspacePathDraft}
-                onChange={(e) => setWorkspacePathDraft(e.target.value)}
-                disabled={workspaceBusy}
-              />
-              {isDesktop() ? (
-                <Button
-                  onClick={async () => {
-                    if (workspaceBusy) return;
-                    try {
-                      const { open } = await import("@tauri-apps/plugin-dialog");
-                      const selected = await open({ directory: true, title: "Select Workspace" });
-                      if (typeof selected === "string" && selected.trim()) {
-                        void registerAndCreateSession(selected);
-                      }
-                    } catch (e: any) {
-                      setWorkspaceErr(String(e?.message || e || "desktop_directory_picker_failed"));
-                    }
-                  }}
-                  disabled={workspaceBusy}
-                >
-                  Browse…
-                </Button>
-              ) : null}
-            </div>
-            <div className="mt-2 text-[11px] text-ink-500">可选择任意本地目录（不存在会自动创建并初始化 .aura/）。</div>
-          </div>
+          {deleteSessionError ? (
+            <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">{deleteSessionError}</div>
+          ) : null}
         </div>
       </Modal>
 
-      <Modal
-        open={Boolean(activeApproval && !activeApprovalIsTakeover)}
-        title="Approval required"
-        dismissible={false}
-        onClose={() => { }}
-        footer={
-          <div className="flex justify-end gap-2">
-            <Button onClick={() => decideApproval("deny")}>{activeApprovalIsTakeover ? "Cancel" : "Deny"}</Button>
-            <Button variant="primary" onClick={() => decideApproval("approve")}>
-              {activeApprovalIsTakeover ? "Resume" : "Approve"}
-            </Button>
-          </div>
-        }
-      >
-        {activeApproval ? (
-          <div className="space-y-3">
-            <div className="grid grid-cols-2 gap-3 text-sm">
-              <div className="rounded-xl border border-surface-200 bg-surface-50 p-3">
-                <div className="text-xs text-ink-500">Approval</div>
-                <div className="mt-1 font-mono text-xs text-ink-700">{activeApproval.approval_id}</div>
-              </div>
-              <div className="rounded-xl border border-surface-200 bg-surface-50 p-3">
-                <div className="text-xs text-ink-500">Risk</div>
-                <div className="mt-1 text-sm font-semibold text-ink-900">{activeApproval.risk_level || "high"}</div>
-              </div>
-            </div>
-
-            <div className="rounded-xl border border-surface-200 bg-surface-50 p-3">
-              <div className="text-xs text-ink-500">Summary</div>
-              <div className="mt-1 text-sm text-ink-900">{activeApproval.action_summary}</div>
-              {activeApproval.reason ? <div className="mt-2 text-xs text-ink-700">{activeApproval.reason}</div> : null}
-              {activeApprovalIsTakeover ? (
-                <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800">
-                  Complete verification/login in Browser view, then click <span className="font-semibold">Resume</span>.
-                </div>
-              ) : null}
-              {typeof (activeTakeoverContext as any)?.current_url === "string" && (activeTakeoverContext as any).current_url ? (
-                <div className="mt-2 font-mono text-[10px] text-ink-600">{String((activeTakeoverContext as any).current_url)}</div>
-              ) : null}
-            </div>
-
-            <div className="rounded-xl border border-surface-200 bg-surface-50 p-3">
-              <div className="flex items-center justify-between">
-                <div className="text-xs text-ink-500">Diff preview</div>
-                {diffLoading ? <Badge tone="gray">loading</Badge> : null}
-              </div>
-              <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap rounded-lg border border-surface-200 bg-surface-0 p-3 font-mono text-xs text-ink-700">
-                {diffText || (activeApproval.diff_ref ? "Loading…" : "No diff preview.")}
-              </pre>
-            </div>
-          </div>
-        ) : null}
-      </Modal>
-    </div >
+      <ApprovalModal
+        approval={activeApprovalIsTakeover ? null : activeApproval}
+        currentSessionId={currentSessionId}
+        onDecide={decideApproval}
+      />
+    </div>
   );
 }

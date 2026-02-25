@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,12 +19,15 @@ class ApprovalAgentOutput:
     safety_notes: list[str]
 
 
-def _extract_json_object(text: str) -> dict[str, Any] | None:
+_DECISION_RE = re.compile(r'"decision"\s*:\s*"(allow|require_user|deny)"', re.IGNORECASE)
+
+
+def _extract_json_objects(text: str) -> list[dict[str, Any]]:
     s = (text or "").strip()
     if not s:
-        return None
+        return []
     decoder = json.JSONDecoder()
-    # Find the first '{' and try raw_decode from there.
+    out: list[dict[str, Any]] = []
     for i, ch in enumerate(s):
         if ch != "{":
             continue
@@ -31,8 +35,58 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
             obj, _ = decoder.raw_decode(s[i:])
         except Exception:
             continue
-        return obj if isinstance(obj, dict) else None
+        if isinstance(obj, dict):
+            out.append(obj)
+    return out
+
+
+def _normalize_decision(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    norm = value.strip().lower()
+    if norm in {"allow", "require_user", "deny"}:
+        return norm
     return None
+
+
+def _decision_from_obj(obj: dict[str, Any]) -> str | None:
+    direct = _normalize_decision(obj.get("decision"))
+    if direct is not None:
+        return direct
+
+    output = obj.get("output")
+    if isinstance(output, dict):
+        nested = _normalize_decision(output.get("decision"))
+        if nested is not None:
+            return nested
+    return None
+
+
+def _score_approval_obj(obj: dict[str, Any]) -> int:
+    score = 0
+    decision = _decision_from_obj(obj)
+    if decision is not None:
+        score += 100
+    if "decision" in obj:
+        score += 8
+    reason = obj.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        score += 6
+    reasons = obj.get("reasons")
+    if isinstance(reasons, list) and any(isinstance(x, str) and x.strip() for x in reasons):
+        score += 4
+    safety_notes = obj.get("safety_notes")
+    if isinstance(safety_notes, list):
+        score += 2
+    return score
+
+
+def _extract_best_approval_json(text: str) -> dict[str, Any] | None:
+    objs = _extract_json_objects(text)
+    if not objs:
+        return None
+    ranked = sorted(enumerate(objs), key=lambda item: (_score_approval_obj(item[1]), item[0]))
+    return ranked[-1][1]
 
 
 def _extract_text(out: Any) -> str:
@@ -156,13 +210,18 @@ def maybe_apply_approval_agent(
         return inspection
 
     raw_text = _extract_text(out)
-    parsed = _extract_json_object(raw_text)
+    parsed = _extract_best_approval_json(raw_text)
     if not isinstance(parsed, dict):
         if trace is not None:
             trace.setdefault("parsed", False)
+            trace["raw_preview"] = (raw_text[:400] + ("…" if len(raw_text) > 400 else ""))
         return inspection
 
-    decision = str(parsed.get("decision") or "").strip().lower()
+    decision = _decision_from_obj(parsed) or ""
+    if not decision:
+        m = _DECISION_RE.search(raw_text or "")
+        if m:
+            decision = m.group(1).lower()
     reason = str(parsed.get("reason") or "").strip()
     safety_notes_raw = parsed.get("safety_notes")
     safety_notes: list[str] = []
@@ -189,6 +248,8 @@ def maybe_apply_approval_agent(
             "reason": reason,
             "safety_notes": safety_notes,
         }
+        if not decision:
+            trace["raw_preview"] = (raw_text[:400] + ("…" if len(raw_text) > 400 else ""))
 
     # Normalize decisions
     if decision == "allow":

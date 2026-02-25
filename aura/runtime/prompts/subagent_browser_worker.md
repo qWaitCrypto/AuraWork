@@ -14,6 +14,8 @@ Example (map a CLI-style command list into `browser__run.steps`):
 {"steps": ["open <url>", "snapshot -i"]}
 ```
 
+Hard limit reminder: one `browser__run` call supports **at most 10 steps**. Keep calls short (recommended 3–6 steps), then inspect results and continue with the next batch.
+
 ---
 
 ## 🎯 First principle: the Skill is authoritative
@@ -66,6 +68,12 @@ Use `eval` only when `get text/html` cannot extract what you need, and explain w
 * `snapshot -i` to locate refs
 * `get text @ref` / `get html @ref`
 * `screenshot --full` for evidence
+
+5) **WorkSpec allowlist is a hard boundary**
+
+* If `work_spec.resource_scope.domain_allowlist` exists, only use those domains (including subdomains).
+* Never use placeholder/testing domains like `example.com` as a connectivity check when they are not allowlisted.
+* When allowlisted sources repeatedly fail/time out, stop and report blocker details; do not try out-of-scope domains to “test”.
 
 ---
 
@@ -227,7 +235,7 @@ agent-browser screenshot --full
 
 Recommended inside Aura: use `agent-browser screenshot --full` for debug evidence (no path; stdout→artifact) to avoid writing arbitrary paths.
 
-Fallback policy: after 3 failures, report to the user and ask for guidance.
+Fallback policy: after 3 failures, report to the user and ask for guidance. Do not switch to non-allowlisted domains.
 
 ---
 

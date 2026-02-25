@@ -40,6 +40,15 @@ def _maybe_float(args: dict[str, Any], key: str) -> float | None:
     raise ValueError(f"Invalid '{key}' (expected number).")
 
 
+def _maybe_bool(args: dict[str, Any], key: str) -> bool | None:
+    value = args.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"Invalid '{key}' (expected bool).")
+
+
 def _resolve_in_project(project_root: Path, rel: str) -> Path:
     rel_path = Path(rel)
     if rel_path.is_absolute():
@@ -113,6 +122,8 @@ def _extract_screenshot_path(stdout_text: str) -> str | None:
 class BrowserRunTool:
     artifact_store: ArtifactStore
 
+    _MAX_STEPS_PER_CALL: ClassVar[int] = 10
+
     name: ClassVar[str] = "browser__run"
     description: ClassVar[str] = (
         "Run agent-browser commands in a safer, structured way (no shell). "
@@ -125,6 +136,7 @@ class BrowserRunTool:
             "steps": {
                 "type": "array",
                 "minItems": 1,
+                "maxItems": _MAX_STEPS_PER_CALL,
                 "description": "Sequence of agent-browser commands (without the leading 'agent-browser').",
                 "items": {
                     "anyOf": [
@@ -154,6 +166,10 @@ class BrowserRunTool:
                 "minimum": 1,
                 "description": "Maximum bytes captured for binary stdout (default 5000000).",
             },
+            "continue_on_error": {
+                "type": "boolean",
+                "description": "Whether to continue remaining steps after a failed/timed-out step (default false).",
+            },
         },
         "required": ["steps"],
         "additionalProperties": False,
@@ -161,6 +177,11 @@ class BrowserRunTool:
 
     def execute(self, *, args: dict[str, Any], project_root: Path, context: ToolExecutionContext | None = None) -> dict[str, Any]:
         steps = parse_browser_steps(args.get("steps"))
+        if len(steps) > self._MAX_STEPS_PER_CALL:
+            raise ValueError(
+                f"Too many browser steps in one call: {len(steps)} > {self._MAX_STEPS_PER_CALL}. "
+                f"Split into smaller batches (at most {self._MAX_STEPS_PER_CALL} steps per browser__run call)."
+            )
         cwd_rel = str(args.get("cwd") or ".")
         cwd_path = _resolve_in_project(project_root, cwd_rel)
         timeout_s = _maybe_float(args, "timeout_s")
@@ -168,6 +189,13 @@ class BrowserRunTool:
             timeout_s = 30.0
         max_output_chars = _maybe_int(args, "max_output_chars") or 16000
         max_binary_bytes = _maybe_int(args, "max_binary_bytes") or 5_000_000
+        continue_on_error = _maybe_bool(args, "continue_on_error") or False
+
+        if continue_on_error and context is not None:
+            meta = context.metadata if isinstance(getattr(context, "metadata", None), dict) else {}
+            preset_name = meta.get("aura_subagent_preset") if isinstance(meta, dict) else None
+            if isinstance(preset_name, str) and preset_name.strip() == "browser_worker":
+                continue_on_error = False
 
         binary = shutil.which("agent-browser")
         if not binary:
@@ -202,7 +230,8 @@ class BrowserRunTool:
                 env["AGENT_BROWSER_STREAM_PORT"] = str(stream_port)
 
         results: list[dict[str, Any]] = []
-        for step_argv in steps:
+        first_failure_index: int | None = None
+        for step_index, step_argv in enumerate(steps):
             full_argv = [binary, *step_argv]
             started = time.monotonic()
             proc = subprocess.Popen(
@@ -281,6 +310,7 @@ class BrowserRunTool:
 
             results.append(
                 {
+                    "step_index": step_index,
                     "argv": full_argv,
                     "exit_code": exit_code,
                     "timed_out": timed_out,
@@ -292,11 +322,39 @@ class BrowserRunTool:
                 }
             )
 
-        ok = all(r.get("exit_code") == 0 and not r.get("timed_out") for r in results)
+            if (timed_out or exit_code != 0) and first_failure_index is None:
+                first_failure_index = step_index
+                if not continue_on_error:
+                    break
+
+        ok = first_failure_index is None
         out: dict[str, Any] = {
             "ok": ok,
             "steps": results,
+            "requested_steps": len(steps),
+            "executed_steps": len(results),
         }
+
+        if first_failure_index is not None and 0 <= first_failure_index < len(results):
+            failed_step = results[first_failure_index]
+            out["failed_step_index"] = first_failure_index
+            out["failed_step"] = failed_step
+
+            stderr = failed_step.get("stderr")
+            err = stderr.strip() if isinstance(stderr, str) and stderr.strip() else None
+            if not err:
+                if failed_step.get("timed_out") is True:
+                    err = "browser__run step timed out"
+                else:
+                    exit_code = failed_step.get("exit_code")
+                    if isinstance(exit_code, int):
+                        err = f"browser__run step failed (exit_code={exit_code})"
+            if isinstance(err, str) and err:
+                out["error"] = err
+
+            out["error_code"] = "timeout" if failed_step.get("timed_out") is True else "tool_failed"
+            out["stopped_after_failure"] = (not continue_on_error) and (len(results) < len(steps))
+
         if isinstance(agent_session, str) and agent_session.strip():
             out["agent_session"] = agent_session.strip()
         if isinstance(stream_port, int) and 1 <= stream_port <= 65535:

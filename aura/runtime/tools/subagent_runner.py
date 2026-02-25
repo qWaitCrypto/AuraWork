@@ -19,6 +19,8 @@ class SubagentRunTool:
     tool_runtime: ToolRuntime
     artifact_store: ArtifactStore
 
+    _HARD_MAX_TOOL_CALLS: ClassVar[int] = 10
+
     name: ClassVar[str] = "subagent__run"
     description: ClassVar[str] = (
         "Run a bounded delegated task in an isolated subagent context. "
@@ -130,8 +132,8 @@ class SubagentRunTool:
             "max_tool_calls": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 200,
-                "description": "Max tool calls executed inside the subagent.",
+                "maximum": _HARD_MAX_TOOL_CALLS,
+                "description": "Max tool calls executed inside the subagent (hard-capped at 10).",
             },
         },
         "required": ["preset", "task", "work_spec"],
@@ -139,7 +141,6 @@ class SubagentRunTool:
     }
 
     def execute(self, *, args: dict[str, Any], project_root, context: ToolExecutionContext | None = None) -> dict[str, Any]:
-        default_max_tool_calls = 10
         preset_name = str(args.get("preset") or "").strip()
         preset = get_preset(preset_name)
         if preset is None:
@@ -167,11 +168,11 @@ class SubagentRunTool:
 
         max_tool_calls = args.get("max_tool_calls")
         if max_tool_calls is None:
-            max_tool_calls_int = min(preset.limits.max_tool_calls, default_max_tool_calls)
+            max_tool_calls_int = min(preset.limits.max_tool_calls, self._HARD_MAX_TOOL_CALLS)
         else:
             if isinstance(max_tool_calls, bool) or not isinstance(max_tool_calls, int) or max_tool_calls < 1:
                 raise ValueError("Invalid 'max_tool_calls' (expected integer >= 1).")
-            max_tool_calls_int = min(int(max_tool_calls), 200)
+            max_tool_calls_int = min(int(max_tool_calls), self._HARD_MAX_TOOL_CALLS)
 
         work_spec_raw = args.get("work_spec")
         work_spec: WorkSpec | None = None

@@ -1,51 +1,159 @@
 import React from "react";
-import { Bot } from "lucide-react";
+import { ArrowDown, Bot } from "lucide-react";
 import { Badge } from "./Badge";
 import { Button } from "./Button";
-import { TaskExecutionCard, type ToolLog } from "./TaskExecutionCard";
+import { TaskExecutionCard } from "./TaskExecutionCard";
+import type { ChatItem, ToolRun, ToolLog, TimelineCard } from "../types";
+import { useVirtualWindow } from "../hooks/useVirtualWindow";
 
-type ChatMessage = {
-  id: string;
-  role: "user" | "assistant" | "system";
-  ts: number;
-  locator?: string;
-  summary?: string;
-  text?: string;
-};
+const CHAT_ROW_GAP_PX = 24;
+const CHAT_VIRTUALIZE_THRESHOLD = 90;
+const CHAT_OVERSCAN_PX = 960;
+const CHAT_AUTO_SCROLL_THRESHOLD_PX = 120;
 
-type TimelineRow = {
+type RenderableChatRow = {
   key: string;
-  kind: "llm" | "tool" | "plan" | "approval" | "error";
-  title: string;
-  subtitle?: string;
-  details?: string;
-  status?: "running" | "succeeded" | "failed" | "blocked" | "needs_approval" | "cancelled" | "unknown";
-  startedAt?: number;
-  durationMs?: number;
-  toolRunId?: string;
-  onOpenTab?: "plan" | "terminal";
-  thinkingLocator?: string;
+  item: ChatItem;
+  content?: string;
 };
 
-type TimelineCard = {
-  id: string;
-  ts: number;
-  rows: TimelineRow[];
-};
+function resolveMessageContent(msg: { locator?: string; text?: string; summary?: string }, artifactTexts: Record<string, string>): string | null {
+  if (!msg.locator) return msg.text ?? "—";
+  const value = artifactTexts[msg.locator];
+  if (typeof value === "string" && value.trim()) return value;
+  if (typeof msg.text === "string" && msg.text.trim()) return msg.text;
+  if (typeof msg.summary === "string" && msg.summary.trim()) return msg.summary;
+  return null;
+}
 
-type ChatItem =
-  | { kind: "message"; msg: ChatMessage }
-  | { kind: "timeline"; card: TimelineCard };
+type MarkdownBlock =
+  | { kind: "text"; content: string }
+  | { kind: "code"; content: string; language: string };
 
-type ToolRun = {
-  id: string;
-  tool: string;
-  summary: string;
-  startedAt: number;
-  endedAt?: number;
-  durationMs?: number;
-  status: "running" | "succeeded" | "failed" | "blocked" | "needs_approval" | "cancelled" | "unknown";
-};
+function parseMarkdownBlocks(raw: string): MarkdownBlock[] {
+  const lines = String(raw || "").replace(/\r\n/g, "\n").split("\n");
+  const blocks: MarkdownBlock[] = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    const fence = line.match(/^```\s*([^`\s]*)\s*$/);
+    if (fence) {
+      const language = String(fence[1] || "").trim();
+      const codeLines: string[] = [];
+      index += 1;
+      while (index < lines.length && !/^```\s*$/.test(lines[index])) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+      blocks.push({ kind: "code", content: codeLines.join("\n"), language });
+      if (index < lines.length) index += 1;
+      continue;
+    }
+
+    const textLines: string[] = [];
+    while (index < lines.length && !/^```\s*([^`\s]*)\s*$/.test(lines[index])) {
+      textLines.push(lines[index]);
+      index += 1;
+    }
+
+    const content = textLines.join("\n").trim();
+    if (content) blocks.push({ kind: "text", content });
+  }
+
+  return blocks.length ? blocks : [{ kind: "text", content: String(raw || "") }];
+}
+
+function renderInlineMarkdown(text: string, keyPrefix: string): React.ReactNode[] {
+  return text.split(/(`[^`\n]+`)/g).filter(Boolean).map((part, index) => {
+    if (part.startsWith("`") && part.endsWith("`") && part.length >= 2) {
+      return (
+        <code key={`${keyPrefix}-code-${index}`} className="rounded bg-surface-100 px-1.5 py-0.5 font-mono text-[0.92em] text-ink-700">
+          {part.slice(1, -1)}
+        </code>
+      );
+    }
+    return <React.Fragment key={`${keyPrefix}-text-${index}`}>{part}</React.Fragment>;
+  });
+}
+
+function renderMarkdownTextBlock(content: string, keyPrefix: string): React.ReactNode[] {
+  const paragraphs = content.split(/\n{2,}/).map((item) => item.trim()).filter(Boolean);
+
+  return paragraphs.map((paragraph, index) => {
+    const key = `${keyPrefix}-${index}`;
+    const lines = paragraph.split("\n").map((line) => line.trim()).filter(Boolean);
+
+    if (lines.length === 1) {
+      const heading = lines[0].match(/^(#{1,3})\s+(.+)$/);
+      if (heading) {
+        const level = heading[1].length;
+        const text = heading[2];
+        if (level === 1) {
+          return <h1 key={key} className="text-base font-semibold text-ink-900">{renderInlineMarkdown(text, key)}</h1>;
+        }
+        if (level === 2) {
+          return <h2 key={key} className="text-sm font-semibold text-ink-900">{renderInlineMarkdown(text, key)}</h2>;
+        }
+        return <h3 key={key} className="text-sm font-medium text-ink-800">{renderInlineMarkdown(text, key)}</h3>;
+      }
+    }
+
+    if (lines.length > 0 && lines.every((line) => /^[-*]\s+/.test(line))) {
+      return (
+        <ul key={key} className="list-disc space-y-1 pl-5 text-sm leading-relaxed">
+          {lines.map((line, lineIndex) => (
+            <li key={`${key}-li-${lineIndex}`}>
+              {renderInlineMarkdown(line.replace(/^[-*]\s+/, ""), `${key}-li-${lineIndex}`)}
+            </li>
+          ))}
+        </ul>
+      );
+    }
+
+    if (lines.length > 0 && lines.every((line) => /^\d+\.\s+/.test(line))) {
+      return (
+        <ol key={key} className="list-decimal space-y-1 pl-5 text-sm leading-relaxed">
+          {lines.map((line, lineIndex) => (
+            <li key={`${key}-oli-${lineIndex}`}>
+              {renderInlineMarkdown(line.replace(/^\d+\.\s+/, ""), `${key}-oli-${lineIndex}`)}
+            </li>
+          ))}
+        </ol>
+      );
+    }
+
+    return (
+      <p key={key} className="whitespace-pre-wrap text-sm leading-relaxed text-ink-700">
+        {renderInlineMarkdown(paragraph, key)}
+      </p>
+    );
+  });
+}
+
+function MarkdownText(props: { text: string; className?: string }) {
+  const blocks = React.useMemo(() => parseMarkdownBlocks(props.text), [props.text]);
+
+  return (
+    <div className={props.className}>
+      {blocks.map((block, index) => {
+        if (block.kind === "code") {
+          return (
+            <pre key={`md-code-${index}`} className="overflow-x-auto rounded-xl border border-surface-200 bg-surface-100 px-3 py-2 font-mono text-xs text-ink-700">
+              {block.language ? <div className="mb-1 text-[10px] uppercase tracking-wide text-ink-400">{block.language}</div> : null}
+              <code>{block.content}</code>
+            </pre>
+          );
+        }
+        return (
+          <div key={`md-text-${index}`} className="space-y-2">
+            {renderMarkdownTextBlock(block.content, `md-text-${index}`)}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 export const Chat = React.memo(function Chat(props: {
   chatItems: ChatItem[];
@@ -67,13 +175,102 @@ export const Chat = React.memo(function Chat(props: {
 
   const [collapsedCards, setCollapsedCards] = React.useState<Record<string, boolean>>({});
 
+  const isNearBottomRef = React.useRef(true);
+  const [isNearBottom, setIsNearBottom] = React.useState(true);
+
+  const updateBottomState = React.useCallback(() => {
+    const el = chatStreamRef.current;
+    if (!el) return;
+    const distance = el.scrollHeight - el.clientHeight - el.scrollTop;
+    const nearBottom = distance <= CHAT_AUTO_SCROLL_THRESHOLD_PX;
+    isNearBottomRef.current = nearBottom;
+    setIsNearBottom((prev) => (prev === nearBottom ? prev : nearBottom));
+  }, []);
+
+  const scrollToLatest = React.useCallback((behavior: ScrollBehavior = "smooth") => {
+    const el = chatStreamRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior });
+    isNearBottomRef.current = true;
+    setIsNearBottom(true);
+  }, []);
+
   React.useEffect(() => {
     const el = chatStreamRef.current;
     if (!el) return;
-    requestAnimationFrame(() => {
+
+    const onScroll = () => {
+      updateBottomState();
+    };
+
+    onScroll();
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+    };
+  }, [updateBottomState]);
+
+  const renderableRows = React.useMemo<RenderableChatRow[]>(() => {
+    const rows: RenderableChatRow[] = [];
+    for (const item of chatItems) {
+      if (item.kind === "timeline") {
+        rows.push({ key: `timeline:${item.card.id}`, item });
+        continue;
+      }
+      const content = resolveMessageContent(item.msg, artifactTexts);
+      if (content === null) continue;
+      rows.push({ key: `message:${item.msg.id}`, item, content });
+    }
+    return rows;
+  }, [artifactTexts, chatItems]);
+
+  const estimateRowSize = React.useCallback((row: RenderableChatRow) => {
+    if (row.item.kind === "timeline") {
+      const collapsed = collapsedCards[row.item.card.id] ?? true;
+      if (collapsed) return 96;
+      const count = row.item.card.rows.length;
+      return Math.min(760, 140 + count * 86);
+    }
+
+    const msg = row.item.msg;
+    const contentLen = row.content ? row.content.length : 0;
+    if (msg.role === "system") return Math.min(260, 76 + Math.ceil(contentLen / 64) * 18);
+    return Math.min(680, 112 + Math.ceil(contentLen / 58) * 20);
+  }, [collapsedCards]);
+
+  const virtualWindow = useVirtualWindow({
+    containerRef: chatStreamRef,
+    items: renderableRows,
+    estimateSize: estimateRowSize,
+    threshold: CHAT_VIRTUALIZE_THRESHOLD,
+    overscanPx: CHAT_OVERSCAN_PX,
+    gapPx: CHAT_ROW_GAP_PX,
+  });
+
+  const visibleRows = virtualWindow.enabled
+    ? renderableRows.slice(virtualWindow.start, virtualWindow.end)
+    : renderableRows;
+
+  const topPadding = virtualWindow.enabled
+    ? Math.max(0, virtualWindow.topPadding - (virtualWindow.start > 0 ? CHAT_ROW_GAP_PX : 0))
+    : 0;
+  const bottomPadding = virtualWindow.enabled
+    ? Math.max(0, virtualWindow.bottomPadding - (virtualWindow.end < virtualWindow.total ? CHAT_ROW_GAP_PX : 0))
+    : 0;
+
+  React.useEffect(() => {
+    if (!isNearBottomRef.current) return;
+
+    const raf = requestAnimationFrame(() => {
+      const el = chatStreamRef.current;
+      if (!el) return;
       el.scrollTop = el.scrollHeight;
+      isNearBottomRef.current = true;
+      setIsNearBottom(true);
     });
-  }, [chatItems.length, liveAssistant, liveThinking, hasRunningTool, toolRuns.length]);
+
+    return () => cancelAnimationFrame(raf);
+  }, [renderableRows.length, liveAssistant, liveThinking, hasRunningTool, toolRuns.length]);
 
   function isCollapsed(cardId: string) {
     return collapsedCards[cardId] ?? true;
@@ -102,9 +299,13 @@ export const Chat = React.memo(function Chat(props: {
   }
 
   return (
-    <div ref={chatStreamRef} className="flex-1 overflow-y-auto scroll-smooth p-4 md:p-8 space-y-6" id="chat-stream">
-      {chatItems.length ? (
-        chatItems.map((it) => {
+    <div className="relative flex-1 min-h-0">
+      <div ref={chatStreamRef} className="h-full overflow-y-auto scroll-smooth p-4 md:p-8 space-y-6" id="chat-stream">
+      {renderableRows.length ? (
+        <>
+          {virtualWindow.enabled && topPadding > 0 ? <div aria-hidden style={{ height: topPadding }} /> : null}
+          {visibleRows.map((row) => {
+            const it = row.item;
           if (it.kind === "timeline") {
             const card = it.card;
             const collapsed = isCollapsed(card.id);
@@ -151,11 +352,11 @@ export const Chat = React.memo(function Chat(props: {
                             ? "red"
                             : r.status === "blocked" || r.status === "needs_approval"
                               ? "orange"
-                            : r.status === "running"
-                              ? "orange"
-                              : r.status === "succeeded"
-                                ? "blue"
-                                : "gray";
+                              : r.status === "running"
+                                ? "orange"
+                                : r.status === "succeeded"
+                                  ? "blue"
+                                  : "gray";
 
                         const dur = typeof r.durationMs === "number" ? `${r.durationMs}ms` : undefined;
 
@@ -202,7 +403,7 @@ export const Chat = React.memo(function Chat(props: {
                               </div>
                               <div className="flex flex-shrink-0 items-center gap-2">
                                 {dur ? <span className="font-mono text-[11px] text-ink-500">{dur}</span> : null}
-                                {r.status ? <Badge tone={tone as any}>{r.status}</Badge> : <Badge tone={tone as any}>{r.kind}</Badge>}
+                                {r.status ? <Badge tone={tone}>{r.status}</Badge> : <Badge tone={tone}>{r.kind}</Badge>}
                                 {r.onOpenTab ? (
                                   <Button
                                     title={r.onOpenTab === "terminal" ? "Open in Terminal" : "Open Plan"}
@@ -228,16 +429,7 @@ export const Chat = React.memo(function Chat(props: {
           }
 
           const m = it.msg;
-          const content = (() => {
-            if (!m.locator) return m.text ?? "—";
-            const v = artifactTexts[m.locator];
-            if (typeof v === "string" && v.trim()) return v;
-            if (typeof m.text === "string" && m.text.trim()) return m.text;
-            if (m.summary && m.summary.trim()) return m.summary;
-            // 如果有 locator 但内容未加载，说明是后续消息，可能还在处理中
-            return null;
-          })();
-          // 跳过没有内容的消息（避免显示空的 Loading...）
+          const content = row.content ?? resolveMessageContent(m, artifactTexts);
           if (content === null) return null;
           const isUser = m.role === "user";
           const isSystem = m.role === "system";
@@ -273,12 +465,14 @@ export const Chat = React.memo(function Chat(props: {
                       : "rounded-2xl rounded-tl-sm bg-surface-0 border-l-2 border-accent-400 border-t border-r border-b border-t-surface-200 border-r-surface-200 border-b-surface-200",
                   ].join(" ")}
                 >
-                  <div className="whitespace-pre-wrap">{content}</div>
+                  {isUser ? <div className="whitespace-pre-wrap">{content}</div> : <MarkdownText text={content} className="space-y-2" />}
                 </div>
               </div>
             </div>
           );
-        })
+          })}
+          {virtualWindow.enabled && bottomPadding > 0 ? <div aria-hidden style={{ height: bottomPadding }} /> : null}
+        </>
       ) : (
         <div className="mx-auto w-full max-w-3xl animate-fade-in rounded-2xl border border-surface-200 bg-surface-0 p-6 text-center shadow-soft">
           <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-accent-500 to-accent-700 shadow-medium">
@@ -316,8 +510,8 @@ export const Chat = React.memo(function Chat(props: {
               summary: t.summary,
               status: t.status,
               durationMs: t.durationMs,
-              preset: (t as any).preset,
-              subagentRunId: (t as any).subagentRunId,
+              preset: t.preset,
+              subagentRunId: t.subagentRunId,
             }));
             const running = toolRuns.filter((t) => t.status === "running");
             const startedAt = running.length ? Math.min(...running.map((t) => t.startedAt)) : null;
@@ -360,10 +554,25 @@ export const Chat = React.memo(function Chat(props: {
                   {liveThinking.length > 600 ? "…" : ""}
                 </div>
               ) : null}
-              {liveAssistant ? <div className="whitespace-pre-wrap text-ink-700">{liveAssistant}</div> : <div className="text-sm text-ink-500">Thinking…</div>}
+              {liveAssistant ? <MarkdownText text={liveAssistant} className="space-y-2" /> : <div className="text-sm text-ink-500">Thinking…</div>}
               <span className="ml-0.5 inline-block h-4 w-1 align-text-bottom bg-accent-500 animate-pulse" />
             </div>
           </div>
+        </div>
+      ) : null}
+      </div>
+
+      {!isNearBottom && renderableRows.length ? (
+        <div className="pointer-events-none absolute bottom-4 right-6 z-20">
+          <Button
+            type="button"
+            variant="primary"
+            className="pointer-events-auto rounded-full px-3 py-1.5 text-xs shadow-elevated"
+            onClick={() => scrollToLatest()}
+          >
+            <ArrowDown className="h-3.5 w-3.5" />
+            Jump to latest
+          </Button>
         </div>
       ) : null}
     </div>

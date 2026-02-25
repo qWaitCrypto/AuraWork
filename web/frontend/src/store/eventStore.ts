@@ -22,47 +22,103 @@ function sortEvents(a: AuraEvent, b: AuraEvent) {
   return a.event_id.localeCompare(b.event_id);
 }
 
-export const useEventStore = create<State>((set, get) => ({
+function isNonDecreasing(events: AuraEvent[], seed: AuraEvent | null) {
+  let prev = seed;
+  for (const ev of events) {
+    if (prev && sortEvents(prev, ev) > 0) return false;
+    prev = ev;
+  }
+  return true;
+}
+
+function binaryInsertIndex(events: AuraEvent[], target: AuraEvent) {
+  let low = 0;
+  let high = events.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (sortEvents(events[mid], target) <= 0) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  return low;
+}
+
+function mergeSortedEvents(existing: AuraEvent[], incoming: AuraEvent[]) {
+  if (!existing.length) return incoming.slice();
+  if (!incoming.length) return existing;
+
+  const merged: AuraEvent[] = [];
+  let i = 0;
+  let j = 0;
+
+  while (i < existing.length && j < incoming.length) {
+    if (sortEvents(existing[i], incoming[j]) <= 0) {
+      merged.push(existing[i]);
+      i += 1;
+    } else {
+      merged.push(incoming[j]);
+      j += 1;
+    }
+  }
+  if (i < existing.length) merged.push(...existing.slice(i));
+  if (j < incoming.length) merged.push(...incoming.slice(j));
+  return merged;
+}
+
+export const useEventStore = create<State>((set) => ({
   events: [],
   eventIds: new Set(),
   appendMany: (evs) => {
-    const ids = new Set(get().eventIds);
-    const prev = get().events;
-    const merged = [...prev];
+    if (!Array.isArray(evs) || !evs.length) return;
 
-    let appended = 0;
-    let monotonic = true;
-    const last = merged.length ? merged[merged.length - 1] : null;
+    set((state) => {
+      let nextIds: Set<string> | null = null;
+      const incoming: AuraEvent[] = [];
 
-    for (const ev of evs) {
-      if (!ev?.event_id || ids.has(ev.event_id)) continue;
-      ids.add(ev.event_id);
-      merged.push(ev);
-      appended += 1;
-
-      if (monotonic && last) {
-        // Fast-path: if batch appears to be non-decreasing by our sort key, we can skip resort.
-        if (sortEvents(last, ev) > 0) monotonic = false;
+      for (const ev of evs) {
+        if (!ev?.event_id) continue;
+        const ids = nextIds ?? state.eventIds;
+        if (ids.has(ev.event_id)) continue;
+        if (!nextIds) nextIds = new Set(state.eventIds);
+        nextIds.add(ev.event_id);
+        incoming.push(ev);
       }
-    }
 
-    if (!appended) return;
+      if (!incoming.length || !nextIds) return state;
 
-    if (!last || !monotonic) merged.sort(sortEvents);
-    set({ events: merged, eventIds: ids });
+      const prev = state.events;
+      const last = prev.length ? prev[prev.length - 1] : null;
+
+      if (isNonDecreasing(incoming, last)) {
+        return { events: prev.concat(incoming), eventIds: nextIds };
+      }
+
+      const sortedIncoming = incoming.length > 1 ? [...incoming].sort(sortEvents) : incoming;
+      return { events: mergeSortedEvents(prev, sortedIncoming), eventIds: nextIds };
+    });
   },
   appendOne: (ev) => {
-    const ids = new Set(get().eventIds);
-    if (!ev?.event_id || ids.has(ev.event_id)) return;
-    ids.add(ev.event_id);
+    if (!ev?.event_id) return;
 
-    const prev = get().events;
-    const last = prev.length ? prev[prev.length - 1] : null;
-    const merged = [...prev, ev];
+    set((state) => {
+      if (state.eventIds.has(ev.event_id)) return state;
 
-    // Fast-path for strictly appending in-order.
-    if (last && sortEvents(last, ev) > 0) merged.sort(sortEvents);
-    set({ events: merged, eventIds: ids });
+      const nextIds = new Set(state.eventIds);
+      nextIds.add(ev.event_id);
+
+      const prev = state.events;
+      const last = prev.length ? prev[prev.length - 1] : null;
+
+      if (!last || sortEvents(last, ev) <= 0) {
+        return { events: prev.concat(ev), eventIds: nextIds };
+      }
+
+      const insertAt = binaryInsertIndex(prev, ev);
+      const nextEvents = [...prev.slice(0, insertAt), ev, ...prev.slice(insertAt)];
+      return { events: nextEvents, eventIds: nextIds };
+    });
   },
   clear: () => set({ events: [], eventIds: new Set() }),
 }));

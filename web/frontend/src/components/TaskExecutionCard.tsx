@@ -1,16 +1,7 @@
 import React from "react";
 import { CheckCircle, Loader2, Terminal, XCircle } from "lucide-react";
 import { Badge } from "./Badge";
-
-export type ToolLog = {
-  id: string;
-  tool: string;
-  summary: string;
-  status: "running" | "succeeded" | "failed" | "blocked" | "needs_approval" | "cancelled" | "unknown";
-  durationMs?: number;
-  preset?: string;
-  subagentRunId?: string;
-};
+import type { ToolLog } from "../types";
 
 export function TaskExecutionCard(props: {
   title: string;

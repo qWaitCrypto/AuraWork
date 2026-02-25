@@ -810,7 +810,14 @@ def build_app(*, project_root: Path) -> FastAPI:
                                 raw = await ws.receive_text()
                                 # Allow a lightweight keepalive.
                                 if raw == "ping":
-                                    await ws.send_text("pong")
+                                    await send({"type": "pong"})
+                                    continue
+                                try:
+                                    msg = json.loads(raw)
+                                except Exception:
+                                    msg = None
+                                if isinstance(msg, dict) and str(msg.get("type") or "") == "ping":
+                                    await send({"type": "pong"})
                                     continue
                                 await upstream_ws.send(raw)
 

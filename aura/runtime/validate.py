@@ -172,6 +172,22 @@ def _validate_events(events: list[Event], *, strict: bool) -> list[ValidationIss
                 if not isinstance(ev.payload.get("error_code"), str) or not ev.payload.get("error_code"):
                     issues.append(ValidationIssue("error", "Missing payload.error_code for tool_call_end failure.", f"event[{idx}]"))
 
+        if ev.kind == EventKind.LLM_RESPONSE_COMPLETED.value:
+            final_text = ev.payload.get("final_text")
+            tool_calls = ev.payload.get("tool_calls")
+            stop_reason = ev.payload.get("stop_reason")
+            if isinstance(final_text, str) and not final_text.strip():
+                has_tool_calls = isinstance(tool_calls, list) and len(tool_calls) > 0
+                if not has_tool_calls and stop_reason != "empty_response":
+                    sev = "error" if strict else "warning"
+                    issues.append(
+                        ValidationIssue(
+                            sev,
+                            "Empty final_text without tool_calls should set stop_reason='empty_response'.",
+                            f"event[{idx}]",
+                        )
+                    )
+
     if len(session_ids) > 1:
         issues.append(ValidationIssue("error", f"Multiple session_id values in log: {sorted(session_ids)}", "events"))
     return issues

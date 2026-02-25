@@ -108,6 +108,7 @@ def build_agno_toolset(
                 meta = getattr(run_context, "metadata", None) or {}
                 subagent_run_id = meta.get("aura_subagent_run_id")
                 subagent_preset = meta.get("aura_subagent_preset")
+                browser_agent_session = meta.get("aura_browser_agent_session")
 
                 def _with_subagent_meta(payload: dict[str, Any]) -> dict[str, Any]:
                     out = dict(payload)
@@ -115,6 +116,8 @@ def build_agno_toolset(
                         out.setdefault("subagent_run_id", subagent_run_id)
                     if isinstance(subagent_preset, str) and subagent_preset:
                         out.setdefault("preset", subagent_preset)
+                    if isinstance(browser_agent_session, str) and browser_agent_session:
+                        out.setdefault("browser_agent_session", browser_agent_session)
                     return out
 
                 tool_call_id = getattr(fc, "call_id", None)

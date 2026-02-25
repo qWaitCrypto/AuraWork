@@ -283,6 +283,8 @@ _DEFAULT_EXPOSED_TOOL_NAMES: set[str] = {
     "dag__execute_next",
 }
 
+_EMPTY_FINAL_RESPONSE_FALLBACK_TEXT = "Model returned an empty final response. Please retry."
+
 
 @dataclass(slots=True)
 class AgnoAsyncEngine:
@@ -1448,10 +1450,14 @@ class AgnoAsyncEngine:
                     extra_payload={"stream": use_stream, "run_mode": "llm_tools"},
                 )
 
+                history_text = normalized_resp.text if isinstance(normalized_resp.text, str) else ""
+                if not history_text.strip() and not planned_calls:
+                    history_text = _EMPTY_FINAL_RESPONSE_FALLBACK_TEXT
+
                 self._history.append(
                     CanonicalMessage(
                         role=CanonicalMessageRole.ASSISTANT,
-                        content=normalized_resp.text,
+                        content=history_text,
                         tool_calls=tool_calls or None,
                         reasoning_content=(normalized_resp.thinking if tool_calls else None),
                     )
@@ -2904,7 +2910,13 @@ class AgnoAsyncEngine:
                 context_limit_tokens=int(merged_stats["context_limit_tokens"]),
             )
 
-        assistant_text = final_response.text
+        assistant_text_raw = final_response.text if isinstance(final_response.text, str) else ""
+        assistant_text = assistant_text_raw
+        empty_response_fallback = False
+        if not assistant_text.strip() and not planned_calls:
+            assistant_text = _EMPTY_FINAL_RESPONSE_FALLBACK_TEXT
+            empty_response_fallback = True
+
         thinking_text = final_response.thinking
         thinking_ref = None
         output_ref = self.artifact_store.put(
@@ -2946,8 +2958,13 @@ class AgnoAsyncEngine:
             "tool_calls": tool_calls_payload,
             "usage": usage,
             "context_stats": merged_stats,
-            "stop_reason": final_response.stop_reason,
+            "stop_reason": final_response.stop_reason or ("empty_response" if empty_response_fallback else None),
         }
+        if empty_response_fallback:
+            payload["response_warning"] = {
+                "code": "empty_response_fallback",
+                "message": "Provider returned empty assistant text without tool calls.",
+            }
         if isinstance(extra_payload, dict):
             payload.update(extra_payload)
 
@@ -2957,6 +2974,8 @@ class AgnoAsyncEngine:
         emit_delta = True
         if isinstance(extra_payload, dict) and extra_payload.get("stream") is True:
             emit_delta = False
+        if empty_response_fallback:
+            emit_delta = True
         if emit_delta and isinstance(assistant_text, str) and assistant_text:
             chunk_size = 2048
             for i in range(0, len(assistant_text), chunk_size):

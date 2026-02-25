@@ -79,11 +79,20 @@ async def _dispatch_single_node(
     status = str(result.get("status") or "unknown")
     status_norm = status.strip().lower()
     report = _parse_report(result)
-    if result.get("needs_approval") or report.get("needs_approval"):
+    report_status_norm = str(report.get("status") or "").strip().lower()
+    if (
+        result.get("needs_approval")
+        or report.get("needs_approval")
+        or report_status_norm in {"needs_approval", "require_approval", "requires_approval", "pending_approval"}
+    ):
         status = "needs_approval"
-    elif status_norm in {"needs_user_takeover", "user_takeover_required", "needs_takeover"}:
+    elif status_norm in {"needs_user_takeover", "user_takeover_required", "needs_takeover"} or report_status_norm in {
+        "needs_user_takeover",
+        "user_takeover_required",
+        "needs_takeover",
+    }:
         status = "needs_user_takeover"
-    elif result.get("error") or status == "failed":
+    elif result.get("error") or status_norm == "failed" or report_status_norm == "failed":
         status = "failed"
 
     return NodeDispatchResult(node_id=node.id, status=status, result=result, error=None)
@@ -134,6 +143,43 @@ def _extract_receipts(result: dict[str, Any] | None) -> list[dict[str, Any]]:
     if isinstance(receipts, list):
         return [r for r in receipts if isinstance(r, dict)]
     return []
+
+
+def _non_empty_str(value: Any) -> str | None:
+    if isinstance(value, str):
+        s = value.strip()
+        if s:
+            return s
+    return None
+
+
+def _extract_failure_message(*, result: dict[str, Any] | None, report: dict[str, Any]) -> str:
+    direct_error = None
+    if isinstance(result, dict):
+        direct_error = _non_empty_str(result.get("error"))
+    if direct_error is None:
+        direct_error = _non_empty_str(report.get("error"))
+    if direct_error is not None:
+        return direct_error
+
+    error_code = None
+    summary = None
+    if isinstance(result, dict):
+        error_code = _non_empty_str(result.get("error_code"))
+        summary = _non_empty_str(result.get("summary") or result.get("message"))
+
+    if error_code is None:
+        error_code = _non_empty_str(report.get("error_code"))
+    if summary is None:
+        summary = _non_empty_str(report.get("summary") or report.get("message"))
+
+    if error_code and summary:
+        return f"{error_code}: {summary}"
+    if summary:
+        return summary
+    if error_code:
+        return error_code
+    return "Unknown failure"
 
 
 def _extract_takeover_request(*, result: dict[str, Any] | None, report: dict[str, Any]) -> dict[str, Any]:
@@ -246,11 +292,7 @@ class NodeCompletionHandler:
             )
 
         if dispatch_result.status == "failed":
-            error_msg = None
-            if result is not None:
-                error_msg = result.get("error")
-            if not error_msg:
-                error_msg = report.get("error", "Unknown failure")
+            error_msg = _extract_failure_message(result=result, report=report)
             return NodeCompletionAction(
                 action="mark_failed",
                 node_id=node_id,

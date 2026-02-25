@@ -1,12 +1,6 @@
 import React, { useMemo } from "react";
 import { Check, ChevronDown, Circle, Loader2, X } from "lucide-react";
-
-type PlanStep = {
-  id: string;
-  step?: string;
-  status?: "pending" | "in_progress" | "completed" | "failed";
-  depends_on?: string[];
-};
+import type { PlanEnvelope, PlanStep } from "../lib/types";
 
 const STATUS_CONFIG = {
   pending: {
@@ -51,12 +45,17 @@ function clampId(id: string, max = 10) {
   return `${s.slice(0, max)}…`;
 }
 
-export default function DagPanel({ latestPlan }: { latestPlan: any }) {
-  const steps = useMemo<PlanStep[]>(() => {
-    const raw = (latestPlan as any)?.plan;
-    if (!Array.isArray(raw)) return [];
-    return raw.filter((x) => x && typeof x.id === "string") as PlanStep[];
-  }, [latestPlan]);
+function normalizePlanSteps(raw: unknown): PlanStep[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((item) => {
+    if (!item || typeof item !== "object") return false;
+    const rec = item as Record<string, unknown>;
+    return typeof rec.id === "string" || typeof rec.step === "string";
+  }) as PlanStep[];
+}
+
+export default function DagPanel({ latestPlan }: { latestPlan: PlanEnvelope | null }) {
+  const steps = useMemo<PlanStep[]>(() => normalizePlanSteps(latestPlan?.plan), [latestPlan]);
 
   if (!steps.length) {
     return (
@@ -74,12 +73,12 @@ export default function DagPanel({ latestPlan }: { latestPlan: any }) {
         const status = (step.status || "pending") as keyof typeof STATUS_CONFIG;
         const cfg = STATUS_CONFIG[status] ?? STATUS_CONFIG.pending;
         const Icon = cfg.icon;
-        const label = String(step.step || step.id);
+        const label = String(step.step || step.id || "");
         const deps = Array.isArray(step.depends_on) ? step.depends_on : [];
         const isLast = idx === steps.length - 1;
 
         return (
-          <div key={step.id} className="relative">
+          <div key={String(step.id || idx)} className="relative">
             {idx > 0 ? <div className="absolute left-4 -top-3 h-3 w-0.5 bg-surface-200" /> : null}
 
             <div
@@ -114,13 +113,13 @@ export default function DagPanel({ latestPlan }: { latestPlan: any }) {
 
                   {deps.length ? (
                     <div className="mt-1 flex flex-wrap gap-1">
-                      {deps.slice(0, 3).map((d) => (
+                      {deps.slice(0, 3).map((dep) => (
                         <span
-                          key={d}
-                          title={d}
+                          key={dep}
+                          title={dep}
                           className="inline-flex items-center rounded-md bg-surface-100 px-1.5 py-0.5 text-[10px] text-ink-500"
                         >
-                          ← {clampId(d, 12)}
+                          ← {clampId(dep, 12)}
                         </span>
                       ))}
                       {deps.length > 3 ? <span className="text-[10px] text-ink-400">+{deps.length - 3}</span> : null}
@@ -145,4 +144,3 @@ export default function DagPanel({ latestPlan }: { latestPlan: any }) {
     </div>
   );
 }
-

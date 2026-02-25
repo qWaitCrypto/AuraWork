@@ -59,6 +59,41 @@
     /* Scrollbar tokens */
     --scrollbar-thumb: 212 212 216;
     --scrollbar-thumb-hover: 161 161 170;
+    color-scheme: light;
+  }
+
+  :root[data-theme="dark"] {
+    --surface-0: 24 24 27;
+    --surface-50: 39 39 42;
+    --surface-100: 63 63 70;
+    --surface-200: 82 82 91;
+
+    --ink-900: 244 244 245;
+    --ink-700: 228 228 231;
+    --ink-500: 212 212 216;
+    --ink-400: 161 161 170;
+
+    --accent-50: 15 23 42;
+    --accent-100: 30 58 138;
+    --accent-200: 37 99 235;
+    --accent-300: 59 130 246;
+    --accent-400: 96 165 250;
+    --accent-500: 96 165 250;
+    --accent-600: 59 130 246;
+    --accent-700: 37 99 235;
+
+    --scrollbar-thumb: 82 82 91;
+    --scrollbar-thumb-hover: 113 113 122;
+
+    --shadow-xs: 0 1px 2px rgba(0,0,0,0.28);
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.32), 0 1px 2px rgba(0,0,0,0.24);
+    --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.36), 0 2px 4px -1px rgba(0,0,0,0.24);
+    --shadow-lg: 0 10px 15px -3px rgba(0,0,0,0.42), 0 4px 6px -2px rgba(0,0,0,0.25);
+    --shadow-xl: 0 20px 25px -5px rgba(0,0,0,0.45), 0 10px 10px -5px rgba(0,0,0,0.28);
+    --shadow-glow-accent: 0 0 20px rgba(96, 165, 250, 0.2);
+    --shadow-glow-cta: 0 0 20px rgba(249, 115, 22, 0.24);
+
+    color-scheme: dark;
   }
 
   html,

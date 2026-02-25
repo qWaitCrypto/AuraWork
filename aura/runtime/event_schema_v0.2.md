@@ -36,6 +36,7 @@ Canonical payload fields:
 - `final_text` is the assistant's final user-facing output.
 - `thinking_ref` is optional and must remain semantically separate from `final_text`.
 - UI consumers should never infer final answer text from `thinking_ref`.
+- If a provider returns empty text with no tool calls, runtime emits a fallback assistant message and sets `stop_reason` to `"empty_response"`.
 
 ## `tool_call_end`
 

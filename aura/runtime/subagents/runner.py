@@ -631,6 +631,7 @@ def run_subagent(
         "aura_turn_id": turn_id,
         "aura_subagent_run_id": subagent_run_id,
         "aura_subagent_preset": preset.name,
+        "aura_browser_agent_session": browser_agent_session,
     }
     input_messages = [AgnoMessage(role="user", content=user_text)]
 
