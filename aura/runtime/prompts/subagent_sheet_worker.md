@@ -18,7 +18,7 @@ Notes:
 2. **Formula-first**: Always prefer writing Excel formulas/references. Do not hard-code computed results as fixed values (unless explicitly required).
 3. **Do not casually break templates**: If the input is a template, prefer the closed-loop editing workflow of `aura-xlsx` to avoid losing charts/pivots/controls.
 4. **Snapshot before write**: Before any write via `project__apply_edits`, create a `snapshot__create` first.
-5. **Approval awareness**: If a needed tool requires user approval, STOP and return `status="needs_approval"` with a clear explanation.
+5. **Approval middleware handles it**: Do NOT pre-stop before `shell__run`. Call it directly — the runner's approval middleware intercepts it automatically. For `aura-xlsx` runner scripts, they are pre-authorized and will run without interruption. If the middleware decides approval is required, it handles escalation itself.
 
 ## Key workflow: XLSX (follow exactly)
 1) Call `skill__load` to load `aura-xlsx` (SheetWorker is only allowed to use `aura-xlsx`). Use the returned `skill.skill_root` as a **project-relative path** (e.g., `.aura/skills/aura-xlsx`).
@@ -26,6 +26,7 @@ Notes:
    - If you need to rewrite/update the same plan file: use `project__apply_edits(overwrite=true)`; do not switch to a different path.
 3) Execute via `shell__run`:
    - `python "<skill_root>/scripts/run.py" input.xlsx "{{PLAN_JSON_PATH}}" --out "<OUTPUT_PATH>" --artifacts-dir "{{RUN_ARTIFACTS_DIR}}"`
+   - **REQUIRED**: always include `"cwd": "."` in the `shell__run` arguments. Omitting `cwd` causes an immediate scope-violation denial. The `"."` runs the script from the project root, where the skill paths resolve correctly.
    - Notes:
      - `<OUTPUT_PATH>`: prefer the `path` in `WorkSpec.expected_outputs` (project-relative); do not additionally `cp/mv` artifacts around.
      - To overwrite an existing output: add `--overwrite`.
@@ -47,14 +48,14 @@ Notes:
 5. **Run + verify**
    - Use `shell__run` to execute the `aura-xlsx` runner.
    - If needed, run `snapshot__diff` and summarize the changes.
-7. **Return JSON**
+6. **Return JSON**
    - Output MUST be valid JSON only (no prose).
 
 ---
 
 ## Output format (MUST be valid JSON; no surrounding prose)
 {
-  "status": "completed|needs_approval|failed",
+  "status": "completed|failed",
   "sheet_info": {
     "path": "<OUTPUT_PATH>",
     "format": "xlsx",
@@ -73,6 +74,7 @@ Notes:
 ---
 
 ## Anti-patterns
-- Don’t delete rows that fail parsing/validation—mark them invalid and keep them.
-- Don’t assume column types—validate explicitly and record errors.
-- Don’t merge columns or change semantics without a clearly stated rule.
+- Don't hardcode computed results as fixed values — always write Excel formulas so the workbook stays dynamic (formula-first principle).
+- Don't skip Gate B when the plan involves formulas — `ok:null` (skipped) means correctness is unverified; report it rather than claiming success.
+- Don't overwrite an existing xlsx template without reading its structure first (via `analyze.py`) — you may silently drop charts, pivots, or named ranges.
+- Don't invent a `skill_root` path — always use the value returned by `skill__load`; never hardcode or guess it.

@@ -2,20 +2,33 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from aura.runtime.approval import ApprovalStatus
-from aura.runtime.engine import Engine, EngineBuildError, build_engine_for_session
-from aura.runtime.event_bus import EventBus
-from aura.runtime.ids import new_id, now_ts_ms
-from aura.runtime.llm.config import ModelConfig
-from aura.runtime.llm.config_io import load_model_config_layers_for_dir
-from aura.runtime.llm.types import ModelRole
-from aura.runtime.project import RuntimePaths
-from aura.runtime.stores import FileApprovalStore, FileArtifactStore, FileEventLogStore, FileSessionStore
-from aura.runtime.tools.runtime import ToolApprovalMode
+from aura.runtime.api import (
+    ApprovalStatus,
+    Engine,
+    EngineBuildError,
+    EventBus,
+    FileApprovalStore,
+    FileArtifactStore,
+    FileEventLogStore,
+    FileSessionStore,
+    ModelConfig,
+    ModelRole,
+    RuntimePaths,
+    ToolApprovalMode,
+    build_engine_for_session,
+    load_model_config_layers_for_dir,
+    new_id,
+    now_ts_ms,
+    update_session_settings,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,11 +179,11 @@ class WebRuntime:
         try:
             (self.paths.sessions_dir / f"{sid}.json").unlink(missing_ok=True)
         except Exception:
-            pass
+            logger.warning("Failed to delete session metadata for session_id=%s", sid, exc_info=True)
         try:
             (self.paths.events_dir / f"{sid}.jsonl").unlink(missing_ok=True)
         except Exception:
-            pass
+            logger.warning("Failed to delete session event log for session_id=%s", sid, exc_info=True)
 
         # Remove pending approvals for this session (best-effort).
         approvals_dir = (self.paths.state_dir / "approvals").resolve()
@@ -179,12 +192,13 @@ class WebRuntime:
                 try:
                     raw = json.loads(p.read_text(encoding="utf-8"))
                 except Exception:
+                    logger.warning("Failed to parse approval record while deleting session: %s", p, exc_info=True)
                     continue
                 if isinstance(raw, dict) and str(raw.get("session_id") or "") == sid:
                     try:
                         p.unlink(missing_ok=True)
                     except Exception:
-                        pass
+                        logger.warning("Failed to delete approval file: %s", p, exc_info=True)
 
         # Remove agent-browser state files (best-effort).
         try:
@@ -194,11 +208,11 @@ class WebRuntime:
             try:
                 port_file.unlink(missing_ok=True)
             except Exception:
-                pass
+                logger.warning("Failed to delete browser stream port file for session_id=%s", sid, exc_info=True)
             # The daemon also writes a per-session `.stream` file under its socket dir, but that's not
             # workspace-local and is handled by the daemon lifecycle.
         except Exception:
-            pass
+            logger.warning("Failed to clean browser state for session_id=%s", sid, exc_info=True)
 
     def update_session_settings(
         self,
@@ -208,28 +222,15 @@ class WebRuntime:
         llm_streaming: bool | None = None,
         tool_approval_mode: str | None = None,
     ) -> None:
-        patch: dict[str, Any] = {}
-
-        if chat_profile_id is not None:
-            pid = str(chat_profile_id).strip()
-            cfg = self.model_config()
-            if pid not in cfg.profiles:
-                raise ValueError(f"Unknown model profile: {pid}")
-            patch["chat_profile_id"] = pid
-
-        if llm_streaming is not None:
-            patch["llm_streaming"] = bool(llm_streaming)
-
-        if tool_approval_mode is not None:
-            raw = str(tool_approval_mode).strip().lower()
-            try:
-                mode = ToolApprovalMode(raw)
-            except ValueError as e:
-                raise ValueError("tool_approval_mode must be one of: strict, standard, trusted") from e
-            patch["tool_approval_mode"] = mode.value
-
+        patch = update_session_settings(
+            session_store=self.session_store,
+            session_id=session_id,
+            model_config=self.model_config(),
+            chat_profile_id=chat_profile_id,
+            llm_streaming=llm_streaming,
+            tool_approval_mode=tool_approval_mode,
+        )
         if patch:
-            self.session_store.update_session(session_id, patch)
             self._engine_cache.pop(session_id, None)
 
     def list_pending_approvals(self, *, session_id: str, request_id: str | None = None) -> list[dict[str, Any]]:
@@ -297,3 +298,15 @@ class WebRuntime:
             eng = self._build_engine(session_id=session_id)
             self._engine_cache[session_id] = eng
         return eng
+
+    async def warm_engine_for_session(self, *, session_id: str) -> None:
+        """Pre-build the engine in the background on session connect."""
+        try:
+            loop = asyncio.get_running_loop()
+            async with self.lock_for_session(session_id):
+                await loop.run_in_executor(
+                    None,
+                    lambda: self.engine_for_session(session_id=session_id),
+                )
+        except Exception:
+            logger.debug("Engine pre-warm failed for session %s", session_id, exc_info=True)

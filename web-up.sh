@@ -15,8 +15,15 @@ BACKEND_PORT="${AURA_WEB_PORT:-8000}"
 FRONTEND_PORT="${AURA_WEB_FRONTEND_PORT:-5173}"
 
 REPLAY_CAP="${AURA_WEB_WS_REPLAY_CAP:-1000}"
+AUTH_REQUIRED="${AURA_WEB_REQUIRE_AUTH:-0}"
 
 have() { command -v "$1" >/dev/null 2>&1; }
+is_truthy() {
+  case "${1,,}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 if ! have node; then
   echo "ERROR: node is required" >&2
@@ -44,6 +51,7 @@ echo "==> Starting backend (FastAPI)"
 (
   cd "$BACKEND_DIR"
   export AURA_WEB_WS_REPLAY_CAP="$REPLAY_CAP"
+  export AURA_WEB_REQUIRE_AUTH="$AUTH_REQUIRED"
   # Ensure backend deps exist for python import.
   python -c "import fastapi, uvicorn" >/dev/null 2>&1 || {
     echo "ERROR: backend deps missing. Install: pip install -r $BACKEND_DIR/requirements.txt" >&2
@@ -85,6 +93,29 @@ sleep 0.8
 echo "==> Starting frontend (Vite)"
 (
   cd "$FRONTEND_DIR"
+  if is_truthy "$AUTH_REQUIRED"; then
+    TOKEN_FILE="${AURA_WEB_SERVER_TOKEN_PATH:-$HOME/.aura/web/server_token}"
+    for _ in {1..40}; do
+      if [[ -f "$TOKEN_FILE" ]]; then
+        break
+      fi
+      sleep 0.05
+    done
+    if [[ ! -f "$TOKEN_FILE" ]]; then
+      echo "ERROR: backend auth token file not found: $TOKEN_FILE" >&2
+      exit 1
+    fi
+    VITE_AURA_WEB_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
+    if [[ -z "$VITE_AURA_WEB_TOKEN" ]]; then
+      echo "ERROR: backend auth token file is empty: $TOKEN_FILE" >&2
+      exit 1
+    fi
+    export VITE_AURA_WEB_TOKEN
+  else
+    unset VITE_AURA_WEB_TOKEN || true
+    echo "==> Backend auth disabled; frontend will connect without token"
+  fi
+
   NPM_MODE="${AURA_WEB_NPM_MODE:-auto}" # auto|ci|install|skip
   case "$NPM_MODE" in
     auto)
@@ -127,6 +158,7 @@ Backend:   http://${BACKEND_HOST}:${BACKEND_PORT}
 Notes:
 - If you only want frontend, run: (cd web/frontend && npm run dev)
 - Replay cap is set via AURA_WEB_WS_REPLAY_CAP=${REPLAY_CAP}
+- Auth required: ${AUTH_REQUIRED}
 
 Press Ctrl+C to stop.
 EOF

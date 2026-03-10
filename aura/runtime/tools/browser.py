@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import shutil
 import signal
@@ -10,14 +11,39 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
-from ..stores import ArtifactStore
 from ..agent_browser import (
     agent_browser_session_for_aura_session,
     agent_browser_session_for_subagent_run,
     ensure_agent_browser_stream_port_for_session,
 )
+from ..stores import ArtifactStore
 from .browser_steps import parse_browser_steps
 from .runtime import ToolExecutionContext
+
+
+logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except Exception:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except Exception:
+        return default
+    return max(minimum, min(maximum, value))
 
 
 def _maybe_int(args: dict[str, Any], key: str) -> int | None:
@@ -103,7 +129,7 @@ def _extract_screenshot_path(stdout_text: str) -> str | None:
             if isinstance(p, str) and p.strip():
                 return p.strip()
     except Exception:
-        pass
+        logger.warning("Failed to parse browser screenshot output as JSON.", exc_info=True)
 
     # Fallback: scan lines for a path-like substring ending in an image extension.
     # Handles common agent-browser output like: "Screenshot saved to /run/user/.../x.png"
@@ -116,6 +142,63 @@ def _extract_screenshot_path(stdout_text: str) -> str | None:
         if m:
             return m.group("path").strip()
     return None
+
+
+def _is_open_step(step_argv: list[str]) -> bool:
+    if not step_argv:
+        return False
+    return str(step_argv[0]).strip().lower() == "open"
+
+
+def _effective_step_timeout_s(*, step_argv: list[str], timeout_s: float, timeout_explicit: bool) -> float:
+    if timeout_explicit:
+        return timeout_s
+    if _is_open_step(step_argv):
+        open_timeout_s = _env_float("AURA_BROWSER_OPEN_TIMEOUT_S", 45.0, minimum=1.0, maximum=600.0)
+        return max(timeout_s, open_timeout_s)
+    return timeout_s
+
+
+def _is_retryable_open_stderr(stderr_text: str) -> bool:
+    text = str(stderr_text or "").lower()
+    if not text.strip():
+        return False
+    markers = (
+        "timed out",
+        "timeout",
+        "temporary failure in name resolution",
+        "connection reset",
+        "connection closed",
+        "econnreset",
+        "econnrefused",
+        "enetunreach",
+        "net::err_",
+        "err_connection_",
+        "err_name_not_resolved",
+        "err_network_changed",
+        "err_internet_disconnected",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _should_retry_open_step(
+    *,
+    step_argv: list[str],
+    timed_out: bool,
+    exit_code: int,
+    stderr_text: str,
+    attempt: int,
+    max_attempts: int,
+) -> bool:
+    if attempt >= max_attempts:
+        return False
+    if not _is_open_step(step_argv):
+        return False
+    if timed_out:
+        return True
+    if exit_code == 0:
+        return False
+    return _is_retryable_open_stderr(stderr_text)
 
 
 @dataclass(slots=True)
@@ -184,12 +267,13 @@ class BrowserRunTool:
             )
         cwd_rel = str(args.get("cwd") or ".")
         cwd_path = _resolve_in_project(project_root, cwd_rel)
-        timeout_s = _maybe_float(args, "timeout_s")
-        if timeout_s is None:
-            timeout_s = 30.0
+        timeout_arg = _maybe_float(args, "timeout_s")
+        timeout_s = timeout_arg if timeout_arg is not None else 30.0
         max_output_chars = _maybe_int(args, "max_output_chars") or 16000
         max_binary_bytes = _maybe_int(args, "max_binary_bytes") or 5_000_000
         continue_on_error = _maybe_bool(args, "continue_on_error") or False
+        open_step_max_attempts = _env_int("AURA_BROWSER_OPEN_MAX_ATTEMPTS", 2, minimum=1, maximum=4)
+        open_step_retry_delay_s = _env_float("AURA_BROWSER_OPEN_RETRY_DELAY_S", 1.0, minimum=0.0, maximum=30.0)
 
         if continue_on_error and context is not None:
             meta = context.metadata if isinstance(getattr(context, "metadata", None), dict) else {}
@@ -232,84 +316,96 @@ class BrowserRunTool:
         results: list[dict[str, Any]] = []
         first_failure_index: int | None = None
         for step_index, step_argv in enumerate(steps):
-            full_argv = [binary, *step_argv]
-            started = time.monotonic()
-            proc = subprocess.Popen(
-                full_argv,
-                cwd=str(cwd_path),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-                start_new_session=True,
+            step_timeout_s = _effective_step_timeout_s(
+                step_argv=step_argv,
+                timeout_s=timeout_s,
+                timeout_explicit=(timeout_arg is not None),
             )
+            step_max_attempts = open_step_max_attempts if _is_open_step(step_argv) else 1
+            step_result: dict[str, Any] | None = None
+            attempt = 1
+            while True:
+                full_argv = [binary, *step_argv]
+                started = time.monotonic()
+                proc = subprocess.Popen(
+                    full_argv,
+                    cwd=str(cwd_path),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    start_new_session=True,
+                )
 
-            timed_out = False
-            try:
-                stdout_b, stderr_b = proc.communicate(timeout=timeout_s)
-            except subprocess.TimeoutExpired:
-                timed_out = True
+                timed_out = False
                 try:
-                    os_pid = getattr(proc, "pid", None)
-                    if isinstance(os_pid, int):
-                        with contextlib.suppress(Exception):
-                            os.killpg(os_pid, signal.SIGKILL)
-                except Exception:
-                    pass
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                stdout_b, stderr_b = proc.communicate()
-
-            duration_ms = int((time.monotonic() - started) * 1000)
-            exit_code = proc.returncode if proc.returncode is not None else -1
-
-            stdout_truncated = False
-            stderr_truncated = False
-            stdout_text: str | None = None
-            stdout_ref: dict[str, Any] | None = None
-
-            stdout_text = (stdout_b or b"").decode("utf-8", errors="replace")
-            if len(stdout_text) > max_output_chars:
-                stdout_truncated = True
-                stdout_text = stdout_text[:max_output_chars] + "…"
-
-            # agent-browser v0.8+ screenshots are written to a file and stdout reports the path.
-            # Best effort: if this step is `screenshot` without explicit path, capture the image bytes as an artifact.
-            if _screenshot_path_arg(step_argv) is None and (step_argv and step_argv[0] == "screenshot"):
-                shot_path = _extract_screenshot_path(stdout_text)
-                if shot_path:
+                    stdout_b, stderr_b = proc.communicate(timeout=step_timeout_s)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
                     try:
-                        p = Path(shot_path).expanduser()
-                        if p.is_file():
-                            payload = p.read_bytes()
-                            truncated_bytes = False
-                            if len(payload) > max_binary_bytes:
-                                payload = payload[:max_binary_bytes]
-                                truncated_bytes = True
-                            ref = self.artifact_store.put(
-                                payload,
-                                kind="browser_screenshot",
-                                meta={
-                                    "summary": "Browser screenshot",
-                                    "source": "agent-browser",
-                                    "path": str(p),
-                                    "truncated": truncated_bytes,
-                                },
-                            )
-                            stdout_ref = ref.to_dict()
-                            stdout_truncated = stdout_truncated or truncated_bytes
+                        os_pid = getattr(proc, "pid", None)
+                        if isinstance(os_pid, int):
+                            with contextlib.suppress(Exception):
+                                os.killpg(os_pid, signal.SIGKILL)
                     except Exception:
-                        pass
+                        logger.warning("Failed to kill process group for timed out browser step %s.", step_index, exc_info=True)
+                    try:
+                        proc.kill()
+                    except Exception:
+                        logger.warning("Failed to kill timed out browser process for step %s.", step_index, exc_info=True)
+                    stdout_b, stderr_b = proc.communicate()
 
-            stderr_text = (stderr_b or b"").decode("utf-8", errors="replace")
-            if len(stderr_text) > max_output_chars:
-                stderr_truncated = True
-                stderr_text = stderr_text[:max_output_chars] + "…"
+                duration_ms = int((time.monotonic() - started) * 1000)
+                exit_code = proc.returncode if proc.returncode is not None else -1
 
-            results.append(
-                {
+                stdout_truncated = False
+                stderr_truncated = False
+                stdout_text: str | None = None
+                stdout_ref: dict[str, Any] | None = None
+
+                stdout_text = (stdout_b or b"").decode("utf-8", errors="replace")
+                if len(stdout_text) > max_output_chars:
+                    stdout_truncated = True
+                    stdout_text = stdout_text[:max_output_chars] + "…"
+
+                # agent-browser v0.8+ screenshots are written to a file and stdout reports the path.
+                # Best effort: if this step is `screenshot` without explicit path, capture the image bytes as an artifact.
+                if _screenshot_path_arg(step_argv) is None and (step_argv and step_argv[0] == "screenshot"):
+                    shot_path = _extract_screenshot_path(stdout_text)
+                    if shot_path:
+                        try:
+                            p = Path(shot_path).expanduser()
+                            if p.is_file():
+                                payload = p.read_bytes()
+                                truncated_bytes = False
+                                if len(payload) > max_binary_bytes:
+                                    payload = payload[:max_binary_bytes]
+                                    truncated_bytes = True
+                                ref = self.artifact_store.put(
+                                    payload,
+                                    kind="browser_screenshot",
+                                    meta={
+                                        "summary": "Browser screenshot",
+                                        "source": "agent-browser",
+                                        "path": str(p),
+                                        "truncated": truncated_bytes,
+                                    },
+                                )
+                                stdout_ref = ref.to_dict()
+                                stdout_truncated = stdout_truncated or truncated_bytes
+                        except Exception:
+                            logger.warning(
+                                "Failed to capture browser screenshot artifact from path: %s",
+                                shot_path,
+                                exc_info=True,
+                            )
+
+                stderr_text = (stderr_b or b"").decode("utf-8", errors="replace")
+                if len(stderr_text) > max_output_chars:
+                    stderr_truncated = True
+                    stderr_text = stderr_text[:max_output_chars] + "…"
+
+                step_result = {
                     "step_index": step_index,
                     "argv": full_argv,
                     "exit_code": exit_code,
@@ -320,9 +416,31 @@ class BrowserRunTool:
                     "stderr": stderr_text,
                     "truncated": {"stdout": stdout_truncated, "stderr": stderr_truncated},
                 }
-            )
 
-            if (timed_out or exit_code != 0) and first_failure_index is None:
+                if not _should_retry_open_step(
+                    step_argv=step_argv,
+                    timed_out=timed_out,
+                    exit_code=exit_code,
+                    stderr_text=stderr_text,
+                    attempt=attempt,
+                    max_attempts=step_max_attempts,
+                ):
+                    break
+
+                logger.warning(
+                    "Retrying browser open step after transient failure (%s/%s): %s",
+                    attempt,
+                    step_max_attempts,
+                    " ".join(full_argv),
+                )
+                attempt += 1
+                if open_step_retry_delay_s > 0:
+                    time.sleep(open_step_retry_delay_s)
+
+            if step_result is None:
+                continue
+            results.append(step_result)
+            if (step_result.get("timed_out") is True or int(step_result.get("exit_code") or 0) != 0) and first_failure_index is None:
                 first_failure_index = step_index
                 if not continue_on_error:
                     break

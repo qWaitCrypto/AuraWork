@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -8,6 +9,9 @@ from typing import Any, Iterable
 from .approval import ApprovalRecord, ApprovalStatus
 from .protocol import ArtifactRef, Event, EventKind, TOOL_END_STATUSES_ALL
 from .stores import FileApprovalStore
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,7 +320,7 @@ def _iter_artifact_refs(value: Any) -> Iterable[ArtifactRef]:
             try:
                 yield ArtifactRef.from_dict(value)
             except Exception:
-                pass
+                logger.warning("Failed to parse artifact reference while validating session data.", exc_info=True)
         for v in value.values():
             yield from _iter_artifact_refs(v)
         return

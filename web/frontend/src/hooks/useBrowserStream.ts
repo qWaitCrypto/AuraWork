@@ -7,6 +7,7 @@ const BROWSER_WS_PONG_TIMEOUT_MS = 10000;
 const BROWSER_WS_RECONNECT_BASE_MS = 700;
 const BROWSER_WS_RECONNECT_MAX_MS = 8000;
 const BROWSER_WS_RECONNECT_JITTER_MS = 400;
+const BROWSER_WS_STABLE_OPEN_MS = 1500;
 
 export interface BrowserStreamState {
   wsOpen: boolean;
@@ -174,6 +175,10 @@ export function useBrowserStream(opts: {
     let heartbeatTimer: number | null = null;
     let pongTimeoutTimer: number | null = null;
     let lastPongAt = Date.now();
+    let openedAt = 0;
+    let sawServerTraffic = false;
+    let stopReconnect = false;
+    const intentionalClose = new WeakSet<WebSocket>();
 
     const clearReconnectTimer = () => {
       if (reconnectTimer != null) {
@@ -190,6 +195,15 @@ export function useBrowserStream(opts: {
       if (pongTimeoutTimer != null) {
         window.clearTimeout(pongTimeoutTimer);
         pongTimeoutTimer = null;
+      }
+    };
+
+    const closeWs = (ws: WebSocket, code?: number, reason?: string) => {
+      intentionalClose.add(ws);
+      try {
+        if (typeof code === "number") ws.close(code, reason);
+        else ws.close();
+      } catch {
       }
     };
 
@@ -219,10 +233,7 @@ export function useBrowserStream(opts: {
         pongTimeoutTimer = window.setTimeout(() => {
           if (!isStillCurrent() || ws.readyState !== WebSocket.OPEN) return;
           if (lastPongAt < sentAt) {
-            try {
-              ws.close(4001, "heartbeat_timeout");
-            } catch {
-            }
+            closeWs(ws, 4001, "heartbeat_timeout");
           }
         }, BROWSER_WS_PONG_TIMEOUT_MS);
       }, BROWSER_WS_HEARTBEAT_MS);
@@ -246,10 +257,7 @@ export function useBrowserStream(opts: {
 
     if (viewMode !== "stage") {
       if (browserWsRef.current) {
-        try {
-          browserWsRef.current.close();
-        } catch {
-        }
+        closeWs(browserWsRef.current);
         browserWsRef.current = null;
       }
       setBrowserControl(false);
@@ -264,10 +272,7 @@ export function useBrowserStream(opts: {
 
     if (!currentSessionId) {
       if (browserWsRef.current) {
-        try {
-          browserWsRef.current.close();
-        } catch {
-        }
+        closeWs(browserWsRef.current);
         browserWsRef.current = null;
       }
       setBrowserStreamState((state) => ({
@@ -283,10 +288,7 @@ export function useBrowserStream(opts: {
       if (!isStillCurrent()) return;
 
       if (browserWsRef.current) {
-        try {
-          browserWsRef.current.close();
-        } catch {
-        }
+        closeWs(browserWsRef.current);
         browserWsRef.current = null;
       }
 
@@ -301,8 +303,10 @@ export function useBrowserStream(opts: {
       const ws = connectBrowserStreamWs(
         currentSessionId,
         (msg: BrowserStreamMsg) => {
+          lastPongAt = Date.now();
+          sawServerTraffic = true;
+
           if (msg.type === "pong") {
-            lastPongAt = Date.now();
             if (pongTimeoutTimer != null) {
               window.clearTimeout(pongTimeoutTimer);
               pongTimeoutTimer = null;
@@ -332,7 +336,11 @@ export function useBrowserStream(opts: {
           }
 
           if (msg.type === "error") {
-            setBrowserStreamState((state) => ({ ...state, lastError: String(msg.message || "browser_stream_error") }));
+            const message = String(msg.message || "browser_stream_error");
+            if (message.includes("browser_stream_disabled")) {
+              stopReconnect = true;
+            }
+            setBrowserStreamState((state) => ({ ...state, lastError: message }));
             return;
           }
         },
@@ -343,14 +351,12 @@ export function useBrowserStream(opts: {
 
       ws.addEventListener("open", () => {
         if (!isStillCurrent()) {
-          try {
-            ws.close();
-          } catch {
-          }
+          closeWs(ws);
           return;
         }
 
-        reconnectAttempts = 0;
+        openedAt = Date.now();
+        sawServerTraffic = false;
         clearReconnectTimer();
         setBrowserStreamState((state) => ({
           ...state,
@@ -361,19 +367,21 @@ export function useBrowserStream(opts: {
         startHeartbeat(ws);
       });
 
-      ws.addEventListener("close", () => {
+      ws.addEventListener("close", (event) => {
         clearHeartbeatTimers();
         if (browserWsRef.current === ws) browserWsRef.current = null;
+        if (intentionalClose.has(ws)) return;
         if (!isStillCurrent()) return;
         setBrowserStreamState((state) => ({ ...state, wsOpen: false }));
+        if (stopReconnect || event.code === 1008) return;
+        if (sawServerTraffic && openedAt > 0 && Date.now() - openedAt >= BROWSER_WS_STABLE_OPEN_MS) {
+          reconnectAttempts = 0;
+        }
         scheduleReconnect(connect);
       });
 
       ws.addEventListener("error", () => {
-        try {
-          ws.close();
-        } catch {
-        }
+        closeWs(ws);
       });
     };
 
@@ -384,10 +392,7 @@ export function useBrowserStream(opts: {
       clearReconnectTimer();
       clearHeartbeatTimers();
       if (browserWsRef.current) {
-        try {
-          browserWsRef.current.close();
-        } catch {
-        }
+        closeWs(browserWsRef.current);
         browserWsRef.current = null;
       }
     };

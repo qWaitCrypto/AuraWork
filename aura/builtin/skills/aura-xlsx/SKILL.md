@@ -1,6 +1,6 @@
 ---
 name: aura-xlsx
-description: Microsoft Excel / XLSX (.xlsx) template-safe filling, editing, and validation for office spreadsheets, including set-cells/ranges, fill named ranges, append rows, and formula error checks. Use when the user mentions Excel/XLSX spreadsheets, template filling, data entry, financial models, or formulas.
+description: Microsoft Excel / XLSX processing via a plan-driven pipeline with Gate A (structure) and Gate B (formula correctness) validation. Use this skill whenever the user mentions Excel, XLSX, spreadsheets, workbooks, financial models, budgets, forecasts, data entry, template filling, named ranges, formulas, charts, pivot tables, or any .xlsx task. Always prefer this skill over ad-hoc openpyxl scripts.
 ---
 
 # Aura XLSX (Tutorial-style)
@@ -213,8 +213,3 @@ If the task is a finance model (budget/forecast/DCF) and the workbook already fo
 - Return the final `.xlsx`.
 - Return `artifacts/.../report.json` (the run folder path is printed by `run.py`).
 - Summarize: operations, touched parts, Gate A/B status, and any risks.
-
-## Output expectations
-- Return the final `.xlsx`.
-- Return `artifacts/xlsx_report.json`.
-- Summarize: operations, touched parts, Gate A/Gate B status, and any risks.

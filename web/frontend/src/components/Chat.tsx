@@ -1,10 +1,11 @@
 import React from "react";
-import { ArrowDown, Bot } from "lucide-react";
+import { AlertCircle, ArrowDown, Bot, Brain, ChevronDown, ChevronRight, ListChecks, ShieldAlert, ShieldCheck, Wrench } from "lucide-react";
 import { Badge } from "./Badge";
 import { Button } from "./Button";
 import { TaskExecutionCard } from "./TaskExecutionCard";
 import type { ChatItem, ToolRun, ToolLog, TimelineCard } from "../types";
 import { useVirtualWindow } from "../hooks/useVirtualWindow";
+import { fmtTime } from "../lib/timeFormat";
 
 const CHAT_ROW_GAP_PX = 24;
 const CHAT_VIRTUALIZE_THRESHOLD = 90;
@@ -155,25 +156,71 @@ function MarkdownText(props: { text: string; className?: string }) {
   );
 }
 
+function RowIcon({ kind, status }: { kind: string; status?: string }) {
+  if (kind === "error" || status === "failed") {
+    return <AlertCircle className="h-3 w-3 flex-shrink-0 text-red-500" />;
+  }
+  if (kind === "approval") {
+    if (status === "needs_approval") {
+      return <ShieldAlert className="h-3 w-3 flex-shrink-0 text-amber-500" />;
+    }
+    return <ShieldCheck className="h-3 w-3 flex-shrink-0 text-green-500" />;
+  }
+  if (kind === "plan") return <ListChecks className="h-3 w-3 flex-shrink-0 text-blue-500" />;
+  if (kind === "llm") return <Brain className="h-3 w-3 flex-shrink-0 text-purple-500" />;
+  return <Wrench className="h-3 w-3 flex-shrink-0 text-ink-400" />;
+}
+
+function TimelineRowDetails({ label, children }: { label: string; children: React.ReactNode }) {
+  const [open, setOpen] = React.useState(false);
+  return (
+    <div className="mt-1">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1 text-[10px] font-medium text-ink-500 hover:text-ink-700"
+      >
+        {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+        {label}
+      </button>
+      {open ? <div className="mt-1">{children}</div> : null}
+    </div>
+  );
+}
+
 export const Chat = React.memo(function Chat(props: {
   chatItems: ChatItem[];
   artifactTexts: Record<string, string>;
   liveAssistant: string;
   liveThinking: string;
   llmRunning: boolean;
+  llmStartedAt?: number;
   hasRunningTool: boolean;
   toolRuns: ToolRun[];
   activeTaskTitle?: string | null;
   onPickSuggestion?: (text: string) => void;
-  fmtTime: (ms: number) => string;
   onOpenRightTab: (tab: "plan" | "terminal") => void;
   onScrollToToolRun: (toolRunId: string) => void;
 }) {
-  const { chatItems, artifactTexts, liveAssistant, liveThinking, llmRunning, hasRunningTool, toolRuns, activeTaskTitle, onPickSuggestion, fmtTime, onOpenRightTab, onScrollToToolRun } = props;
+  const { chatItems, artifactTexts, liveAssistant, liveThinking, llmRunning, llmStartedAt, hasRunningTool, toolRuns, activeTaskTitle, onPickSuggestion, onOpenRightTab, onScrollToToolRun } = props;
 
   const chatStreamRef = React.useRef<HTMLDivElement>(null);
 
   const [collapsedCards, setCollapsedCards] = React.useState<Record<string, boolean>>({});
+
+  // Elapsed-time counter for the typing indicator — ticks every second while the LLM is running.
+  const [elapsedSecs, setElapsedSecs] = React.useState(0);
+  React.useEffect(() => {
+    if (!llmRunning || !llmStartedAt) {
+      setElapsedSecs(0);
+      return;
+    }
+    setElapsedSecs(Math.floor((Date.now() - llmStartedAt) / 1000));
+    const id = setInterval(() => {
+      setElapsedSecs(Math.floor((Date.now() - llmStartedAt) / 1000));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [llmRunning, llmStartedAt]);
 
   const isNearBottomRef = React.useRef(true);
   const [isNearBottom, setIsNearBottom] = React.useState(true);
@@ -311,9 +358,10 @@ export const Chat = React.memo(function Chat(props: {
             const collapsed = isCollapsed(card.id);
             const sum = summarize(card);
             const hasRunningLlm = card.rows.some((r) => r.kind === "llm" && r.status === "running");
+            const hasRunning = card.rows.some((r) => r.status === "running");
             return (
               <div key={card.id} className="mx-auto flex max-w-3xl animate-slide-up">
-                <div className="w-full rounded-xl border border-surface-100 bg-surface-50/50 px-3 py-2">
+                <div className={["w-full rounded-xl border border-surface-100 bg-surface-50/50 px-3 py-2", hasRunning ? "ring-1 ring-accent-400/50 animate-pulse" : ""].join(" ").trim()}>
                   <button
                     className="flex w-full items-center justify-between text-left"
                     onClick={() => toggleCollapsed(card.id)}
@@ -332,7 +380,7 @@ export const Chat = React.memo(function Chat(props: {
                       <div className="min-w-0">
                         <div className="truncate text-xs font-semibold text-ink-900">{sum.text}</div>
                         {hasRunningLlm && (liveThinking || liveAssistant) ? (
-                          <div className="mt-1 max-w-[260px] truncate text-[11px] italic text-ink-400">
+                          <div className="mt-1 max-w-[260px] truncate text-xs text-ink-400">
                             {liveThinking
                               ? `Thinking: ${liveThinking.slice(0, 90)}${liveThinking.length > 90 ? "…" : ""}`
                               : `Response: ${liveAssistant.slice(0, 90)}${liveAssistant.length > 90 ? "…" : ""}`}
@@ -347,41 +395,49 @@ export const Chat = React.memo(function Chat(props: {
                   ) : (
                     <div className="mt-3 space-y-2">
                       {card.rows.map((r) => {
+                        const isError = r.kind === "error" || r.status === "failed";
+                        const isNeedsApproval = r.status === "needs_approval";
                         const tone =
-                          r.kind === "error" || r.status === "failed"
+                          isError
                             ? "red"
-                            : r.status === "blocked" || r.status === "needs_approval"
-                              ? "orange"
+                            : isNeedsApproval || r.status === "blocked"
+                              ? "yellow"
                               : r.status === "running"
                                 ? "orange"
                                 : r.status === "succeeded"
                                   ? "blue"
                                   : "gray";
 
+                        const badgeLabel = isNeedsApproval ? "⚠ approval" : r.status ? r.status : r.kind;
                         const dur = typeof r.durationMs === "number" ? `${r.durationMs}ms` : undefined;
 
+                        const rowBorder = isNeedsApproval ? "border-amber-300" : "border-surface-200";
+                        const rowBg = isNeedsApproval ? "bg-amber-50/40" : "bg-surface-50";
+
                         return (
-                          <div key={r.key} className="rounded-xl border border-surface-200 bg-surface-50 p-3">
+                          <div key={r.key} className={`rounded-xl border ${rowBorder} ${rowBg} p-3`}>
                             <div className="flex items-start justify-between gap-3">
                               <div className="min-w-0 flex-1">
-                                <div className="truncate text-xs font-semibold text-ink-900">{r.title}</div>
+                                <div className="flex items-center gap-1.5">
+                                  <RowIcon kind={r.kind} status={r.status} />
+                                  <div className="truncate text-xs font-semibold text-ink-900">{r.title}</div>
+                                </div>
                                 {r.subtitle ? <div className="mt-0.5 truncate font-mono text-[11px] text-ink-500">{r.subtitle}</div> : null}
                                 {r.details ? (
-                                  <details className="mt-1 rounded-lg border border-surface-200 bg-white/70 px-2 py-1.5">
-                                    <summary className="cursor-pointer text-[10px] font-medium text-ink-500">Details</summary>
-                                    <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap font-mono text-[10px] text-ink-600">{r.details}</pre>
-                                  </details>
+                                  <TimelineRowDetails label="Details">
+                                    <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded-lg border border-surface-200 bg-white/70 px-2 py-1.5 font-mono text-[10px] text-ink-600">{r.details}</pre>
+                                  </TimelineRowDetails>
                                 ) : null}
                                 {r.kind === "llm" && r.status === "running" && (liveThinking || liveAssistant) ? (
                                   <div className="mt-2 space-y-1">
                                     {liveThinking ? (
-                                      <div className="whitespace-pre-wrap text-[11px] italic text-amber-700/80">
+                                      <div className="whitespace-pre-wrap text-xs text-amber-800">
                                         Thinking: {liveThinking.slice(0, 500)}
                                         {liveThinking.length > 500 ? "…" : ""}
                                       </div>
                                     ) : null}
                                     {liveAssistant ? (
-                                      <div className="whitespace-pre-wrap text-[11px] text-ink-600">
+                                      <div className="whitespace-pre-wrap text-xs text-ink-600">
                                         {liveAssistant.slice(0, 400)}
                                         {liveAssistant.length > 400 ? "…" : ""}
                                       </div>
@@ -392,18 +448,17 @@ export const Chat = React.memo(function Chat(props: {
                                   const t = artifactTexts[r.thinkingLocator];
                                   if (!(typeof t === "string" && t.trim())) return null;
                                   return (
-                                    <details className="mt-2 rounded-lg border border-surface-200 bg-white/70 px-2.5 py-2">
-                                      <summary className="cursor-pointer text-[11px] font-medium text-ink-600">Thinking</summary>
-                                      <div className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap font-mono text-[11px] text-ink-600">
+                                    <TimelineRowDetails label="Thinking">
+                                      <div className="max-h-48 overflow-auto whitespace-pre-wrap rounded-lg border border-surface-200 bg-white/70 px-2.5 py-2 font-mono text-[11px] text-ink-600">
                                         {t}
                                       </div>
-                                    </details>
+                                    </TimelineRowDetails>
                                   );
                                 })() : null}
                               </div>
                               <div className="flex flex-shrink-0 items-center gap-2">
                                 {dur ? <span className="font-mono text-[11px] text-ink-500">{dur}</span> : null}
-                                {r.status ? <Badge tone={tone}>{r.status}</Badge> : <Badge tone={tone}>{r.kind}</Badge>}
+                                <Badge tone={tone}>{badgeLabel}</Badge>
                                 {r.onOpenTab ? (
                                   <Button
                                     title={r.onOpenTab === "terminal" ? "Open in Terminal" : "Open Plan"}
@@ -532,6 +587,9 @@ export const Chat = React.memo(function Chat(props: {
             <span className="typing-dot h-2 w-2 rounded-full bg-accent-400" />
             <span className="typing-dot h-2 w-2 rounded-full bg-accent-400" />
             <span className="typing-dot h-2 w-2 rounded-full bg-accent-400" />
+            {elapsedSecs >= 3 ? (
+              <span className="ml-2 text-xs text-ink-400">{elapsedSecs}s</span>
+            ) : null}
           </div>
         </div>
       ) : null}
@@ -549,7 +607,7 @@ export const Chat = React.memo(function Chat(props: {
             </div>
             <div className="rounded-2xl border border-surface-200 bg-surface-100 p-4 shadow-soft">
               {liveThinking ? (
-                <div className="mb-2 whitespace-pre-wrap text-[11px] italic text-amber-700/80">
+                <div className="mb-2 whitespace-pre-wrap text-xs text-amber-800">
                   {liveThinking.slice(0, 600)}
                   {liveThinking.length > 600 ? "…" : ""}
                 </div>

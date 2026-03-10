@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 
 import json
 import threading
@@ -15,6 +16,8 @@ from .types import (
     ToolCall,
     ToolCallDelta,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _responses_to_usage(resp: Any) -> LLMUsage | None:
@@ -103,12 +106,12 @@ def _responses_stream_to_events(
                 try:
                     on_provider_chunk(event)
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _responses_stream_to_events.", exc_info=True)
             if on_chunk is not None:
                 try:
                     on_chunk()
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _responses_stream_to_events.", exc_info=True)
 
             event_type = getattr(event, "type", None)
             if isinstance(event_type, str) and ("reasoning" in event_type or "thinking" in event_type):

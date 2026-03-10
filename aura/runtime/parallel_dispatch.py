@@ -80,10 +80,29 @@ async def _dispatch_single_node(
     status_norm = status.strip().lower()
     report = _parse_report(result)
     report_status_norm = str(report.get("status") or "").strip().lower()
+    # Text phrases an LLM may emit when it wants approval but didn't use the
+    # structured field.  We check the full serialized report so we catch prose
+    # buried in nested fields (e.g. "proposals", "receipts", "error" text).
+    _APPROVAL_TEXT_SIGNALS = (
+        "need confirmation",
+        "need your approval",
+        "need approval",
+        "needs your approval",
+        "awaiting approval",
+        "please approve",
+        "require confirmation",
+        "requires confirmation",
+        "waiting for confirmation",
+        "waiting for approval",
+        "requesting approval",
+    )
+    _report_text = json.dumps(report).lower() if report else ""
+
     if (
         result.get("needs_approval")
         or report.get("needs_approval")
         or report_status_norm in {"needs_approval", "require_approval", "requires_approval", "pending_approval"}
+        or any(sig in _report_text for sig in _APPROVAL_TEXT_SIGNALS)
     ):
         status = "needs_approval"
     elif status_norm in {"needs_user_takeover", "user_takeover_required", "needs_takeover"} or report_status_norm in {
@@ -94,6 +113,17 @@ async def _dispatch_single_node(
         status = "needs_user_takeover"
     elif result.get("error") or status_norm == "failed" or report_status_norm == "failed":
         status = "failed"
+
+    # If the subagent reported "completed" but executed zero tool calls, demote to
+    # "failed".  Any worker that meaningfully produces a deliverable (doc, sheet,
+    # research) must call at least one tool.  Zero receipts means the LLM either
+    # hallucinated success or bailed out without doing real work.  This catches
+    # both the "error signals in report" case and the silent false-completion case
+    # (LLM emits {"status":"completed","receipts":[]} with no error text).
+    if status not in {"failed", "needs_approval", "needs_user_takeover"}:
+        all_receipts = _extract_receipts(result)
+        if len(all_receipts) == 0:
+            status = "failed"
 
     return NodeDispatchResult(node_id=node.id, status=status, result=result, error=None)
 

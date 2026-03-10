@@ -5,6 +5,7 @@ Apply an XLSX plan.json (aura_plan_spec) to an XLSX package.
 Produces a plan-aware apply_report.json with engine and touched_parts for Gate A.
 """
 from __future__ import annotations
+import logging
 
 import argparse
 import json
@@ -18,6 +19,8 @@ import patch_xlsx
 import xlsx_ooxml
 import zipfile
 
+
+logger = logging.getLogger(__name__)
 
 def _list_all_parts(xlsx_path: Path) -> List[str]:
     with zipfile.ZipFile(xlsx_path, "r") as zf:
@@ -73,7 +76,7 @@ def apply_plan(in_xlsx: Path, plan: Dict[str, Any], out_xlsx: Path, mode: str) -
                 if has_external_links:
                     break
     except Exception:
-        pass
+        logger.warning("Suppressed exception in apply_plan.", exc_info=True)
 
     chosen = mode
     if create_mode and mode == "patch":

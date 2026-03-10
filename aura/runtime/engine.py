@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
@@ -11,6 +13,8 @@ from .llm.errors import CancellationToken
 from .protocol import Op
 from .stores import ApprovalStore, ArtifactStore, EventLogStore, SessionStore
 from .tools.runtime import ToolRuntime
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +98,40 @@ class Engine(Protocol):
         timeout_s: float | None = None,
         cancel: CancellationToken | None = None,
     ) -> RunResult:
-        return asyncio.run(self.arun(op, timeout_s=timeout_s, cancel=cancel))
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.arun(op, timeout_s=timeout_s, cancel=cancel))
+
+        result_holder: dict[str, RunResult] = {}
+        error_holder: dict[str, BaseException] = {}
+        done = threading.Event()
+
+        def _runner() -> None:
+            try:
+                result_holder["result"] = asyncio.run(self.arun(op, timeout_s=timeout_s, cancel=cancel))
+            except BaseException as exc:
+                error_holder["error"] = exc
+                logger.warning(
+                    "Engine.run background runner failed for session_id=%s request_id=%s",
+                    op.session_id,
+                    op.request_id,
+                    exc_info=True,
+                )
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=_runner, name="aura-engine-runner", daemon=True)
+        thread.start()
+        done.wait()
+
+        error = error_holder.get("error")
+        if error is not None:
+            raise error
+        result = result_holder.get("result")
+        if result is None:
+            raise RuntimeError("Engine.run failed to produce a result.")
+        return result
 
 
 class EngineBuildError(RuntimeError):
@@ -125,6 +162,7 @@ def build_engine_for_session(
     try:
         from .engine_agno_async import AgnoAsyncEngine
     except Exception as e:
+        logger.warning("Failed to import AgnoAsyncEngine.", exc_info=True)
         raise EngineBuildError(f"Failed to initialize async agno engine: {e}") from e
 
     return AgnoAsyncEngine(

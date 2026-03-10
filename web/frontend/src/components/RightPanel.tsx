@@ -2,164 +2,27 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import type { ApprovalRecord, AuraEvent, PlanEnvelope, PlanStep, SessionMeta } from "../lib/types";
 import { apiFetchWorkspaceFileText, apiListWorkspaceFiles, type WorkspaceFileEntry } from "../lib/api";
 import { httpBase } from "../lib/backendBase";
+import type { TerminalLogItem, ToolRun } from "../types";
+import {
+  cleanText,
+  formatWorkSpecDetails,
+  formatWorkSpecSummary,
+  joinDetails,
+  normalizeApproverDecision,
+  parseWorkSpecView,
+  summarizeApproverTrace,
+} from "../lib/workSpecView";
+import { fmtTime } from "../lib/timeFormat";
 import { Badge } from "./Badge";
 import { Button } from "./Button";
 import { useVirtualWindow } from "../hooks/useVirtualWindow";
 
 export type RightTab = "plan" | "files" | "terminal";
 
-type WorkSpecView = {
-  goal?: string;
-  expectedOutputs: string[];
-  workspaceRoots: string[];
-  domainAllowlist: string[];
-  fileTypeAllowlist: string[];
-};
-
-type ToolRun = {
-  id: string;
-  tool: string;
-  summary: string;
-  startedAt: number;
-  endedAt?: number;
-  durationMs?: number;
-  status: "running" | "succeeded" | "failed" | "blocked" | "needs_approval" | "cancelled" | "unknown";
-  preset?: string;
-  subagentRunId?: string;
-  workSpec?: WorkSpecView;
-};
-
-type TerminalLogKind = "llm" | "tool" | "plan" | "approval" | "error";
-
-type TerminalLogItem = {
-  id: string;
-  ts: number;
-  kind: TerminalLogKind;
-  level: "info" | "error";
-  title: string;
-  subtitle?: string;
-  status?: "running" | "succeeded" | "failed" | "blocked" | "needs_approval" | "cancelled" | "unknown";
-  durationMs?: number;
-  toolRunId?: string;
-  expandable?: boolean;
-  details?: string;
-};
-
 
 const TERMINAL_ROW_GAP_PX = 12;
 const TERMINAL_VIRTUALIZE_THRESHOLD = 120;
 const TERMINAL_OVERSCAN_PX = 860;
-
-
-function cleanText(raw: unknown, maxLen = 220): string | undefined {
-  if (typeof raw !== "string") return undefined;
-  const text = raw.replace(/\s+/g, " ").trim();
-  if (!text) return undefined;
-  if (text.length <= maxLen) return text;
-  return `${text.slice(0, maxLen - 1)}…`;
-}
-
-function cleanStringList(raw: unknown, limit = 4, itemMaxLen = 100): string[] {
-  if (!Array.isArray(raw)) return [];
-  const out: string[] = [];
-  for (const item of raw) {
-    const value = cleanText(item, itemMaxLen);
-    if (!value) continue;
-    out.push(value);
-    if (out.length >= limit) break;
-  }
-  return out;
-}
-
-function parseWorkSpecView(raw: unknown): WorkSpecView | undefined {
-  if (!raw || typeof raw !== "object") return undefined;
-  const ws = raw as Record<string, unknown>;
-  const goal = cleanText(ws.goal, 220);
-
-  const expectedOutputs = Array.isArray(ws.expected_outputs)
-    ? ws.expected_outputs
-      .map((item) => {
-        if (!item || typeof item !== "object") return undefined;
-        const rec = item as Record<string, unknown>;
-        const outputType = cleanText(rec.type, 40);
-        const outputPath = cleanText(rec.path, 120);
-        if (outputType && outputPath) return `${outputType}: ${outputPath}`;
-        return outputPath || outputType || cleanText(rec.format, 60);
-      })
-      .filter((item): item is string => Boolean(item))
-      .slice(0, 6)
-    : [];
-
-  const scopeRaw = ws.resource_scope && typeof ws.resource_scope === "object" ? (ws.resource_scope as Record<string, unknown>) : {};
-  const workspaceRoots = cleanStringList(scopeRaw.workspace_roots, 4, 120);
-  const domainAllowlist = cleanStringList(scopeRaw.domain_allowlist, 4, 100);
-  const fileTypeAllowlist = cleanStringList(scopeRaw.file_type_allowlist, 6, 40);
-
-  if (!goal && !expectedOutputs.length && !workspaceRoots.length && !domainAllowlist.length && !fileTypeAllowlist.length) {
-    return undefined;
-  }
-
-  return {
-    goal,
-    expectedOutputs,
-    workspaceRoots,
-    domainAllowlist,
-    fileTypeAllowlist,
-  };
-}
-
-function formatWorkSpecSummary(ws?: WorkSpecView): string | undefined {
-  if (!ws) return undefined;
-  const parts: string[] = [];
-  if (ws.goal) parts.push(`goal: ${ws.goal}`);
-  if (ws.expectedOutputs.length) parts.push(`outputs: ${ws.expectedOutputs.length}`);
-  if (ws.workspaceRoots.length) parts.push(`roots: ${ws.workspaceRoots.length}`);
-  if (ws.domainAllowlist.length) parts.push(`domains: ${ws.domainAllowlist.length}`);
-  if (ws.fileTypeAllowlist.length) parts.push(`types: ${ws.fileTypeAllowlist.length}`);
-  return parts.length ? parts.join(" · ") : undefined;
-}
-
-function formatWorkSpecDetails(ws?: WorkSpecView): string | undefined {
-  if (!ws) return undefined;
-  const lines: string[] = [];
-  if (ws.goal) lines.push(`goal: ${ws.goal}`);
-  if (ws.expectedOutputs.length) lines.push(`expected_outputs:\n- ${ws.expectedOutputs.join("\n- ")}`);
-  if (ws.workspaceRoots.length) lines.push(`workspace_roots: ${ws.workspaceRoots.join(", ")}`);
-  if (ws.domainAllowlist.length) lines.push(`domain_allowlist: ${ws.domainAllowlist.join(", ")}`);
-  if (ws.fileTypeAllowlist.length) lines.push(`file_type_allowlist: ${ws.fileTypeAllowlist.join(", ")}`);
-  return lines.length ? lines.join("\n") : undefined;
-}
-
-function joinDetails(parts: Array<string | undefined>): string | undefined {
-  const rows = parts.map((item) => String(item || "").trim()).filter(Boolean);
-  return rows.length ? rows.join("\n") : undefined;
-}
-
-function normalizeApproverDecision(raw: unknown): "allow" | "deny" | "escalate" | "unknown" {
-  const value = String(raw || "").trim().toLowerCase();
-  if (!value) return "unknown";
-  if (value === "allow") return "allow";
-  if (value === "deny") return "deny";
-  if (["require_approval", "needs_approval", "escalate"].includes(value)) return "escalate";
-  return "unknown";
-}
-
-function summarizeApproverTrace(raw: unknown): string | undefined {
-  if (!raw || typeof raw !== "object") return undefined;
-  const trace = raw as Record<string, unknown>;
-  const decision = cleanText(trace.decision ?? trace.final_decision, 40);
-  const parsed = cleanText(trace.parsed_decision ?? trace.parsed, 40);
-  const reason = cleanText(trace.reason, 260);
-  const error = cleanText(trace.error, 260);
-  const skipped = trace.skipped === true;
-  return joinDetails([
-    decision ? `decision: ${decision}` : undefined,
-    parsed ? `parsed: ${parsed}` : undefined,
-    skipped ? "skipped: true" : undefined,
-    error ? `error: ${error}` : undefined,
-    reason ? `reason: ${reason}` : undefined,
-  ]);
-}
 export const RightPanel = React.memo(function RightPanel(props: {
   currentSessionId: string | null;
   rightTab: RightTab;
@@ -194,9 +57,6 @@ export const RightPanel = React.memo(function RightPanel(props: {
   sessionMeta: SessionMeta | null;
   onChangeApprovalMode: (mode: string) => void;
   onToggleStreaming: (enabled: boolean) => void;
-
-  // Formatting helpers
-  fmtTime: (ms: number) => string;
 }) {
   const {
     currentSessionId,
@@ -222,7 +82,6 @@ export const RightPanel = React.memo(function RightPanel(props: {
     sessionMeta,
     onChangeApprovalMode,
     onToggleStreaming,
-    fmtTime,
   } = props;
 
   const [terminalFilter, setTerminalFilter] = useState<"all" | "llm" | "tools" | "plan" | "approvals" | "errors">("all");

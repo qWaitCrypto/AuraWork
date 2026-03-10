@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import shutil
 import sys
@@ -19,6 +20,8 @@ EXIT_DENIED = 2
 EXIT_VALIDATION_FAILED = 3
 EXIT_TOOL_FAILED = 4
 EXIT_CONFIG_ERROR = 5
+PLAIN_INPUT_ENV_VAR = "AURA_PLAIN_INPUT"
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .runtime.engine import Engine
@@ -162,13 +165,13 @@ def _pick_from_list_standalone(
             if fd is not None and old is not None:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old)
         except Exception:
-            pass
+            logger.warning("Failed to restore terminal attributes in standalone selector.", exc_info=True)
         try:
             if rendered_lines:
                 _clear_block(len(rendered_lines))
                 sys.stdout.flush()
         except Exception:
-            pass
+            logger.warning("Failed to clear selector UI block in standalone selector.", exc_info=True)
 
 
 def _pick_session_id_standalone(*, session_store: FileSessionStore, project_ref: str) -> str | None:
@@ -306,6 +309,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Color mode for console output: auto (TTY only), always, or never.",
     )
+    chat_parser.add_argument(
+        "--plain-input",
+        dest="plain_input",
+        action="store_true",
+        help=f"Force basic input() mode (disable prompt_toolkit). Same as {PLAIN_INPUT_ENV_VAR}=1.",
+    )
     chat_parser.set_defaults(enable_tools=None)
     chat_parser.set_defaults(func=_cmd_chat)
 
@@ -347,6 +356,12 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["auto", "always", "never"],
         default="auto",
         help="Color mode for console output: auto (TTY only), always, or never.",
+    )
+    session_resume_parser.add_argument(
+        "--plain-input",
+        dest="plain_input",
+        action="store_true",
+        help=f"Force basic input() mode (disable prompt_toolkit). Same as {PLAIN_INPUT_ENV_VAR}=1.",
     )
     session_resume_parser.set_defaults(enable_tools=None)
     session_resume_parser.set_defaults(func=_cmd_session_resume)
@@ -390,6 +405,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     from .runtime.llm.config_io import load_model_config_layers_for_dir
     from .runtime.llm.types import ModelRole
     from .runtime.project import RuntimePaths
+    from .runtime.session_settings import update_session_settings
     from .runtime.stores import FileApprovalStore, FileArtifactStore, FileEventLogStore, FileSessionStore
     from .runtime.tools.runtime import ToolApprovalMode
 
@@ -483,7 +499,12 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     except ValueError:
         approval_mode = default_approval_mode
     if session_meta.get("tool_approval_mode") != approval_mode.value:
-        session_store.update_session(session_id, {"tool_approval_mode": approval_mode.value})
+        update_session_settings(
+            session_store=session_store,
+            session_id=session_id,
+            model_config=model_config,
+            tool_approval_mode=approval_mode.value,
+        )
 
     try:
         orchestrator = build_engine_for_session(
@@ -513,37 +534,17 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     else:
         orchestrator.set_llm_streaming(True)
         try:
-            session_store.update_session(session_id, {"llm_streaming": True})
+            update_session_settings(
+                session_store=session_store,
+                session_id=session_id,
+                model_config=model_config,
+                llm_streaming=True,
+            )
         except Exception:
-            pass
+            logger.warning("Failed to persist default llm_streaming for session_id=%s", session_id, exc_info=True)
     orchestrator.load_history_from_events()
     orchestrator.apply_memory_summary_retention()
 
-    return _run_chat_line_mode(
-        orchestrator=orchestrator,
-        event_bus=event_bus,
-        session_id=session_id,
-        approval_store=approval_store,
-        event_log_store=event_log_store,
-        artifact_store=artifact_store,
-        timeout_s=args.timeout_s,
-        print_replay=resumed,
-        color=getattr(args, "color", "auto"),
-    )
-
-
-def _run_chat_line_mode(
-    *,
-    orchestrator: "Engine",
-    event_bus: "EventBus",
-    session_id: str,
-    approval_store: "FileApprovalStore",
-    event_log_store: "FileEventLogStore",
-    artifact_store: "FileArtifactStore",
-    timeout_s: float | None,
-    print_replay: bool,
-    color: str,
-) -> int:
     return _run_chat_console_ui(
         orchestrator=orchestrator,
         event_bus=event_bus,
@@ -551,9 +552,11 @@ def _run_chat_line_mode(
         approval_store=approval_store,
         event_log_store=event_log_store,
         artifact_store=artifact_store,
-        timeout_s=timeout_s,
-        print_replay=print_replay,
-        color=color,
+        history_file=paths.history_file,
+        timeout_s=args.timeout_s,
+        print_replay=resumed,
+        color=getattr(args, "color", "auto"),
+        force_plain_input=bool(getattr(args, "plain_input", False)),
     )
 
 
@@ -565,16 +568,18 @@ def _run_chat_console_ui(
     approval_store: "FileApprovalStore",
     event_log_store: "FileEventLogStore",
     artifact_store: "FileArtifactStore",
+    history_file: Path,
     timeout_s: float | None,
     print_replay: bool,
     color: str,
+    force_plain_input: bool = False,
 ) -> int:
-    from pathlib import Path
     from contextlib import contextmanager
 
     from .runtime.event_bus import EventFilter, EventLogAppendError
     from .runtime.llm.errors import CancellationToken
     from .runtime.context_mgmt import render_context_left_line
+    from .runtime.session_settings import update_session_settings
     from .runtime.tools.runtime import ToolApprovalMode
     from .ui.console_ui import ConsoleUI, ThinkTagParser, UIEvent, UIEventKind
 
@@ -586,7 +591,9 @@ def _run_chat_console_ui(
 
     def _should_use_prompt_toolkit() -> bool:
         # Let callers (and tests) force plain input mode.
-        if str(os.environ.get("NOVELAIRE_PLAIN_INPUT") or "").strip() in {"1", "true", "yes", "on"}:
+        if force_plain_input:
+            return False
+        if str(os.environ.get(PLAIN_INPUT_ENV_VAR) or "").strip().lower() in {"1", "true", "yes", "on"}:
             return False
         if not _is_tty():
             return False
@@ -598,7 +605,7 @@ def _run_chat_console_ui(
             if isinstance(mod, str) and mod.startswith("unittest.mock"):
                 return False
         except Exception:
-            pass
+            logger.warning("Failed to inspect builtins.input when deciding prompt_toolkit mode.", exc_info=True)
         return True
 
     # Input: prompt_toolkit if available and appropriate; otherwise basic input().
@@ -638,11 +645,11 @@ def _run_chat_console_ui(
             def _(event) -> None:
                 event.current_buffer.validate_and_handle()
 
-            history_path = Path(approval_store._root).parent / "history.txt"  # state/history.txt
+            history_path = history_file
             try:
                 history_path.parent.mkdir(parents=True, exist_ok=True)
             except Exception:
-                pass
+                logger.warning("Failed to create prompt history directory: %s", history_path.parent, exc_info=True)
             prompt_session = PromptSession(
                 message="You> ",
                 multiline=True,
@@ -702,7 +709,7 @@ def _run_chat_console_ui(
                         context_limit_tokens=limit if isinstance(limit, int) else None,
                     )
         except Exception:
-            pass
+            logger.warning("Failed to update context status from runtime event.", exc_info=True)
         for uiev in _runtime_event_to_ui_events(event, think_parser=think_parser):
             ui.emit(uiev)
 
@@ -740,7 +747,7 @@ def _run_chat_console_ui(
                 termios.tcsetattr(fd, termios.TCSADRAIN, old)
                 termios.tcflush(fd, termios.TCIFLUSH)
             except Exception:
-                pass
+                logger.warning("Failed to restore terminal echo state after waiting.", exc_info=True)
 
     def _run_op(op: Op) -> None:
         cancel = CancellationToken()
@@ -904,13 +911,13 @@ def _run_chat_console_ui(
                 try:
                     termios.tcsetattr(fd, termios.TCSADRAIN, old)
                 except Exception:
-                    pass
+                    logger.warning("Failed to restore terminal attributes in interactive picker.", exc_info=True)
                 try:
                     if rendered_lines:
                         _clear_block(len(rendered_lines))
                         sys.stdout.flush()
                 except Exception:
-                    pass
+                    logger.warning("Failed to clear selector UI block in interactive picker.", exc_info=True)
 
     def _pick_model_profile_interactive(*, cfg, current_profile_id: str | None) -> str | None:
         profile_ids = sorted(cfg.profiles.keys())
@@ -1142,7 +1149,7 @@ def _run_chat_console_ui(
                         )
                         ui.emit(UIEvent(UIEventKind.LOG, {"level": "policy", "message": "Saved allowlist rule for this command."}))
                 except Exception:
-                    pass
+                    logger.warning("Failed to persist shell allowlist rule from approval prompt.", exc_info=True)
 
             op = Op(
                 kind=OpKind.APPROVAL_DECISION.value,
@@ -1226,9 +1233,19 @@ def _run_chat_console_ui(
                 continue
             orchestrator.set_llm_streaming(enabled)
             try:
-                orchestrator.session_store.update_session(orchestrator.session_id, {"llm_streaming": enabled})
+                update_session_settings(
+                    session_store=orchestrator.session_store,
+                    session_id=orchestrator.session_id,
+                    model_config=orchestrator.model_config,
+                    llm_streaming=enabled,
+                )
             except Exception:
-                pass
+                logger.warning(
+                    "Failed to persist llm_streaming=%s for session_id=%s",
+                    enabled,
+                    orchestrator.session_id,
+                    exc_info=True,
+                )
             ui.emit(
                 UIEvent(
                     UIEventKind.LOG,
@@ -1291,17 +1308,25 @@ def _run_chat_console_ui(
                 ui.emit(UIEvent(UIEventKind.WARNING, {"message": f"Failed to switch model: {e}"}))
                 continue
             try:
-                orchestrator.session_store.update_session(orchestrator.session_id, {"chat_profile_id": target})
+                update_session_settings(
+                    session_store=orchestrator.session_store,
+                    session_id=orchestrator.session_id,
+                    model_config=orchestrator.model_config,
+                    chat_profile_id=target,
+                )
             except Exception:
-                pass
+                logger.warning(
+                    "Failed to persist chat_profile_id=%s for session_id=%s",
+                    target,
+                    orchestrator.session_id,
+                    exc_info=True,
+                )
             p = cfg.profiles[target]
             ui.emit(UIEvent(UIEventKind.LOG, {"level": "policy", "message": f"Chat model set to: {target} ({p.provider_kind.value} {p.model_name})"}))
             if orchestrator.tools_enabled:
                 caps = p.capabilities.with_provider_defaults(p.provider_kind)
                 if caps.supports_tools is not True:
                     ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Selected model does not declare tool support; tool calls may fail."}))
-            continue
-            ui.emit(UIEvent(UIEventKind.WARNING, {"message": "Usage: /model [list] | /model <profile-id>"}))
             continue
         if cmd.startswith("/perm"):
             parts = cmd.split()
@@ -1355,9 +1380,19 @@ def _run_chat_console_ui(
 
             tr.set_approval_mode(desired)
             try:
-                orchestrator.session_store.update_session(orchestrator.session_id, {"tool_approval_mode": desired.value})
+                update_session_settings(
+                    session_store=orchestrator.session_store,
+                    session_id=orchestrator.session_id,
+                    model_config=orchestrator.model_config,
+                    tool_approval_mode=desired.value,
+                )
             except Exception:
-                pass
+                logger.warning(
+                    "Failed to persist tool_approval_mode=%s for session_id=%s",
+                    desired.value,
+                    orchestrator.session_id,
+                    exc_info=True,
+                )
             ui.emit(UIEvent(UIEventKind.LOG, {"level": "policy", "message": f"Tool approval mode set to: {desired.value}"}))
             continue
 
@@ -1393,107 +1428,6 @@ def _run_chat_console_ui(
     return EXIT_OK
 
 
-def _run_chat_basic_line_mode(
-    *,
-    orchestrator: Engine,
-    event_bus: EventBus,
-    session_id: str,
-    approval_store: FileApprovalStore,
-    event_log_store: FileEventLogStore,
-    artifact_store: FileArtifactStore,
-    timeout_s: float | None,
-    print_replay: bool,
-) -> int:
-    if print_replay:
-        _print_replay(session_id, event_log_store=event_log_store, artifact_store=artifact_store)
-
-    try:
-        _handle_pending_approvals(
-            orchestrator=orchestrator,
-            session_id=session_id,
-            approval_store=approval_store,
-            timeout_s=timeout_s,
-        )
-    except EventLogAppendError as e:
-        print(f"[fatal] {e}", file=sys.stderr)
-        return EXIT_CONFIG_ERROR
-
-    assistant_last_char_newline = True
-
-    def _ui_handler(event) -> None:
-        nonlocal assistant_last_char_newline
-        if event.kind == EventKind.LLM_RESPONSE_DELTA.value:
-            delta = str(event.payload.get("text_delta") or "")
-            sys.stdout.write(delta)
-            sys.stdout.flush()
-            assistant_last_char_newline = delta.endswith("\n")
-        elif event.kind == EventKind.LLM_RESPONSE_COMPLETED.value:
-            if not assistant_last_char_newline:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-            assistant_last_char_newline = True
-        elif event.kind == EventKind.OPERATION_PROGRESS.value:
-            msg = event.payload.get("message") if isinstance(event.payload, dict) else None
-            if msg:
-                print(f"[progress] {msg}", file=sys.stderr)
-        elif event.kind == EventKind.OPERATION_CANCELLED.value:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-            reason = event.payload.get("reason") or "cancelled"
-            print(f"[cancelled] {reason}", file=sys.stderr)
-        elif event.kind in (EventKind.OPERATION_FAILED.value, EventKind.LLM_REQUEST_FAILED.value):
-            msg = event.payload.get("error") or event.payload
-            print(f"[error] {msg}", file=sys.stderr)
-
-    event_bus.subscribe(_ui_handler, EventFilter(session_id=session_id))
-
-    print(f"Session: {session_id}")
-    print("Type '/exit' to quit.")
-    while True:
-        try:
-            user_text = input("> ")
-        except EOFError:
-            print()
-            break
-        except KeyboardInterrupt:
-            print()
-            continue
-        if user_text.strip() in {"/exit", "/quit"}:
-            break
-        user_text = _sanitize_text(user_text)
-        op = Op(
-            kind=OpKind.CHAT.value,
-            payload={"text": user_text},
-            session_id=session_id,
-            request_id=new_id("req"),
-            timestamp=now_ts_ms(),
-            turn_id=new_id("turn"),
-        )
-        try:
-            orchestrator.run(op, timeout_s=timeout_s)
-            _handle_pending_approvals(
-                orchestrator=orchestrator,
-                session_id=session_id,
-                approval_store=approval_store,
-                request_id=op.request_id,
-                timeout_s=timeout_s,
-            )
-        except EventLogAppendError as e:
-            print(f"[fatal] {e}", file=sys.stderr)
-            return EXIT_CONFIG_ERROR
-        except KeyboardInterrupt:
-            print("\nCancelled.", file=sys.stderr)
-            continue
-
-    try:
-        event_bus.flush()
-    except EventLogAppendError as e:
-        print(f"[fatal] {e}", file=sys.stderr)
-        return EXIT_CONFIG_ERROR
-
-    return EXIT_OK
-
-
 def _cmd_session_list(_: argparse.Namespace) -> int:
     from .runtime.project import RuntimePaths
     from .runtime.stores import FileSessionStore
@@ -1522,6 +1456,7 @@ def _cmd_session_resume(args: argparse.Namespace) -> int:
         enable_tools=getattr(args, "enable_tools", None),
         max_tool_turns=getattr(args, "max_tool_turns", 30),
         color=getattr(args, "color", "auto"),
+        plain_input=bool(getattr(args, "plain_input", False)),
     )
     return _cmd_chat(args2)
 
@@ -1616,7 +1551,7 @@ def _print_replay(
                     rendered = text.decode("utf-8", errors="replace").rstrip()
                     print(f"You: {rendered}")
                 except Exception:
-                    pass
+                    logger.warning("Failed to render replay user message for session_id=%s", session_id, exc_info=True)
         if event.kind == EventKind.LLM_RESPONSE_COMPLETED.value:
             ref_raw = event.payload.get("output_ref")
             if isinstance(ref_raw, dict):
@@ -1625,7 +1560,7 @@ def _print_replay(
                     rendered = text.decode("utf-8", errors="replace").rstrip()
                     print(f"Assistant: {rendered}")
                 except Exception:
-                    pass
+                    logger.warning("Failed to render replay assistant message for session_id=%s", session_id, exc_info=True)
     print("--- End replay ---")
 
 
@@ -1648,7 +1583,11 @@ def _emit_replay_to_ui(
                     rendered = text.decode("utf-8", errors="replace").rstrip()
                     ui.emit(UIEvent(UIEventKind.USER_SUBMITTED, {"text": rendered}))
                 except Exception:
-                    pass
+                    logger.warning(
+                        "Failed to emit replay user message to UI for session_id=%s",
+                        session_id,
+                        exc_info=True,
+                    )
         if event.kind == EventKind.LLM_RESPONSE_COMPLETED.value:
             ref_raw = event.payload.get("output_ref")
             if isinstance(ref_raw, dict):
@@ -1658,7 +1597,11 @@ def _emit_replay_to_ui(
                     ui.emit(UIEvent(UIEventKind.ASSISTANT_DELTA, {"text": rendered}))
                     ui.emit(UIEvent(UIEventKind.ASSISTANT_COMPLETED, {"finish_reason": None}))
                 except Exception:
-                    pass
+                    logger.warning(
+                        "Failed to emit replay assistant message to UI for session_id=%s",
+                        session_id,
+                        exc_info=True,
+                    )
     ui.emit(UIEvent(UIEventKind.LOG, {"level": "replay", "message": "--- End replay ---"}))
 
 
@@ -1679,7 +1622,7 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
         try:
             think_parser.reset()
         except Exception:
-            pass
+            logger.warning("Failed to reset think parser on LLM request start.", exc_info=True)
         out.append(UIEvent(UIEventKind.LLM_REQUEST_STARTED, {"request_id": event.request_id}))
         return out
 
@@ -1688,7 +1631,7 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
             try:
                 think_parser.reset()
             except Exception:
-                pass
+                logger.warning("Failed to reset think parser on compaction start.", exc_info=True)
             out.append(
                 UIEvent(
                     UIEventKind.LLM_REQUEST_STARTED,
@@ -1897,73 +1840,6 @@ def _runtime_event_to_ui_events(event, *, think_parser) -> list:
         return out
 
     return out
-
-
-def _handle_pending_approvals(
-    *,
-    orchestrator: "Engine",
-    session_id: str,
-    approval_store: "FileApprovalStore",
-    timeout_s: float | None,
-    request_id: str | None = None,
-) -> None:
-    from .runtime.approval import ApprovalStatus
-
-    while True:
-        pending = approval_store.list(
-            session_id=session_id,
-            status=ApprovalStatus.PENDING,
-            request_id=request_id,
-        )
-        if not pending:
-            return
-
-        record = pending[0]
-        print()
-        print(f"Approval required: {record.approval_id}")
-        print(f"Summary: {record.action_summary}")
-        if record.risk_level is not None:
-            print(f"Risk: {record.risk_level}")
-        if record.reason:
-            print(f"Reason: {record.reason}")
-        if record.diff_ref:
-            try:
-                ref = ArtifactRef.from_dict(record.diff_ref)
-                raw = orchestrator.artifact_store.get(ref)
-                diff_text = raw.decode("utf-8", errors="replace")
-                max_chars = 8000
-                print("\n--- Diff (preview) ---")
-                if len(diff_text) > max_chars:
-                    print(diff_text[:max_chars])
-                    print(f"... (truncated, {len(diff_text)} chars total)")
-                else:
-                    print(diff_text)
-                print("--- End diff ---")
-            except Exception as e:
-                print(f"(Failed to load diff: {e})", file=sys.stderr)
-        while True:
-            try:
-                ans = input("Decision [approve/deny] (a/d): ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                print("\nApproval decision interrupted; leaving approval pending.", file=sys.stderr)
-                return
-            if ans in {"approve", "a", "yes", "y"}:
-                decision = "approve"
-                break
-            if ans in {"deny", "d", "no", "n", "abort"}:
-                decision = "deny"
-                break
-            print("Invalid decision. Enter 'approve' or 'deny'.")
-
-        decision_op = Op(
-            kind=OpKind.APPROVAL_DECISION.value,
-            payload={"approval_id": record.approval_id, "decision": decision},
-            session_id=session_id,
-            request_id=new_id("req"),
-            timestamp=now_ts_ms(),
-            turn_id=new_id("turn"),
-        )
-        orchestrator.run(decision_op, timeout_s=timeout_s)
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -2201,7 +2077,7 @@ def _iter_artifact_refs(value: object) -> list[ArtifactRef]:
             try:
                 out.append(ArtifactRef.from_dict(value))
             except Exception:
-                pass
+                logger.warning("Failed to parse artifact reference while exporting approval artifacts.", exc_info=True)
         for v in value.values():
             out.extend(_iter_artifact_refs(v))
         return out

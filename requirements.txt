@@ -10,7 +10,7 @@ httpx>=0.28
 openai>=1.100
 anthropic>=0.75
 strictyaml>=1.6
-mcp
+mcp>=1.0,<2.0
 prompt_toolkit>=3.0
 
 # Office skills bundle (DOCX/XLSX/PPTX/PDF)

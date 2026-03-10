@@ -9,6 +9,7 @@ from .ids import new_id, new_tool_call_id
 from .llm.types import CanonicalMessage, CanonicalMessageRole, ToolSpec
 from .orchestrator_helpers import _summarize_tool_for_ui
 from .protocol import EventKind
+from .tool_status import normalize_tool_end_status
 from .tools.runtime import (
     InspectionDecision,
     PlannedToolCall,
@@ -16,7 +17,6 @@ from .tools.runtime import (
     ToolRuntime,
     _classify_tool_exception,
     _classify_tool_result,
-    _normalize_tool_end_status,
  )
 
 
@@ -144,7 +144,7 @@ def build_agno_toolset(
                 if inspection.decision is InspectionDecision.DENY:
                     remaining_tool_calls = _consume_tool_call_budget()
                     error_code = inspection.error_code.value if inspection.error_code is not None else "permission"
-                    status = _normalize_tool_end_status("blocked")
+                    status = normalize_tool_end_status("blocked")
                     error_message = inspection.reason or inspection.action_summary or f"Tool call denied: {planned.tool_name}"
                     output_ref = artifact_store.put(
                         json.dumps(

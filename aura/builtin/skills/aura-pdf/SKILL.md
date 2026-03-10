@@ -1,6 +1,6 @@
 ---
 name: aura-pdf
-description: PDF office operations via a plan-driven pipeline (analyze → plan → apply → Gate A validate → report), including text/table extraction, merge/split, forms/watermark, encryption/decryption, OCR (if available), image extraction, rotation, and metadata. Use for PDFs, scanned documents, OCR, merging/splitting, text/table extraction, form filling, watermarking, and encryption.
+description: PDF operations via a plan-driven pipeline (analyze → plan → apply → Gate A validate → report). Use this skill whenever the user mentions PDF files, scanned documents, OCR, merging or splitting PDFs, extracting text or tables, filling PDF forms, adding watermarks, encrypting or decrypting, extracting images, rotating pages, or reading metadata. Always use this skill for any .pdf task rather than ad-hoc scripts.
 ---
 
 # Aura PDF (Tutorial-style)

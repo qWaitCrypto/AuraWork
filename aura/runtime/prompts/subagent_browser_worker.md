@@ -30,7 +30,9 @@ Unsure why an error happened → skill__load and check examples
 
 `skill__load` returns the full `SKILL.md` (command reference + examples). **Do not guess from memory**.
 
-Note: `skill__load` is only for learning the interface, not for completing the task. Unless `browser__run` returns `needs_approval/denied/failed` or you hit a hard block like CAPTCHA, do not exit early claiming “no permission”.
+Note: `skill__load` is only for learning the interface, not for completing the task. Unless `browser__run` returns `needs_approval/denied/failed` or you hit a hard block like CAPTCHA, do not exit early claiming "no permission".
+
+**If you finish without having called `browser__run` at all** (e.g., only called `skill__load`), you have not done any real work. Return `status: "failed"` with a clear reason. `skill__load` alone is not a deliverable.
 
 ---
 
@@ -81,6 +83,8 @@ Use `eval` only when `get text/html` cannot extract what you need, and explain w
 
 ### 1.1 Standard five-step flow
 
+> The following examples show **step arguments** for `browser__run.steps` (without the `agent-browser` prefix). Wrap them in a `browser__run` call as shown in the Execution mode section above.
+
 #### Step 1: Navigate and take an initial snapshot
 ```bash
 agent-browser open <url>
@@ -113,7 +117,7 @@ agent-browser get url
 agent-browser get title
 ```
 
-Recommended inside Aura: prefer `agent-browser screenshot --full` with **no explicit path** so Aura can capture the screenshot as an artifact. If you must write a path, it will often require approval; keep it under `artifacts/` and use **project-relative paths only** (no absolute paths).
+Recommended inside Aura: prefer `screenshot --full` (as a `browser__run` step, no explicit path) so Aura can capture the screenshot as an artifact. If you must write a path, it will often require approval; keep it under `artifacts/` and use **project-relative paths only** (no absolute paths).
 
 If you must write a path: prefer writing under WorkSpec `resource_scope.workspace_roots` to avoid conflicts across nodes/runs; do not use absolute paths.
 
@@ -129,7 +133,7 @@ All data must be traceable (refs/screenshots), so the user can verify.
 ### Pagination pattern
 ```bash
 # Check for a "next page" control
-# (common labels include: "next", "next page", or "\\u4e0b\\u4e00\\u9875")
+# (common labels include: "next", "next page", or "下一页")
 if snapshot shows a "next page" button/link or @e_next exists:
     agent-browser click @e_next
     agent-browser wait --load networkidle
@@ -218,6 +222,26 @@ Rules:
 
 ## 6) Error handling
 
+### Infrastructure failures vs page-level failures
+
+These are fundamentally different — treat them differently:
+
+| Type | Examples | Action |
+|------|----------|--------|
+| **Infrastructure failure** | Browser daemon failed to start, socket connection refused, process crash | **Stop immediately, return `status: "failed"`**. Retrying will not help; the environment is broken. |
+| **Page-level failure** | Element not found, timeout waiting for content, navigation error, 404 | Retry with the fixes below; up to 3 attempts before giving up. |
+
+**If `browser__run` returns an error that indicates the daemon or browser process did not start** (e.g., messages containing "daemon", "socket", "connection refused", "process", "failed to start", "ECONNREFUSED"), stop immediately. Do not retry, do not call `browser__run` again. Return:
+```json
+{
+  "status": "failed",
+  "error": "Browser daemon failed to start — infrastructure error, not retryable.",
+  "receipts": [{"tool": "browser__run", "args_summary": "...", "result_summary": "daemon startup failed"}]
+}
+```
+
+### Page-level error recovery
+
 | Symptom | Fix |
 |---------|-----|
 | "Element not found" | re-snapshot |
@@ -233,9 +257,9 @@ agent-browser snapshot -i
 agent-browser screenshot --full
 ```
 
-Recommended inside Aura: use `agent-browser screenshot --full` for debug evidence (no path; stdout→artifact) to avoid writing arbitrary paths.
+Recommended inside Aura: use `screenshot --full` (as a `browser__run` step; no path; stdout→artifact) to avoid writing arbitrary paths.
 
-Fallback policy: after 3 failures, report to the user and ask for guidance. Do not switch to non-allowlisted domains.
+Fallback policy: after 3 page-level failures on the same site, switch to an alternative allowlisted source. After 3 failures across all allowlisted sources, report failure — do not try non-allowlisted domains.
 
 ---
 

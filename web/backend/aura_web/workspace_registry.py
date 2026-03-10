@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+import logging
 import re
 import sys
 from dataclasses import dataclass
@@ -11,7 +11,11 @@ from typing import Any
 
 from aura.runtime.ids import now_ts_ms
 
+from .io_utils import atomic_write_text
 from .workspace_init import init_workspace
+
+
+logger = logging.getLogger(__name__)
 
 
 def _is_wsl() -> bool:
@@ -20,6 +24,7 @@ def _is_wsl() -> bool:
     try:
         return "microsoft" in Path("/proc/version").read_text(encoding="utf-8", errors="ignore").lower()
     except Exception:
+        logger.warning("Failed to detect WSL environment from /proc/version.", exc_info=True)
         return False
 
 
@@ -35,14 +40,6 @@ class WorkspaceRecord:
             "project_root": self.project_root,
             "last_used_at": self.last_used_at,
         }
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
-
 
 class WorkspaceRegistry:
     """Global registry of workspace_id -> project_root for the web backend.
@@ -69,12 +66,14 @@ class WorkspaceRegistry:
             self._workspaces = {}
             return
         except Exception:
+            logger.warning("Failed to read workspace registry: %s", self._path, exc_info=True)
             self._workspaces = {}
             return
 
         try:
             data = json.loads(raw)
         except Exception:
+            logger.warning("Failed to parse workspace registry JSON: %s", self._path, exc_info=True)
             self._workspaces = {}
             return
 
@@ -101,7 +100,7 @@ class WorkspaceRegistry:
 
     def _save(self) -> None:
         payload = {"version": 1, "workspaces": self._workspaces}
-        _atomic_write_text(self._path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        atomic_write_text(self._path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
     def resolve_project_root(self, raw: str) -> Path:
         s = str(raw or "").strip()
@@ -160,11 +159,15 @@ class WorkspaceRegistry:
         rec = self._workspaces.get(wid)
         if not rec:
             return
-        rec["last_used_at"] = now_ts_ms()
-        self._workspaces[wid] = rec
+        previous = dict(rec)
+        updated = dict(rec)
+        updated["last_used_at"] = now_ts_ms()
+        self._workspaces[wid] = updated
         try:
             self._save()
         except Exception:
+            self._workspaces[wid] = previous
+            logger.warning("Failed to persist workspace last_used_at for workspace_id=%s", wid, exc_info=True)
             return
 
     def get_project_root(self, workspace_id: str) -> Path:

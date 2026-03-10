@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 
 import threading
 import time
@@ -6,6 +7,8 @@ from typing import Any
 
 from .errors import CancellationToken
 
+
+logger = logging.getLogger(__name__)
 
 def _maybe_close_stream(stream: Any) -> None:
     # Best-effort close: various SDKs wrap the underlying HTTP response object differently.
@@ -18,7 +21,7 @@ def _maybe_close_stream(stream: Any) -> None:
         try:
             aclose()
         except Exception:
-            pass
+            logger.warning("Suppressed exception in _maybe_close_stream.", exc_info=True)
         return
     for attr in ("response", "_response", "http_response", "_http_response"):
         inner = getattr(stream, attr, None)
@@ -29,7 +32,7 @@ def _maybe_close_stream(stream: Any) -> None:
             try:
                 close2()
             except Exception:
-                pass
+                logger.warning("Suppressed exception in _maybe_close_stream.", exc_info=True)
             return
 
 
@@ -44,7 +47,7 @@ def _start_cancel_closer(cancel: CancellationToken | None, stream: Any) -> threa
                 try:
                     _maybe_close_stream(stream)
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _run.", exc_info=True)
                 return
             stop.wait(0.05)
 
@@ -100,7 +103,7 @@ def _start_stream_idle_watchdog(
                 try:
                     _maybe_close_stream(stream)
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _run.", exc_info=True)
                 return
             if any_seen and idle_timeout_s is not None and (now - last) >= idle_timeout_s:
                 with lock:
@@ -109,7 +112,7 @@ def _start_stream_idle_watchdog(
                 try:
                     _maybe_close_stream(stream)
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _run.", exc_info=True)
                 return
             stop.wait(0.05)
 

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 
 import threading
 from typing import Any, Iterator
@@ -14,6 +15,8 @@ from .types import (
     ToolCall,
     ToolCallDelta,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _anthropic_to_usage(resp: Any) -> LLMUsage | None:
@@ -90,12 +93,12 @@ def _anthropic_stream_to_events(
                 try:
                     on_provider_event(event)
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _anthropic_stream_to_events.", exc_info=True)
             if on_event is not None:
                 try:
                     on_event()
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _anthropic_stream_to_events.", exc_info=True)
 
             etype = getattr(event, "type", None)
             if etype == "message_start":
@@ -187,4 +190,3 @@ def _anthropic_stream_to_events(
         request_id=request_id,
     )
     yield LLMStreamEvent(kind=LLMStreamEventKind.COMPLETED, response=response)
-

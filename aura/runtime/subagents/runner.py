@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 from ..ids import new_id, new_tool_call_id, now_ts_ms
 from ..llm.errors import ModelResolutionError
 from ..agent_browser import agent_browser_session_for_subagent_run
+from ..error_codes import ErrorCode
 from ..llm.router import ModelRouter
 from ..llm.types import ModelRequirements, ModelRole, ToolSpec
 from ..llm.tool_schema_compat import adapt_tool_specs_for_profile
@@ -18,9 +20,12 @@ from ..orchestrator_helpers import _summarize_text, _summarize_tool_for_ui
 from ..protocol import Event, EventKind, EVENT_SCHEMA_VERSION
 from ..prompts.template import render_prompt_template
 from ..stores import ArtifactStore
-from ..tools.runtime import InspectionDecision, ToolExecutionContext, ToolRuntime
+from ..tools.runtime import InspectionDecision, InspectionResult, ToolExecutionContext, ToolRuntime
 from .approver import maybe_apply_approval_agent
 from .presets import SubagentPreset
+
+
+logger = logging.getLogger(__name__)
 
 
 def _derive_run_paths(*, work_spec: WorkSpec | None, fallback_run_id: str) -> tuple[str, str]:
@@ -368,7 +373,7 @@ def _update_system_message_in_run(out: Any, *, system_message: str) -> None:
             try:
                 m.content = system_message
             except Exception:
-                pass
+                logger.warning("Failed to update system message content in subagent run object.", exc_info=True)
             return
 
 
@@ -692,19 +697,19 @@ def run_subagent(
                 try:
                     tool.tool_call_id = tool_call_id
                 except Exception:
-                    pass
+                    logger.warning("Failed to backfill tool_call_id for paused subagent tool call.", exc_info=True)
             if not isinstance(tool_name, str) or not tool_name:
                 tool_name = "unknown"
                 try:
                     tool.tool_name = tool_name
                 except Exception:
-                    pass
+                    logger.warning("Failed to backfill tool_name for paused subagent tool call.", exc_info=True)
             if not isinstance(tool_args, dict):
                 tool_args = {}
                 try:
                     tool.tool_args = tool_args
                 except Exception:
-                    pass
+                    logger.warning("Failed to backfill tool_args for paused subagent tool call.", exc_info=True)
 
             planned = tool_runtime.plan(
                 tool_execution_id=f"tool_{tool_call_id}",
@@ -712,7 +717,17 @@ def run_subagent(
                 tool_call_id=tool_call_id,
                 arguments=dict(tool_args),
             )
-            inspection = tool_runtime.inspect(planned)
+            if not _tool_allowed(planned.tool_name, tool_allowlist):
+                inspection = InspectionResult(
+                    decision=InspectionDecision.DENY,
+                    action_summary=f"Blocked tool outside subagent allowlist: {planned.tool_name}",
+                    risk_level="high",
+                    reason=f"Tool '{planned.tool_name}' is not permitted by this subagent's tool_allowlist.",
+                    error_code=ErrorCode.PERMISSION,
+                    diff_ref=None,
+                )
+            else:
+                inspection = tool_runtime.inspect(planned)
             approver_trace: dict[str, Any] | None = None
 
             # Tier-2 approval: an LLM-only approver decides allow/deny/escalate using WorkSpec.
@@ -863,15 +878,15 @@ def run_subagent(
                 try:
                     tool.requires_confirmation = True
                 except Exception:
-                    pass
+                    logger.warning("Failed to set requires_confirmation=True for approved subagent tool.", exc_info=True)
                 try:
                     tool.confirmed = True
                 except Exception:
-                    pass
+                    logger.warning("Failed to set confirmed=True for approved subagent tool.", exc_info=True)
                 try:
                     tool.confirmation_note = inspection.reason or inspection.action_summary
                 except Exception:
-                    pass
+                    logger.warning("Failed to set confirmation_note for approved subagent tool.", exc_info=True)
                 _update_system_message_in_run(out, system_message=system_message)
                 out = agent.continue_run(
                     run_response=out,
@@ -903,15 +918,15 @@ def run_subagent(
             try:
                 tool.requires_confirmation = True
             except Exception:
-                pass
+                logger.warning("Failed to set requires_confirmation=True for denied subagent tool.", exc_info=True)
             try:
                 tool.confirmed = False
             except Exception:
-                pass
+                logger.warning("Failed to set confirmed=False for denied subagent tool.", exc_info=True)
             try:
                 tool.confirmation_note = inspection.reason or inspection.action_summary
             except Exception:
-                pass
+                logger.warning("Failed to set confirmation_note for denied subagent tool.", exc_info=True)
             _update_system_message_in_run(out, system_message=system_message)
             out = agent.continue_run(
                 run_response=out,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import socket
@@ -11,6 +12,7 @@ from .project import RuntimePaths
 
 
 _SAFE_SESSION_TOKEN_RE = re.compile(r"[^a-zA-Z0-9_\-]+")
+logger = logging.getLogger(__name__)
 
 
 def _sanitize_agent_session_token(raw: str) -> str:
@@ -138,8 +140,11 @@ def ensure_agent_browser_stream_port_for_session(project_root: Path, *, agent_se
         port = int(raw)
         if 1 <= port <= 65535:
             return port
-    except Exception:
+    except FileNotFoundError:
+        # First-run path: no persisted port yet.
         pass
+    except Exception:
+        logger.warning("Failed to read persisted agent-browser stream port: %s", port_file)
 
     port = allocate_loopback_port()
     port_file.write_text(f"{port}\n", encoding="utf-8")

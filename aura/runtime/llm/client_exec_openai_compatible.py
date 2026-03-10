@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 
 from typing import Any, Iterator
 
@@ -17,6 +18,8 @@ from .providers.openai_compatible import OpenAICompatibleAdapter
 from .secrets import resolve_credential
 from .trace import LLMTrace
 from .types import CanonicalRequest, LLMResponse, LLMStreamEvent
+
+logger = logging.getLogger(__name__)
 
 
 def complete_openai_compatible(
@@ -114,7 +117,7 @@ def complete_openai_compatible(
                     },
                 )
             except Exception:
-                pass
+                logger.warning("Suppressed exception in complete_openai_compatible.", exc_info=True)
         raise wrap_provider_exception(
             e,
             provider_kind=profile.provider_kind,
@@ -237,7 +240,7 @@ def stream_openai_compatible(
             try:
                 payload.pop("stream_options", None)
             except Exception:
-                pass
+                logger.warning("Suppressed exception in stream_openai_compatible.", exc_info=True)
             if trace is not None:
                 trace.record_meta(stream_include_usage_rejected=True)
             try:

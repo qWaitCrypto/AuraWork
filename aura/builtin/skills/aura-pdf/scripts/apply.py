@@ -6,6 +6,7 @@ This script is intentionally plan-driven so subagents can execute deterministica
 without reading implementation details.
 """
 from __future__ import annotations
+import logging
 
 import argparse
 import io
@@ -17,6 +18,8 @@ from typing import Any, Iterable
 
 import plan as planmod
 
+
+logger = logging.getLogger(__name__)
 
 def _try_import_pypdf():
     try:
@@ -158,9 +161,9 @@ def _fill_form(input_pdf: Path, *, fields: dict[str, Any], output: Path) -> None
             try:
                 writer._root_object["/AcroForm"].update({NameObject("/NeedAppearances"): BooleanObject(True)})  # type: ignore[index]
             except Exception:
-                pass
+                logger.warning("Suppressed exception in _fill_form.", exc_info=True)
     except Exception:
-        pass
+        logger.warning("Suppressed exception in _fill_form.", exc_info=True)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("wb") as f:
@@ -189,7 +192,7 @@ def _add_watermark_overlay(input_pdf: Path, *, watermark_file: Path, pages: str 
             try:
                 page.merge_page(wm_page)  # type: ignore[attr-defined]
             except Exception:
-                pass
+                logger.warning("Suppressed exception in _add_watermark_overlay.", exc_info=True)
         writer.add_page(page)
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -271,7 +274,7 @@ def _rotate_pdf(input_pdf: Path, *, pages: str, angle: int, output: Path) -> Non
                         for _ in range(turns):
                             page.rotate_counter_clockwise(90)  # type: ignore[attr-defined]
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _rotate_pdf.", exc_info=True)
         writer.add_page(page)
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -330,7 +333,7 @@ def _extract_images(input_pdf: Path, *, pages: str | None, output_dir: Path, fmt
                     im.save(out_path)
                     extracted.append(out_path)
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _extract_images.", exc_info=True)
 
     return extracted
 
@@ -355,7 +358,7 @@ def _get_metadata(input_pdf: Path) -> dict[str, Any]:
             for k, v in dict(meta_obj).items():
                 meta[str(k)] = str(v)
         except Exception:
-            pass
+            logger.warning("Suppressed exception in _get_metadata.", exc_info=True)
 
     return {
         "page_count": len(reader.pages),
@@ -641,7 +644,7 @@ def apply_plan(*, plan: dict[str, Any], input_pdf: Path | None, output_pdf: Path
             except Exception:
                 has_forms = False
         except Exception:
-            pass
+            logger.warning("Suppressed exception in apply_plan.", exc_info=True)
 
     risk_level = "low"
     if encrypted or has_forms:

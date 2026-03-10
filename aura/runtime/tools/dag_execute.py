@@ -227,6 +227,10 @@ class DAGExecuteNextTool:
                     "receipts_count": len(action.receipts),
                 }
             elif action.action == "pause_for_approval":
+                # Release the node from scheduler._running so it can be
+                # re-dispatched once approval is granted.  Without this the
+                # node stays stuck in _running forever and the DAG deadlocks.
+                self.dag_runner.release_running(node_id)
                 blocked_nodes.append(node_id)
                 if isinstance(action.approval_request, dict):
                     req_copy = dict(action.approval_request)

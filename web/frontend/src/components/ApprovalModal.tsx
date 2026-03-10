@@ -14,18 +14,24 @@ export interface ApprovalModalProps {
 export function ApprovalModal({ approval, currentSessionId, onDecide }: ApprovalModalProps) {
     const [diffText, setDiffText] = useState<string | null>(null);
     const [diffLoading, setDiffLoading] = useState(false);
+    const [diffError, setDiffError] = useState<string | null>(null);
 
     // Fetch diff when approval changes
     useEffect(() => {
         setDiffText(null);
         setDiffLoading(false);
+        setDiffError(null);
         if (!approval || !currentSessionId) return;
         const diffRef = approval.diff_ref?.locator;
         if (!diffRef) return;
         setDiffLoading(true);
         apiFetchArtifact(currentSessionId, diffRef)
             .then((text) => setDiffText(typeof text === "string" ? text : null))
-            .catch(() => setDiffText(null))
+            .catch((error: unknown) => {
+                setDiffText(null);
+                const message = String((error as { message?: unknown } | null)?.message || "Failed to load diff preview.");
+                setDiffError(message);
+            })
             .finally(() => setDiffLoading(false));
     }, [approval, currentSessionId]);
 
@@ -65,9 +71,14 @@ export function ApprovalModal({ approval, currentSessionId, onDecide }: Approval
                         <div className="flex items-center justify-between">
                             <div className="text-xs text-ink-500">Diff preview</div>
                             {diffLoading ? <Badge tone="gray">loading</Badge> : null}
+                            {!diffLoading && diffError ? <Badge tone="red">error</Badge> : null}
                         </div>
                         <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap rounded-lg border border-surface-200 bg-surface-0 p-3 font-mono text-xs text-ink-700">
-                            {diffText || (approval.diff_ref ? "Loading…" : "No diff preview.")}
+                            {diffLoading
+                                ? "Loading…"
+                                : diffError
+                                    ? `Load failed: ${diffError}`
+                                    : diffText || "No diff preview."}
                         </pre>
                     </div>
                 </div>

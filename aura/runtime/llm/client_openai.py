@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 
 import json
 import threading
@@ -15,6 +16,8 @@ from .types import (
     ToolCall,
     ToolCallDelta,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _openai_to_usage(resp: Any) -> LLMUsage | None:
@@ -91,12 +94,12 @@ def _openai_stream_to_events(
                 try:
                     on_provider_chunk(chunk)
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _openai_stream_to_events.", exc_info=True)
             if on_chunk is not None:
                 try:
                     on_chunk()
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _openai_stream_to_events.", exc_info=True)
             if request_id is None:
                 request_id = getattr(chunk, "id", None)
             if model is None:

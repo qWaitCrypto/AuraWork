@@ -8,6 +8,7 @@ Pipeline:
 This script is optional and only works when system dependencies are available.
 """
 from __future__ import annotations
+import logging
 
 import argparse
 import json
@@ -16,6 +17,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+
+logger = logging.getLogger(__name__)
 
 def _which(cmd: str) -> str | None:
     return shutil.which(cmd)
@@ -99,7 +102,7 @@ def main() -> None:
         try:
             shutil.rmtree(tmp_pdf_dir, ignore_errors=True)
         except Exception:
-            pass
+            logger.warning("Suppressed exception in main.", exc_info=True)
 
     rep: dict[str, Any] = {
         "input_docx": str(docx),

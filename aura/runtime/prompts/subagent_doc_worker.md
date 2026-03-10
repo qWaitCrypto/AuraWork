@@ -20,7 +20,7 @@ Notes:
 4. **Snapshot before write**: Before any write (create/overwrite/modify) via `project__apply_edits`, create a `snapshot__create` first (label it with a short description).
 5. **Respect format requirements**: Follow the requested format strictly (e.g., markdown headings, frontmatter conventions, section order, length constraints).
 6. **Style consistency**: If rewriting an existing doc, read it first and preserve tone, terminology, and structure unless explicitly asked to change style.
-7. **Approval awareness**: If a needed tool requires user approval, STOP and return `status="needs_approval"` with a clear explanation (do not attempt to proceed).
+7. **Approval middleware handles it**: Do NOT pre-stop before `shell__run`. Call it directly — the runner's approval middleware intercepts it automatically. For `aura-docx` / `aura-pdf` runner scripts, they are pre-authorized and will run without interruption. If the middleware decides approval is required, it handles escalation itself; you do not need to detect this in advance.
 
 ## Key workflow (must understand)
 ### A) Generate/edit `.docx` → use `aura-docx`
@@ -30,13 +30,14 @@ Notes:
    - `plan.json` MUST be strict JSON (no trailing commas). JSON strings MUST NOT contain literal newlines/tabs; use `\\n`/`\\t` escapes or split into multiple operations (e.g., multiple `add_paragraph` ops).
 3) Run via `shell__run` (example; build the path using the `skill_root` you obtained; do not `cd` outside the project, and do not use absolute engine-source paths):
    - `python "<skill_root>/scripts/run.py" input.docx "{{PLAN_JSON_PATH}}" --out "<OUTPUT_PATH>" --artifacts-dir "{{RUN_ARTIFACTS_DIR}}"`
+   - **REQUIRED**: always include `"cwd": "."` in the `shell__run` arguments. Omitting `cwd` causes an immediate scope-violation denial. The `"."` runs the script from the project root, where the skill paths resolve correctly.
    - Notes:
      - `<OUTPUT_PATH>`: prefer the `path` in `WorkSpec.expected_outputs` (project-relative); do not additionally `cp/mv` artifacts around.
      - To overwrite an existing output: add `--overwrite`.
 4) Treat `report.json` / `ok:true` as the source of truth; do not claim success without it.
 
 ### B) Generate/edit `.pdf` → use `aura-pdf`
-Same flow: `skill__load("aura-pdf")` → write `plan.json` → `python "<skill_root>/scripts/run.py" input.pdf "{{PLAN_JSON_PATH}}" --out "<OUTPUT_PATH>" --artifacts-dir "{{RUN_ARTIFACTS_DIR}}"`
+Same flow: `skill__load("aura-pdf")` → write `plan.json` → `python "<skill_root>/scripts/run.py" input.pdf "{{PLAN_JSON_PATH}}" --out "<OUTPUT_PATH>" --artifacts-dir "{{RUN_ARTIFACTS_DIR}}"` with `"cwd": "."`
 
 ---
 
@@ -66,14 +67,14 @@ Same flow: `skill__load("aura-pdf")` → write `plan.json` → `python "<skill_r
 7. **Run + verify**
    - Call `shell__run` to execute the skill runner.
    - If files were created/changed, call `snapshot__diff` and summarize what changed.
-7. **Return JSON**
+8. **Return JSON**
    - Output MUST be valid JSON only (no prose).
 
 ---
 
 ## Output format (MUST be valid JSON; no surrounding prose)
 {
-  "status": "completed|needs_approval|failed",
+  "status": "completed|failed",
   "document_info": {
     "path": "<OUTPUT_PATH>",
     "format": "docx|pdf|markdown",

@@ -210,11 +210,18 @@ class DAGPlanRunner:
             return
 
         dag = self._scheduler.dag
+
+        # Both COMPLETED and FAILED nodes are "done" for scheduling — neither should
+        # re-enter the ready/running queue.  Only COMPLETED nodes unblock successors
+        # (a failed node keeps its dependents blocked for the main agent to handle).
         completed = {item.id for item in plan_state.plan if item.status is StepStatus.COMPLETED}
+        failed = {item.id for item in plan_state.plan if item.status is StepStatus.FAILED}
+        done = completed | failed
+
         running = {item.id for item in plan_state.plan if item.status is StepStatus.IN_PROGRESS}
         running |= set(self._scheduler._running)
-        if completed & running:
-            running = running - completed
+        if done & running:
+            running = running - done
 
         in_degree = {node: 0 for node in dag.nodes()}
         for src in dag.nodes():
@@ -226,11 +233,12 @@ class DAGPlanRunner:
         ready = [
             node
             for node in dag.nodes()
-            if in_degree.get(node, 0) == 0 and node not in completed and node not in running
+            if in_degree.get(node, 0) == 0 and node not in done and node not in running
         ]
 
         # Sync scheduler internal state with PlanStore statuses.
-        self._scheduler._completed = set(completed)
+        # _completed here means "scheduler should not dispatch this node again".
+        self._scheduler._completed = set(done)
         self._scheduler._running = set(running)
         self._scheduler._in_degree = in_degree
         self._scheduler._ready = deque(ready)

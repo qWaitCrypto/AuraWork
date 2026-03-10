@@ -5,11 +5,15 @@ Apply XLSX plan using openpyxl (supports structural edits).
 This path may drop advanced features in some workbooks; the caller should inspect parts_diff.
 """
 from __future__ import annotations
+import logging
 
 import json
 from copy import copy
 from pathlib import Path
 from typing import Any, Dict, List
+
+
+logger = logging.getLogger(__name__)
 
 def _load_openpyxl():
     try:
@@ -56,7 +60,7 @@ def _carry_row_style(ws, src_row: int, dst_row: int, min_col: int, max_col: int)
     try:
         ws.row_dimensions[dst_row].height = ws.row_dimensions[src_row].height
     except Exception:
-        pass
+        logger.warning("Suppressed exception in _carry_row_style.", exc_info=True)
 
 def _carry_col_style(ws, src_col: int, dst_col: int, min_row: int, max_row: int):
     for row in range(min_row, max_row + 1):
@@ -66,7 +70,7 @@ def _carry_col_style(ws, src_col: int, dst_col: int, min_row: int, max_row: int)
     try:
         ws.column_dimensions[ws.cell(row=1, column=dst_col).column_letter].width = ws.column_dimensions[ws.cell(row=1, column=src_col).column_letter].width
     except Exception:
-        pass
+        logger.warning("Suppressed exception in _carry_col_style.", exc_info=True)
 
 def _apply_ops_openpyxl(*, wb, plan: Dict[str, Any], is_new: bool) -> List[Dict[str, Any]]:
     _load, _wb_cls, range_boundaries, Translator, DefinedName = _load_openpyxl()
@@ -335,7 +339,7 @@ def _apply_ops_openpyxl(*, wb, plan: Dict[str, Any], is_new: bool) -> List[Dict[
                 try:
                     w.row_dimensions[target_row].height = w.row_dimensions[template_row].height
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _apply_ops_openpyxl.", exc_info=True)
 
                 # copy formulas (translate relative references)
                 if copy_formulas:

@@ -20,6 +20,7 @@ class RuntimePaths:
     artifacts_dir: Path
     runs_dir: Path
     state_dir: Path
+    history_file: Path
     index_dir: Path
     cache_dir: Path
     tmp_dir: Path
@@ -28,6 +29,7 @@ class RuntimePaths:
     def for_project(project_root: Path) -> "RuntimePaths":
         project_root = project_root.expanduser().resolve()
         system_dir = project_root / ".aura"
+        state_dir = system_dir / "state"
         return RuntimePaths(
             project_root=project_root,
             system_dir=system_dir,
@@ -40,7 +42,8 @@ class RuntimePaths:
             events_dir=system_dir / "events",
             artifacts_dir=system_dir / "artifacts",
             runs_dir=system_dir / "runs",
-            state_dir=system_dir / "state",
+            state_dir=state_dir,
+            history_file=state_dir / "history.txt",
             index_dir=system_dir / "index",
             cache_dir=system_dir / "cache",
             tmp_dir=system_dir / "tmp",

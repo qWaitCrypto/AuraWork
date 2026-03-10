@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 
 import base64
 import json
@@ -36,6 +37,8 @@ from .types import (
     ToolCall,
     ToolCallDelta,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _dedupe_tool_calls(calls: list[ToolCall]) -> list[ToolCall]:
@@ -206,7 +209,7 @@ def _iter_sse_json(resp: Any) -> Iterator[dict[str, Any]]:
                 data = dict(data)
                 data["type"] = current_event
             except Exception:
-                pass
+                logger.warning("Suppressed exception in _flush.", exc_info=True)
         # Some gateways wrap as {"event": "...", "data": {...}}.
         ev_name = data.get("event")
         ev_data = data.get("data")
@@ -283,7 +286,7 @@ def _responses_sse_dicts_to_events(
             try:
                 on_provider_chunk(ev)
             except Exception:
-                pass
+                logger.warning("Suppressed exception in _responses_sse_dicts_to_events.", exc_info=True)
 
         event_type = ev.get("type") or ev.get("event")
         if event_type is None and isinstance(ev.get("response"), (dict, list)):
@@ -448,9 +451,9 @@ def _httpx_post_json(
                         },
                     )
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _httpx_post_json.", exc_info=True)
         except Exception:
-            pass
+            logger.warning("Suppressed exception in _httpx_post_json.", exc_info=True)
         raise _wrap_httpx_like_exception(
             e,
             provider_kind=provider_kind,
@@ -500,14 +503,14 @@ def _httpx_stream_responses(
                         },
                     )
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _httpx_stream_responses.", exc_info=True)
         except Exception:
-            pass
+            logger.warning("Suppressed exception in _httpx_stream_responses.", exc_info=True)
         if trace is not None:
             try:
                 trace.record_error(e, code=classify_provider_exception(e).value)  # type: ignore[name-defined]
             except Exception:
-                pass
+                logger.warning("Suppressed exception in _httpx_stream_responses.", exc_info=True)
         raise _wrap_httpx_like_exception(
             e,
             provider_kind=provider_kind,
@@ -522,11 +525,11 @@ def _httpx_stream_responses(
         try:
             stream_ctx.__exit__(None, None, None)
         except Exception:
-            pass
+            logger.warning("Suppressed exception in _httpx_stream_responses.", exc_info=True)
         try:
             client.close()
         except Exception:
-            pass
+            logger.warning("Suppressed exception in _httpx_stream_responses.", exc_info=True)
 
 
 def _token_supports_openai_responses(token: str) -> bool:
@@ -766,7 +769,7 @@ def complete_openai_codex(
                     try:
                         trace.record_error(e, code=e.code.value)
                     except Exception:
-                        pass
+                        logger.warning("Suppressed exception in complete_openai_codex.", exc_info=True)
                 if (
                     not _is_openai_platform_base_url(profile.base_url)
                     and e.code in {LLMErrorCode.BAD_REQUEST, LLMErrorCode.NOT_FOUND, LLMErrorCode.UNPROCESSABLE}
@@ -775,7 +778,7 @@ def complete_openai_codex(
                         try:
                             trace.record_meta(fallback="responses_unavailable:chat_completions")
                         except Exception:
-                            pass
+                            logger.warning("Suppressed exception in complete_openai_codex.", exc_info=True)
                     return _fallback_complete_chat_completions()
                 if e.code == LLMErrorCode.PERMISSION and _should_retry_blocked_without_tools(request=request):
                     fallback_req = _blocked_fallback_request(request)
@@ -794,7 +797,7 @@ def complete_openai_codex(
                             )
                             trace.record_meta(fallback="permission_blocked:minimal_instructions_no_tools")
                         except Exception:
-                            pass
+                            logger.warning("Suppressed exception in complete_openai_codex.", exc_info=True)
                     return _finalize_response_from_stream_events(
                         provider_kind=ProviderKind.OPENAI_CODEX,
                         profile_id=profile.profile_id,
@@ -838,7 +841,7 @@ def complete_openai_codex(
                         trace.record_error(e, code=classify_provider_exception(e).value)  # type: ignore[name-defined]
                         trace.record_meta(fallback="responses_unavailable:chat_completions")
                     except Exception:
-                        pass
+                        logger.warning("Suppressed exception in complete_openai_codex.", exc_info=True)
                 return _fallback_complete_chat_completions()
             raise wrap_provider_exception(
                 e,
@@ -870,7 +873,7 @@ def complete_openai_codex(
                         )
                         trace.record_meta(fallback="permission_blocked:minimal_instructions_no_tools")
                     except Exception:
-                        pass
+                        logger.warning("Suppressed exception in complete_openai_codex.", exc_info=True)
                 try:
                     raw_stream = client.responses.create(**fallback_payload, timeout=request_timeout_s)
                 except openai.OpenAIError as e2:
@@ -894,7 +897,7 @@ def complete_openai_codex(
                 try:
                     trace.record_error(e, code=classify_provider_exception(e).value)  # type: ignore[name-defined]
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in complete_openai_codex.", exc_info=True)
             raise wrap_provider_exception(
                 e,
                 provider_kind=profile.provider_kind,
@@ -928,7 +931,7 @@ def complete_openai_codex(
                 try:
                     trace.record_error(e, code=classify_provider_exception(e).value)  # type: ignore[name-defined]
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in complete_openai_codex.", exc_info=True)
             raise wrap_provider_exception(
                 e,
                 provider_kind=profile.provider_kind,
@@ -941,7 +944,7 @@ def complete_openai_codex(
                 try:
                     trace.record_error(e, code=LLMErrorCode.RESPONSE_VALIDATION.value)  # type: ignore[attr-defined]
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in complete_openai_codex.", exc_info=True)
             raise LLMRequestError(
                 str(e),
                 code=LLMErrorCode.RESPONSE_VALIDATION,
@@ -957,7 +960,7 @@ def complete_openai_codex(
                 try:
                     trace.record_error(e, code=LLMErrorCode.NETWORK_ERROR.value)  # best-effort
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in complete_openai_codex.", exc_info=True)
             raise _wrap_httpx_like_exception(
                 e,
                 provider_kind=profile.provider_kind,
@@ -1108,7 +1111,7 @@ def stream_openai_codex(
                             )
                             trace.record_meta(fallback="permission_blocked:minimal_instructions_no_tools:chat_completions")
                         except Exception:
-                            pass
+                            logger.warning("Suppressed exception in _fallback_stream_chat_completions.", exc_info=True)
                     try:
                         raw_stream = client.chat.completions.create(**fallback_payload, timeout=request_timeout_s)
                     except Exception as e2:
@@ -1181,13 +1184,13 @@ def stream_openai_codex(
                     )
             finally:
                 try:
-                    wd_stop()
+                    wd_stop.set()
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
                 try:
-                    stop_closer()
+                    stop_closer.set()
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
                 _maybe_close_stream(raw_stream)
 
         payload = OpenAICodexAdapter().prepare_request(profile, request).json
@@ -1239,7 +1242,7 @@ def stream_openai_codex(
                     try:
                         trace.record_error(e, code=e.code.value)
                     except Exception:
-                        pass
+                        logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
                 if (
                     not _is_openai_platform_base_url(profile.base_url)
                     and e.code in {LLMErrorCode.BAD_REQUEST, LLMErrorCode.NOT_FOUND, LLMErrorCode.UNPROCESSABLE}
@@ -1248,7 +1251,7 @@ def stream_openai_codex(
                         try:
                             trace.record_meta(fallback="responses_unavailable:chat_completions")
                         except Exception:
-                            pass
+                            logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
                     yield from _fallback_stream_chat_completions()
                     return
                 if e.code == LLMErrorCode.PERMISSION and _should_retry_blocked_without_tools(request=request):
@@ -1268,7 +1271,7 @@ def stream_openai_codex(
                             )
                             trace.record_meta(fallback="permission_blocked:minimal_instructions_no_tools")
                         except Exception:
-                            pass
+                            logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
                     yield from _responses_sse_dicts_to_events(
                         provider_kind=ProviderKind.OPENAI_CODEX,
                         profile_id=profile.profile_id,
@@ -1308,7 +1311,7 @@ def stream_openai_codex(
                         trace.record_error(e, code=classify_provider_exception(e).value)  # type: ignore[name-defined]
                         trace.record_meta(fallback="responses_unavailable:chat_completions")
                     except Exception:
-                        pass
+                        logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
                 yield from _fallback_stream_chat_completions()
                 return
             raise wrap_provider_exception(
@@ -1340,7 +1343,7 @@ def stream_openai_codex(
                         )
                         trace.record_meta(fallback="permission_blocked:minimal_instructions_no_tools")
                     except Exception:
-                        pass
+                        logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
                 try:
                     raw_stream = client.responses.create(**fallback_payload, timeout=request_timeout_s)
                 except openai.OpenAIError as e2:
@@ -1348,7 +1351,7 @@ def stream_openai_codex(
                         try:
                             trace.record_error(e2, code=classify_provider_exception(e2).value)  # type: ignore[name-defined]
                         except Exception:
-                            pass
+                            logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
                     raise wrap_provider_exception(
                         e2,
                         provider_kind=profile.provider_kind,
@@ -1361,7 +1364,7 @@ def stream_openai_codex(
                     try:
                         trace.record_error(e, code=classify_provider_exception(e).value)  # type: ignore[name-defined]
                     except Exception:
-                        pass
+                        logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
                 raise wrap_provider_exception(
                     e,
                     provider_kind=profile.provider_kind,
@@ -1374,7 +1377,7 @@ def stream_openai_codex(
                 try:
                     trace.record_error(e, code=classify_provider_exception(e).value)  # type: ignore[name-defined]
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
             raise wrap_provider_exception(
                 e,
                 provider_kind=profile.provider_kind,
@@ -1429,7 +1432,7 @@ def stream_openai_codex(
                 try:
                     trace.record_error(e, code=classify_provider_exception(e).value)  # type: ignore[name-defined]
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
             raise wrap_provider_exception(
                 e,
                 provider_kind=profile.provider_kind,
@@ -1442,7 +1445,7 @@ def stream_openai_codex(
                 try:
                     trace.record_error(e, code=LLMErrorCode.RESPONSE_VALIDATION.value)  # type: ignore[attr-defined]
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
             raise LLMRequestError(
                 str(e),
                 code=LLMErrorCode.RESPONSE_VALIDATION,
@@ -1458,7 +1461,7 @@ def stream_openai_codex(
                 try:
                     trace.record_error(e, code=LLMErrorCode.NETWORK_ERROR.value)  # best-effort
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
             raise _wrap_httpx_like_exception(
                 e,
                 provider_kind=profile.provider_kind,
@@ -1468,13 +1471,13 @@ def stream_openai_codex(
             ) from e
         finally:
             try:
-                wd_stop()
+                wd_stop.set()
             except Exception:
-                pass
+                logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
             try:
-                stop_closer()
+                stop_closer.set()
             except Exception:
-                pass
+                logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
             _maybe_close_stream(raw_stream)
         return
 
@@ -1514,7 +1517,7 @@ def stream_openai_codex(
                     )
                     trace.record_meta(fallback="permission_blocked:minimal_instructions_no_tools:chat_completions")
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
             try:
                 raw_stream = client.chat.completions.create(**fallback_payload, timeout=request_timeout_s)
             except Exception as e2:
@@ -1587,11 +1590,11 @@ def stream_openai_codex(
             )
     finally:
         try:
-            wd_stop()
+            wd_stop.set()
         except Exception:
-            pass
+            logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
         try:
-            stop_closer()
+            stop_closer.set()
         except Exception:
-            pass
+            logger.warning("Suppressed exception in stream_openai_codex.", exc_info=True)
         _maybe_close_stream(raw_stream)

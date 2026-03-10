@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import queue
 import shutil
 import sys
@@ -10,6 +11,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, Sequence
+
+
+logger = logging.getLogger(__name__)
 
 
 class UIEventKind(str, Enum):
@@ -269,7 +273,7 @@ class ConsoleUI:
         try:
             self._q.put_nowait(event)
         except Exception:
-            pass
+            logger.warning("Failed to enqueue UI event kind=%s; event dropped.", event.kind, exc_info=True)
 
     # --- high level helpers (optional) ---
     def print_header(self, *, session_id: str) -> None:
@@ -298,13 +302,13 @@ class ConsoleUI:
                     self._tick()
             except Exception:
                 # UI must not crash the process.
-                pass
+                logger.warning("Unhandled exception in ConsoleUI render loop.", exc_info=True)
 
         # Final cleanup: clear spinner line if needed.
         try:
             self._clear_spinner_line()
         except Exception:
-            pass
+            logger.warning("Failed to clear spinner line during ConsoleUI shutdown.", exc_info=True)
 
     def _tick(self) -> None:
         if not self._ansi:
@@ -663,7 +667,7 @@ class ConsoleUI:
             try:
                 self._stream.flush()
             except Exception:
-                pass
+                logger.warning("Failed to flush ConsoleUI stream.", exc_info=True)
 
     def _println(self, s: str = "") -> None:
         self._write(s + "\n")

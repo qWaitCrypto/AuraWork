@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import fnmatch
+import logging
 import os
 import re
 import shutil
 import signal
+import shlex
 import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def _require_str(args: dict[str, Any], key: str) -> str:
@@ -73,6 +77,183 @@ def _resolve_in_project(project_root: Path, rel: str) -> Path:
     if candidate != project_root_resolved and project_root_resolved not in candidate.parents:
         raise PermissionError("Path escapes project root.")
     return candidate
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = str(os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _env_truthy(name: str) -> bool:
+    raw = str(os.environ.get(name) or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _extract_shell_command_argv(command: str) -> list[str] | None:
+    one_line = " ".join(str(command).splitlines()).strip()
+    if not one_line:
+        return None
+    try:
+        parts = shlex.split(one_line)
+    except Exception:
+        logger.warning("Failed to parse shell command argv for network inspection.", exc_info=True)
+        return None
+    if not parts:
+        return None
+    out: list[str] = []
+    for part in parts:
+        token = str(part).strip()
+        if token:
+            out.append(token)
+    return out or None
+
+
+_NETWORK_COMMANDS = {
+    "curl",
+    "wget",
+    "ftp",
+    "sftp",
+    "scp",
+    "ssh",
+    "telnet",
+    "nc",
+    "ncat",
+    "netcat",
+    "dig",
+    "nslookup",
+    "host",
+    "traceroute",
+    "mtr",
+    "ping",
+    "http",
+    "httpie",
+}
+_NETWORK_GIT_SUBCOMMANDS = {"clone", "fetch", "pull", "push", "ls-remote", "submodule"}
+
+
+def _shell_command_uses_network(command: str) -> bool:
+    argv = _extract_shell_command_argv(command)
+    if not argv:
+        return False
+
+    idx = 0
+    while idx < len(argv) and "=" in argv[idx] and not argv[idx].startswith(("/", "./", "../")):
+        key, _sep, _value = argv[idx].partition("=")
+        if not key or key.startswith("-"):
+            break
+        idx += 1
+    if idx >= len(argv):
+        return False
+
+    exe = Path(argv[idx]).name.lower()
+    if exe in _NETWORK_COMMANDS:
+        return True
+
+    if exe == "git":
+        sub_idx = idx + 1
+        while sub_idx < len(argv) and argv[sub_idx].startswith("-"):
+            sub_idx += 1
+        if sub_idx < len(argv) and argv[sub_idx].lower() in _NETWORK_GIT_SUBCOMMANDS:
+            return True
+
+    return False
+
+
+def _build_shell_env() -> dict[str, str]:
+    keep_keys = {
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LOGNAME",
+        "PATH",
+        "PWD",
+        "SHELL",
+        "TERM",
+        "TMP",
+        "TMPDIR",
+        "TEMP",
+        "TZ",
+        "USER",
+        "USERNAME",
+    }
+    keep_prefixes = ("AURA_", "NOVELAIRE_", "VIRTUAL_ENV")
+
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key in keep_keys or key.startswith(keep_prefixes):
+            env[key] = value
+
+    env.update(
+        {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+            "LESS": "-FRSX",
+            "GIT_EDITOR": "true",
+            "EDITOR": "true",
+            "PYTHONUNBUFFERED": "1",
+        }
+    )
+
+    if not env.get("PATH"):
+        fallback_path = os.defpath or "/usr/bin:/bin"
+        env["PATH"] = fallback_path
+
+    return env
+
+
+def _build_shell_preexec(*, timeout_s: float) -> Any:
+    if os.name != "posix":
+        return None
+    try:
+        import resource
+    except Exception:
+        logger.warning("`resource` module unavailable; shell limits are disabled.", exc_info=True)
+        return None
+
+    cpu_soft = _env_int("AURA_SHELL_MAX_CPU_SECONDS", max(1, int(timeout_s) + 2), minimum=1, maximum=3600)
+    cpu_hard = max(cpu_soft, _env_int("AURA_SHELL_MAX_CPU_SECONDS_HARD", cpu_soft + 1, minimum=1, maximum=3600))
+    as_soft = _env_int("AURA_SHELL_MAX_AS_BYTES", 1024 * 1024 * 1024, minimum=64 * 1024 * 1024, maximum=8 * 1024 * 1024 * 1024)
+    as_hard = max(as_soft, _env_int("AURA_SHELL_MAX_AS_BYTES_HARD", as_soft, minimum=64 * 1024 * 1024, maximum=8 * 1024 * 1024 * 1024))
+    fsize_soft = _env_int("AURA_SHELL_MAX_FILE_BYTES", 128 * 1024 * 1024, minimum=1024, maximum=8 * 1024 * 1024 * 1024)
+    fsize_hard = max(fsize_soft, _env_int("AURA_SHELL_MAX_FILE_BYTES_HARD", fsize_soft, minimum=1024, maximum=8 * 1024 * 1024 * 1024))
+    nproc_soft = _env_int("AURA_SHELL_MAX_PROCS", 64, minimum=1, maximum=2048)
+    nproc_hard = max(nproc_soft, _env_int("AURA_SHELL_MAX_PROCS_HARD", nproc_soft, minimum=1, maximum=2048))
+    nofile_soft = _env_int("AURA_SHELL_MAX_OPEN_FILES", 256, minimum=32, maximum=4096)
+    nofile_hard = max(nofile_soft, _env_int("AURA_SHELL_MAX_OPEN_FILES_HARD", nofile_soft, minimum=32, maximum=8192))
+
+    def _set_limit(limit_name: str, soft: int, hard: int) -> None:
+        limit = getattr(resource, limit_name, None)
+        if limit is None:
+            return
+        try:
+            resource.setrlimit(limit, (soft, hard))
+        except Exception:
+            logger.warning(
+                "Failed to set shell limit %s (%s, %s).",
+                limit_name,
+                soft,
+                hard,
+                exc_info=True,
+            )
+            return
+
+    def _preexec() -> None:
+        _set_limit("RLIMIT_CORE", 0, 0)
+        _set_limit("RLIMIT_CPU", cpu_soft, cpu_hard)
+        _set_limit("RLIMIT_AS", as_soft, as_hard)
+        _set_limit("RLIMIT_FSIZE", fsize_soft, fsize_hard)
+        _set_limit("RLIMIT_NPROC", nproc_soft, nproc_hard)
+        _set_limit("RLIMIT_NOFILE", nofile_soft, nofile_hard)
+
+    return _preexec
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,34 +519,58 @@ class ShellRunTool:
         shell = os.environ.get("SHELL")
         if not shell:
             shell = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
-        shell_flag = "-lc" if os.path.basename(shell) in {"bash", "zsh"} else "-c"
-
-        env = dict(os.environ)
-        env.update(
-            {
-                "GIT_TERMINAL_PROMPT": "0",
-                "GIT_PAGER": "cat",
-                "PAGER": "cat",
-                "LESS": "-FRSX",
-                "GIT_EDITOR": "true",
-                "EDITOR": "true",
-                "PYTHONUNBUFFERED": "1",
+        shell_flag = "-c"
+        env = _build_shell_env()
+        preexec_fn = _build_shell_preexec(timeout_s=timeout_s)
+        if _shell_command_uses_network(command) and not _env_truthy("AURA_SHELL_ALLOW_NETWORK"):
+            return {
+                "ok": False,
+                "command": command,
+                "cwd": str(Path(cwd_rel)),
+                "shell": shell,
+                "timed_out": False,
+                "exit_code": None,
+                "duration_ms": 0,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "stdout": "",
+                "stderr": "",
+                "error_code": "permission",
+                "error": "Networked shell commands are disabled (set AURA_SHELL_ALLOW_NETWORK=1 to override).",
             }
-        )
 
         started = time.monotonic()
-        proc = subprocess.Popen(
-            [shell, shell_flag, command],
-            cwd=str(cwd_path),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-            start_new_session=True,
-        )
+        try:
+            proc = subprocess.Popen(
+                [shell, shell_flag, command],
+                cwd=str(cwd_path),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                start_new_session=True,
+                preexec_fn=preexec_fn,
+            )
+        except Exception:
+            logger.warning("Failed to launch shell command in cwd=%s", cwd_path, exc_info=True)
+            return {
+                "ok": False,
+                "command": command,
+                "cwd": str(Path(cwd_rel)),
+                "shell": shell,
+                "timed_out": False,
+                "exit_code": None,
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "stdout": "",
+                "stderr": "",
+                "error_code": "exec_failed",
+                "error": "Failed to launch shell command.",
+            }
 
         def _truncate(s: str) -> tuple[str, bool]:
             if len(s) <= max_output_chars:
@@ -380,6 +585,7 @@ class ShellRunTool:
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
             except Exception:
+                logger.warning("Failed to send SIGTERM to timed out shell process group pid=%s", proc.pid, exc_info=True)
                 proc.terminate()
             try:
                 stdout, stderr = proc.communicate(timeout=1.0)
@@ -387,6 +593,7 @@ class ShellRunTool:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except Exception:
+                    logger.warning("Failed to send SIGKILL to shell process group pid=%s", proc.pid, exc_info=True)
                     proc.kill()
                 stdout, stderr = proc.communicate()
 

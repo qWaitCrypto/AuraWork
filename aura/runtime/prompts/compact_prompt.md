@@ -10,11 +10,12 @@ Constraints:
 - Prefer short, actionable excerpts over long logs/tool outputs; keep only what matters for continuation.
 
 This project is Aura (a local-first agent CLI). The snapshot MUST preserve:
-- User goal and preferences (language, formatting constraints, “don’t touch X”, safety/approval preferences).
+- User goal and preferences (language, formatting constraints, "don't touch X", safety/approval preferences).
 - Runtime state (session identifiers if relevant, pending approvals, selected model/profile, engine backend if relevant).
 - Tool actions (important tool calls, key outputs, and any failures + resolutions).
 - File system state (important files created/modified/deleted, with paths and why they matter).
 - Spec workflow state (if OpenSpec/spec tools were used: change-id, tasks status, decisions).
+- DAG plan state (if `update_plan` was used: the DAG goal, every node's id + step + status, and which node was last dispatched — this is critical for resuming `dag__execute_next` correctly).
 
 The structure MUST be as follows:
 
@@ -50,6 +51,7 @@ The structure MUST be as follows:
 
     <current_plan>
         <!-- The agent's step-by-step plan. Mark completed steps. -->
+        <!-- If a DAG plan is active, include: the goal, each node's id + step + status (pending/in_progress/completed), and the last dispatched node id. This is required for dag__execute_next to resume correctly. -->
         <!-- Example:
          1. [DONE] ...
          2. [IN PROGRESS] ...

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 
 import json
 import os
@@ -11,6 +12,8 @@ from ..ids import now_ts_ms
 from .config_io import parse_env_text
 from .types import CanonicalRequest, LLMResponse, LLMStreamEvent, ProviderKind
 
+
+logger = logging.getLogger(__name__)
 
 def _replace_surrogates(text: str) -> str:
     out: list[str] = []
@@ -62,18 +65,18 @@ def _to_jsonable(obj: Any) -> Any:
         try:
             return _to_jsonable(model_dump())
         except Exception:
-            pass
+            logger.warning("Suppressed exception in _to_jsonable.", exc_info=True)
     to_dict = getattr(obj, "to_dict", None)
     if callable(to_dict):
         try:
             return _to_jsonable(to_dict())
         except Exception:
-            pass
+            logger.warning("Suppressed exception in _to_jsonable.", exc_info=True)
     if hasattr(obj, "__dict__"):
         try:
             return _to_jsonable(vars(obj))
         except Exception:
-            pass
+            logger.warning("Suppressed exception in _to_jsonable.", exc_info=True)
     return {"__type__": type(obj).__name__, "__repr__": repr(obj)}
 
 

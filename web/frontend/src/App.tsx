@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Bot,
   History,
@@ -7,8 +7,10 @@ import {
   Monitor,
   Settings,
 } from "lucide-react";
-import type { AuraEvent, PlanEnvelope, PlanStep, SessionSummary, TakeoverContext, WorkspaceRecord } from "./lib/types";
+import type { PlanEnvelope, PlanStep, SessionSummary, TakeoverContext, WorkspaceRecord } from "./lib/types";
 import { wsSend } from "./lib/ws";
+import { basename } from "./lib/path";
+import { fmtElapsed, fmtTime } from "./lib/timeFormat";
 import { useArtifactStore, useArtifactSessionFetched, useArtifactSessionLoading, useArtifactSessionTexts } from "./store/artifactStore";
 import { useEventStore } from "./store/eventStore";
 import { useUiStore } from "./store/uiStore";
@@ -22,95 +24,14 @@ import { Topbar } from "./components/Topbar";
 import { ChatInput } from "./components/ChatInput";
 import { WorkspacePickerModal } from "./components/WorkspacePickerModal";
 import { ApprovalModal } from "./components/ApprovalModal";
+import { SettingsModal } from "./components/SettingsModal";
 import { useBrowserInput } from "./hooks/useBrowserInput";
 import { useSessionWs } from "./hooks/useSessionWs";
 import { useBrowserStream } from "./hooks/useBrowserStream";
-
-function fmtTime(ms: number) {
-  try {
-    return new Date(ms).toLocaleTimeString();
-  } catch {
-    return "";
-  }
-}
-
-function fmtElapsed(ms: number) {
-  const total = Math.max(0, Math.floor(ms / 1000));
-  const hh = Math.floor(total / 3600);
-  const mm = Math.floor((total % 3600) / 60);
-  const ss = total % 60;
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${pad(hh)}:${pad(mm)}:${pad(ss)}`;
-}
-
-function basename(p: string) {
-  const s = String(p || "");
-  const parts = s.split(/[/\\\\]/).filter(Boolean);
-  return parts[parts.length - 1] || s || "workspace";
-}
-
-type ChatMessage = {
-  id: string;
-  role: "user" | "assistant" | "system";
-  ts: number;
-  locator?: string;
-  summary?: string;
-  text?: string;
-  requestId?: string | null;
-  turnId?: string | null;
-};
-
-type TimelineRow = {
-  key: string;
-  kind: "llm" | "tool" | "plan" | "approval" | "error";
-  title: string;
-  subtitle?: string;
-  status?: "running" | "succeeded" | "failed" | "blocked" | "needs_approval" | "cancelled" | "unknown";
-  startedAt?: number;
-  endedAt?: number;
-  durationMs?: number;
-  toolRunId?: string;
-  count?: number;
-  onOpenTab?: "plan" | "terminal";
-  details?: string;
-  thinkingLocator?: string;
-};
-
-type TimelineCard = {
-  id: string;
-  ts: number;
-  requestId?: string | null;
-  turnId?: string | null;
-  rows: TimelineRow[];
-};
-
-type ChatItem =
-  | { kind: "message"; msg: ChatMessage }
-  | { kind: "timeline"; card: TimelineCard };
-
-type WorkSpecView = {
-  goal?: string;
-  expectedOutputs: string[];
-  workspaceRoots: string[];
-  domainAllowlist: string[];
-  fileTypeAllowlist: string[];
-};
-
-type ToolRun = {
-  id: string;
-  tool: string;
-  summary: string;
-  startedAt: number;
-  endedAt?: number;
-  durationMs?: number;
-  status: "running" | "succeeded" | "failed" | "blocked" | "needs_approval" | "cancelled" | "unknown";
-  preset?: string;
-  subagentRunId?: string;
-  browserAgentSession?: string;
-  requestId?: string | null;
-  turnId?: string | null;
-  workSpec?: WorkSpecView;
-};
+import { useChatTimeline } from "./hooks/useChatTimeline";
+import type { ChatMessage, ToolRun } from "./types";
+import { parseWorkSpecView } from "./lib/workSpecView";
+import { normalizeToolEndStatus } from "./lib/toolStatus";
 
 type ViewMode = "work" | "stage";
 type ThemeMode = "light" | "dark";
@@ -129,167 +50,6 @@ function resolveInitialTheme(): ThemeMode {
 
   return "light";
 }
-
-
-function toolCategory(toolName: string) {
-  if (
-    [
-      "project__read_text",
-      "project__read_text_many",
-      "project__search_text",
-      "project__list_dir",
-      "project__glob",
-      "project__text_stats",
-      "session__search",
-      "web__fetch",
-      "web__search",
-      "mcp__list_servers",
-      "mcp__list_tools",
-    ].includes(toolName) ||
-    toolName.startsWith("skill__")
-  )
-    return "Explored";
-  if (["project__apply_patch", "project__apply_edits", "project__patch"].includes(toolName)) return "Edited";
-  if (toolName === "update_plan") return "Planned";
-  if (toolName === "update_todo") return "Todo";
-  if (toolName.startsWith("spec__")) return "Spec";
-  if (toolName === "session__export") return "Ran";
-  if (toolName === "shell__run") return "Ran";
-  return "Tools";
-}
-
-function normalizeToolEndStatus(rawStatus: string | null | undefined):
-  | "running"
-  | "succeeded"
-  | "failed"
-  | "blocked"
-  | "needs_approval"
-  | "cancelled"
-  | "unknown" {
-  const st = String(rawStatus || "").trim().toLowerCase();
-  if (!st) return "unknown";
-  if (st === "running") return "running";
-  if (["ok", "success", "succeeded", "completed", "done"].includes(st)) return "succeeded";
-  if (["cancelled", "canceled"].includes(st)) return "cancelled";
-  if (["needs_approval", "require_approval", "requires_approval", "pending_approval"].includes(st)) return "needs_approval";
-  if (["blocked", "denied"].includes(st)) return "blocked";
-  if (["failed", "error"].includes(st)) return "failed";
-  return "unknown";
-}
-
-
-function cleanText(raw: unknown, maxLen = 240): string | undefined {
-  if (typeof raw !== "string") return undefined;
-  const text = raw.replace(/\s+/g, " ").trim();
-  if (!text) return undefined;
-  if (text.length <= maxLen) return text;
-  return `${text.slice(0, maxLen - 1)}…`;
-}
-
-function cleanStringList(raw: unknown, limit = 4, itemMaxLen = 120): string[] {
-  if (!Array.isArray(raw)) return [];
-  const out: string[] = [];
-  for (const item of raw) {
-    const value = cleanText(item, itemMaxLen);
-    if (!value) continue;
-    out.push(value);
-    if (out.length >= limit) break;
-  }
-  return out;
-}
-
-function parseWorkSpecView(raw: unknown): WorkSpecView | undefined {
-  if (!raw || typeof raw !== "object") return undefined;
-  const ws = raw as Record<string, unknown>;
-  const goal = cleanText(ws.goal, 220);
-
-  const expectedOutputs = Array.isArray(ws.expected_outputs)
-    ? ws.expected_outputs
-      .map((item) => {
-        if (!item || typeof item !== "object") return undefined;
-        const rec = item as Record<string, unknown>;
-        const outputType = cleanText(rec.type, 40);
-        const outputPath = cleanText(rec.path, 120);
-        if (outputType && outputPath) return `${outputType}: ${outputPath}`;
-        return outputPath || outputType || cleanText(rec.format, 60);
-      })
-      .filter((item): item is string => Boolean(item))
-      .slice(0, 6)
-    : [];
-
-  const scopeRaw = ws.resource_scope && typeof ws.resource_scope === "object" ? (ws.resource_scope as Record<string, unknown>) : {};
-  const workspaceRoots = cleanStringList(scopeRaw.workspace_roots, 4, 120);
-  const domainAllowlist = cleanStringList(scopeRaw.domain_allowlist, 4, 100);
-  const fileTypeAllowlist = cleanStringList(scopeRaw.file_type_allowlist, 6, 40);
-
-  if (!goal && !expectedOutputs.length && !workspaceRoots.length && !domainAllowlist.length && !fileTypeAllowlist.length) {
-    return undefined;
-  }
-
-  return {
-    goal,
-    expectedOutputs,
-    workspaceRoots,
-    domainAllowlist,
-    fileTypeAllowlist,
-  };
-}
-
-function formatWorkSpecSummary(ws?: WorkSpecView): string | undefined {
-  if (!ws) return undefined;
-  const parts: string[] = [];
-  if (ws.goal) parts.push(`goal: ${ws.goal}`);
-  if (ws.expectedOutputs.length) parts.push(`outputs: ${ws.expectedOutputs.length}`);
-  if (ws.workspaceRoots.length) parts.push(`roots: ${ws.workspaceRoots.length}`);
-  if (ws.domainAllowlist.length) parts.push(`domains: ${ws.domainAllowlist.length}`);
-  if (ws.fileTypeAllowlist.length) parts.push(`types: ${ws.fileTypeAllowlist.length}`);
-  return parts.length ? parts.join(" · ") : undefined;
-}
-
-function formatWorkSpecDetails(ws?: WorkSpecView): string | undefined {
-  if (!ws) return undefined;
-  const lines: string[] = [];
-  if (ws.goal) lines.push(`goal: ${ws.goal}`);
-  if (ws.expectedOutputs.length) lines.push(`expected_outputs:\n- ${ws.expectedOutputs.join("\n- ")}`);
-  if (ws.workspaceRoots.length) lines.push(`workspace_roots: ${ws.workspaceRoots.join(", ")}`);
-  if (ws.domainAllowlist.length) lines.push(`domain_allowlist: ${ws.domainAllowlist.join(", ")}`);
-  if (ws.fileTypeAllowlist.length) lines.push(`file_type_allowlist: ${ws.fileTypeAllowlist.join(", ")}`);
-  return lines.length ? lines.join("\n") : undefined;
-}
-
-function joinDetails(parts: Array<string | undefined>): string | undefined {
-  const rows = parts.map((item) => String(item || "").trim()).filter(Boolean);
-  return rows.length ? rows.join("\n") : undefined;
-}
-
-function normalizeApproverDecision(raw: unknown): "allow" | "deny" | "escalate" | "unknown" {
-  const value = String(raw || "").trim().toLowerCase();
-  if (!value) return "unknown";
-  if (value === "allow") return "allow";
-  if (value === "deny") return "deny";
-  if (["require_approval", "needs_approval", "escalate"].includes(value)) return "escalate";
-  return "unknown";
-}
-
-function summarizeApproverTrace(raw: unknown): string | undefined {
-  if (!raw || typeof raw !== "object") return undefined;
-  const trace = raw as Record<string, unknown>;
-  const lines: string[] = [];
-  const decision = cleanText(trace.decision ?? trace.final_decision, 40);
-  const parsed = cleanText(trace.parsed_decision ?? trace.parsed, 40);
-  const reason = cleanText(trace.reason, 260);
-  const error = cleanText(trace.error, 260);
-  const skipped = trace.skipped === true;
-
-  if (decision) lines.push(`decision: ${decision}`);
-  if (parsed) lines.push(`parsed: ${parsed}`);
-  if (skipped) lines.push("skipped: true");
-  if (error) lines.push(`error: ${error}`);
-  if (reason) lines.push(`reason: ${reason}`);
-
-  return lines.length ? lines.join("\n") : undefined;
-}
-
 
 function asRecord(raw: unknown): Record<string, unknown> | null {
   return raw && typeof raw === "object" ? (raw as Record<string, unknown>) : null;
@@ -353,16 +113,17 @@ export default function App() {
   const artifactFetched = useArtifactSessionFetched(currentSessionId);
   const artifactLoading = useArtifactSessionLoading(currentSessionId);
 
-  const ensureText = async (locator: string) => {
+  const ensureText = useCallback(async (locator: string) => {
     if (!currentSessionId) return null;
     return ensureTextRaw(currentSessionId, locator);
-  };
+  }, [currentSessionId, ensureTextRaw]);
 
   const {
     connected,
     pendingUserMessage,
     wsRef,
     sendChat: sendChatWs,
+    sendCompact: sendCompactWs,
     decideApprovalById: decideApprovalByIdWs,
     deleteSession: deleteSessionWs,
     refreshBootstrap,
@@ -387,6 +148,7 @@ export default function App() {
 
   const {
     browserFrameRef,
+    browserFrameTick,
     browserStreamState,
     browserControl,
     browserControlFocused,
@@ -405,6 +167,7 @@ export default function App() {
   });
 
   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const workspaces = bootstrap?.workspaces;
   const workspacesList: WorkspaceRecord[] = Array.isArray(workspaces) ? workspaces : [];
@@ -478,6 +241,7 @@ export default function App() {
   const liveAssistant = liveLlm.assistantText;
   const liveThinking = liveLlm.thinkingText;
   const llmRunning = liveLlm.llmRunning;
+  const llmStartedAt = liveLlm.startedAt;
 
   const chatMessages = useMemo<ChatMessage[]>(() => {
     const out: ChatMessage[] = [];
@@ -616,283 +380,12 @@ export default function App() {
   }, [events]);
 
 
-  const chatItems = useMemo<ChatItem[]>(() => {
-    const items: ChatItem[] = [];
-
-    // Group events into "runs" primarily by request_id/turn_id.
-    const groups = new Map<string, { requestId: string | null; turnId: string | null; events: AuraEvent[]; ts: number }>();
-    function groupKey(e: AuraEvent) {
-      const rid = e.request_id ?? null;
-      const tid = e.turn_id ?? null;
-      if (rid) return `r:${rid}`;
-      if (tid) return `t:${tid}`;
-      return `e:${e.event_id}`;
-    }
-
-    for (const e of events) {
-      const k = groupKey(e);
-      const g = groups.get(k);
-      if (g) {
-        g.events.push(e);
-        if (e.timestamp < g.ts) g.ts = e.timestamp;
-      } else {
-        groups.set(k, { requestId: e.request_id ?? null, turnId: e.turn_id ?? null, events: [e], ts: e.timestamp });
-      }
-    }
-
-    // Index tool runs by id for quick lookup.
-    const toolById = new Map<string, ToolRun>();
-    for (const tr of toolRuns) toolById.set(tr.id, tr);
-
-    // Create timeline cards for groups that contain relevant "reasoning" events.
-    const timelineByKey = new Map<string, TimelineCard>();
-
-    for (const [k, g] of groups.entries()) {
-      const rows: TimelineRow[] = [];
-
-      // LLM state
-      let llmStart: AuraEvent | null = null;
-      let llmEnd: AuraEvent | null = null;
-      let llmFailed: AuraEvent | null = null;
-      for (const e of g.events) {
-        if (e.kind === "llm_request_started") llmStart = e;
-        if (e.kind === "llm_response_completed") llmEnd = e;
-        if (e.kind === "llm_request_failed") llmFailed = e;
-      }
-      if (llmStart || llmEnd || llmFailed) {
-        const startedAt = llmStart?.timestamp ?? llmEnd?.timestamp ?? llmFailed?.timestamp;
-        const endedAt = (llmFailed ?? llmEnd)?.timestamp;
-        const status = llmFailed ? "failed" : llmEnd ? "succeeded" : "running";
-        const durationMs = startedAt && endedAt ? Math.max(0, endedAt - startedAt) : undefined;
-        const thinkingLocator = (() => {
-          const ref = asRecord(llmEnd?.payload.thinking_ref);
-          const loc = ref?.locator;
-          return typeof loc === "string" && loc.trim() ? loc : undefined;
-        })();
-        rows.push({
-          key: `llm:${k}`,
-          kind: "llm",
-          title: "Thinking",
-          status,
-          startedAt: startedAt ?? undefined,
-          endedAt: endedAt ?? undefined,
-          durationMs,
-          thinkingLocator,
-        });
-      }
-
-      // Tools in this group
-      const toolIds = new Set<string>();
-      for (const e of g.events) {
-        if (e.kind !== "tool_call_start" && e.kind !== "tool_call_end") continue;
-        const payload = e.payload;
-        const id = String(payload.tool_execution_id || payload.tool_call_id || e.event_id);
-        toolIds.add(id);
-      }
-      for (const id of toolIds) {
-        const tr = toolById.get(id);
-        if (!tr) continue;
-        const wsSummary = formatWorkSpecSummary(tr.workSpec);
-        const wsDetails = formatWorkSpecDetails(tr.workSpec);
-        rows.push({
-          key: `tool:${id}`,
-          kind: "tool",
-          title: tr.summary,
-          subtitle: wsSummary ? `${tr.tool} · ${wsSummary}` : tr.tool,
-          details: wsDetails,
-          status: tr.status,
-          startedAt: tr.startedAt,
-          endedAt: tr.endedAt,
-          durationMs: tr.durationMs,
-          toolRunId: tr.id,
-          onOpenTab: "terminal",
-        });
-      }
-
-      // Plan updates
-      for (const e of g.events) {
-        if (e.kind !== "plan_update") continue;
-        const planLen = Array.isArray(e.payload.plan) ? e.payload.plan.length : undefined;
-        rows.push({
-          key: `plan:${e.event_id}`,
-          kind: "plan",
-          title: "Plan updated",
-          subtitle: typeof planLen === "number" ? `${planLen} steps` : undefined,
-          startedAt: e.timestamp,
-          onOpenTab: "plan",
-        });
-      }
-
-      // Approval lifecycle (required/paused/granted/denied/resumed) + approver traces
-      for (const e of g.events) {
-        const payload = e.payload;
-
-        if (e.kind === "subagent_approver_started") {
-          const inspection = asRecord(payload.inspection);
-          const actionSummary = cleanText(inspection?.action_summary, 180) || cleanText(payload.tool_name, 80) || "Approver started";
-          const risk = cleanText(inspection?.risk_level, 40);
-          const reason = cleanText(inspection?.reason, 260);
-          const ws = parseWorkSpecView(payload.work_spec);
-          rows.push({
-            key: `approver_start:${e.event_id}`,
-            kind: "approval",
-            title: `Approver started · ${actionSummary}`,
-            subtitle: risk ? `risk: ${risk}` : undefined,
-            details: joinDetails([
-              reason ? `reason: ${reason}` : undefined,
-              formatWorkSpecDetails(ws),
-            ]),
-            status: "running",
-            startedAt: e.timestamp,
-            onOpenTab: "terminal",
-          });
-          continue;
-        }
-
-        if (e.kind === "subagent_approver_completed") {
-          const after = asRecord(payload.inspection_after);
-          const decision = normalizeApproverDecision(after?.decision);
-          const status = decision === "allow" ? "succeeded" : decision === "deny" ? "blocked" : decision === "escalate" ? "needs_approval" : "unknown";
-          const actionSummary = cleanText(after?.action_summary, 180) || cleanText(payload.tool_name, 80) || "Approver completed";
-          const reason = cleanText(after?.reason, 260);
-          const trace = summarizeApproverTrace(payload.approver_trace);
-          rows.push({
-            key: `approver_done:${e.event_id}`,
-            kind: "approval",
-            title: `Approver decision · ${decision}`,
-            subtitle: actionSummary,
-            details: joinDetails([
-              reason ? `reason: ${reason}` : undefined,
-              trace,
-            ]),
-            status,
-            startedAt: e.timestamp,
-            onOpenTab: "terminal",
-          });
-          continue;
-        }
-
-        if (e.kind === "approval_required") {
-          const actionSummary = cleanText(payload.action_summary, 180) || "Approval required";
-          const risk = cleanText(payload.risk_level, 40);
-          const reason = cleanText(payload.reason, 260);
-          const approvalId = cleanText(payload.approval_id, 120);
-          rows.push({
-            key: `approval_required:${e.event_id}`,
-            kind: "approval",
-            title: actionSummary,
-            subtitle: risk ? `risk: ${risk}` : "Approval required",
-            details: joinDetails([
-              approvalId ? `approval_id: ${approvalId}` : undefined,
-              reason ? `reason: ${reason}` : undefined,
-            ]),
-            status: "needs_approval",
-            startedAt: e.timestamp,
-            onOpenTab: "terminal",
-          });
-          continue;
-        }
-
-        if (e.kind === "run_paused") {
-          const pendingCount = Array.isArray(payload.pending_tools) ? payload.pending_tools.length : undefined;
-          rows.push({
-            key: `run_paused:${e.event_id}`,
-            kind: "approval",
-            title: "Run paused",
-            subtitle: typeof pendingCount === "number" ? `pending tools: ${pendingCount}` : "Awaiting approval",
-            details: cleanText(payload.approval_id, 120) ? `approval_id: ${String(payload.approval_id)}` : undefined,
-            status: "needs_approval",
-            startedAt: e.timestamp,
-            onOpenTab: "terminal",
-          });
-          continue;
-        }
-
-        if (e.kind === "approval_granted") {
-          const approvalId = cleanText(payload.approval_id, 120);
-          rows.push({
-            key: `approval_granted:${e.event_id}`,
-            kind: "approval",
-            title: "Approval granted",
-            subtitle: approvalId,
-            details: cleanText(payload.decision, 40) ? `decision: ${String(payload.decision)}` : undefined,
-            status: "succeeded",
-            startedAt: e.timestamp,
-            onOpenTab: "terminal",
-          });
-          continue;
-        }
-
-        if (e.kind === "approval_denied") {
-          const approvalId = cleanText(payload.approval_id, 120);
-          rows.push({
-            key: `approval_denied:${e.event_id}`,
-            kind: "approval",
-            title: "Approval denied",
-            subtitle: approvalId,
-            details: cleanText(payload.decision, 40) ? `decision: ${String(payload.decision)}` : undefined,
-            status: "blocked",
-            startedAt: e.timestamp,
-            onOpenTab: "terminal",
-          });
-          continue;
-        }
-
-        if (e.kind === "run_resumed") {
-          const pendingCount = Number.isFinite(Number(payload?.pending_tools_count)) ? Number(payload.pending_tools_count) : undefined;
-          rows.push({
-            key: `run_resumed:${e.event_id}`,
-            kind: "approval",
-            title: "Run resumed",
-            subtitle: typeof pendingCount === "number" ? `pending tools: ${pendingCount}` : undefined,
-            details: cleanText(payload.approval_id, 120) ? `approval_id: ${String(payload.approval_id)}` : undefined,
-            status: "running",
-            startedAt: e.timestamp,
-            onOpenTab: "terminal",
-          });
-        }
-      }
-
-      // Errors
-      for (const e of g.events) {
-        if (e.kind !== "operation_failed" && e.kind !== "llm_request_failed") continue;
-        const msg = String(e.payload.error || e.payload.message || e.kind);
-        rows.push({ key: `err:${e.event_id}`, kind: "error", title: msg, status: "failed", startedAt: e.timestamp });
-      }
-
-      if (rows.length) {
-        // Order rows deterministically by start time when possible.
-        rows.sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0));
-        timelineByKey.set(k, { id: `tl_${k}`, ts: g.ts, requestId: g.requestId, turnId: g.turnId, rows });
-      }
-    }
-
-    // Merge chat messages and timelines in chronological order.
-    const msgs: { ts: number; item: ChatItem }[] = [];
-    for (const m of chatMessages) msgs.push({ ts: m.ts, item: { kind: "message", msg: m } });
-    for (const tl of timelineByKey.values()) msgs.push({ ts: tl.ts, item: { kind: "timeline", card: tl } });
-    if (pendingUserMessage) {
-      msgs.push({
-        ts: pendingUserMessage.ts,
-        item: {
-          kind: "message",
-          msg: {
-            id: pendingUserMessage.id,
-            role: "user",
-            ts: pendingUserMessage.ts,
-            text: pendingUserMessage.text,
-          },
-        },
-      });
-    }
-
-    msgs.sort((a, b) => a.ts - b.ts);
-
-    // De-duplicate: if timeline is too close and empty, keep as is.
-    for (const it of msgs) items.push(it.item);
-
-    return items;
-  }, [chatMessages, events, pendingUserMessage, toolRuns]);
+  const chatItems = useChatTimeline({
+    chatMessages,
+    events,
+    pendingUserMessage,
+    toolRuns,
+  });
 
   useEffect(() => {
     const need: string[] = [];
@@ -960,6 +453,11 @@ export default function App() {
   function sendChat() {
     const text = draft.trim();
     if (!text) return;
+    if (text === "/compact") {
+      const ok = sendCompactWs();
+      if (ok) setDraft("");
+      return;
+    }
     const ok = sendChatWs(text);
     if (ok) setDraft("");
   }
@@ -1125,9 +623,11 @@ export default function App() {
   const navButtonActive = "border border-accent-100 bg-accent-50 text-accent-600 hover:bg-accent-100";
   const navButtonInactive = "text-ink-500 hover:bg-surface-100 hover:text-ink-700";
 
-  const browserFrameSrc = browserFrameRef.current.data ? `data:image/jpeg;base64,${browserFrameRef.current.data}` : null;
-  const browserFrameMeta = browserFrameRef.current.metadata;
-  const browserFrameTs = browserFrameRef.current.ts;
+  const browserFrameSrc = useMemo(
+    () => (browserFrameRef.current.data ? `data:image/jpeg;base64,${browserFrameRef.current.data}` : null),
+    [browserFrameRef, browserFrameTick],
+  );
+  const browserFrameMeta = useMemo(() => browserFrameRef.current.metadata, [browserFrameRef, browserFrameTick]);
 
   const browserInput = useBrowserInput({
     browserControl,
@@ -1189,11 +689,11 @@ export default function App() {
 
           <div className="flex-1" />
           <button
-            className="group relative flex h-10 w-10 items-center justify-center rounded-lg text-ink-500 transition-colors opacity-40 cursor-not-allowed"
+            className="group relative flex h-10 w-10 items-center justify-center rounded-lg text-ink-500 transition-colors hover:bg-surface-100 hover:text-ink-700"
             aria-label="Settings"
-            title="Coming soon"
+            title="Settings"
             type="button"
-            disabled
+            onClick={() => setSettingsOpen(true)}
           >
             <Settings className="h-5 w-5" />
             <div className="pointer-events-none absolute left-14 top-1/2 -translate-y-1/2 whitespace-nowrap rounded-lg bg-ink-900 px-2.5 py-1.5 text-xs font-medium text-white opacity-0 shadow-elevated transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
@@ -1249,11 +749,11 @@ export default function App() {
                 liveAssistant={liveAssistant}
                 liveThinking={liveThinking}
                 llmRunning={llmRunning}
+                llmStartedAt={llmStartedAt}
                 hasRunningTool={hasRunningTool}
                 toolRuns={toolRuns}
                 activeTaskTitle={activeTaskTitle}
                 onPickSuggestion={(text) => setDraft(text)}
-                fmtTime={fmtTime}
                 onOpenRightTab={(tab) => openRightTabInWorkView(tab)}
                 onScrollToToolRun={(toolRunId) => openToolRunInWorkView(toolRunId)}
               />
@@ -1288,7 +788,6 @@ export default function App() {
               sessionMeta={sessionMeta}
               onChangeApprovalMode={(mode) => wsSend(wsRef.current, { type: "settings", tool_approval_mode: mode })}
               onToggleStreaming={(enabled) => wsSend(wsRef.current, { type: "settings", llm_streaming: enabled })}
-              fmtTime={fmtTime}
             />
           </>
         ) : (
@@ -1506,11 +1005,11 @@ export default function App() {
                   liveAssistant={liveAssistant}
                   liveThinking={liveThinking}
                   llmRunning={llmRunning}
+                  llmStartedAt={llmStartedAt}
                   hasRunningTool={hasRunningTool}
                   toolRuns={toolRuns}
                   activeTaskTitle={activeTaskTitle}
                   onPickSuggestion={(text) => setDraft(text)}
-                  fmtTime={fmtTime}
                   onOpenRightTab={(tab) => openRightTabInWorkView(tab)}
                   onScrollToToolRun={(toolRunId) => openToolRunInWorkView(toolRunId)}
                 />
@@ -1531,6 +1030,8 @@ export default function App() {
         onSessionCreated={(sid) => { setCurrentSession(sid); setWorkspacePickerOpen(false); }}
         refreshBootstrap={refreshBootstrap}
       />
+
+      <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
 
       <Modal
         open={Boolean(deleteSessionTarget)}

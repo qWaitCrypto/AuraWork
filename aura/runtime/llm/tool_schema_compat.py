@@ -1,10 +1,13 @@
 from __future__ import annotations
+import logging
 
 from copy import deepcopy
 from typing import Any
 
 from .types import ModelProfile, ProviderKind, ToolSpec
 
+
+logger = logging.getLogger(__name__)
 
 def adapt_tool_specs_for_profile(*, tools: list[ToolSpec], profile: ModelProfile) -> list[ToolSpec]:
     """
@@ -72,7 +75,7 @@ def adapt_tool_specs_for_profile(*, tools: list[ToolSpec], profile: ModelProfile
                     if isinstance(files, dict) and isinstance(files.get("items"), dict):
                         files["items"] = {"type": "string"}
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in adapt_tool_specs_for_profile.", exc_info=True)
 
         out.append(ToolSpec(name=spec.name, description=spec.description, input_schema=schema))
     return out

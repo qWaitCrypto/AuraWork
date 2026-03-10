@@ -118,8 +118,7 @@ _PRESETS: dict[str, SubagentPreset] = {
         ],
         limits=SubagentLimits(max_turns=20, max_tool_calls=50),
         safe_shell_prefixes=[],
-        # Testing mode: allow browser automation without approval prompts.
-        auto_approve_tools=["browser__run"],
+        auto_approve_tools=[],
     ),
     "verifier": SubagentPreset(
         name="verifier",

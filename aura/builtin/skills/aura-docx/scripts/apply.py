@@ -5,6 +5,7 @@ Apply a DOCX plan.json (aura_plan_spec) to a DOCX package.
 This is a minimal, package-preserving OOXML patcher intended for office workflows.
 """
 from __future__ import annotations
+import logging
 
 import argparse
 import json
@@ -17,6 +18,8 @@ import xml.etree.ElementTree as ET
 
 from utilities import NS
 
+
+logger = logging.getLogger(__name__)
 
 REL_NS = {"rels": "http://schemas.openxmlformats.org/package/2006/relationships"}
 
@@ -70,7 +73,7 @@ def _ensure_document_rels_comment_rel(rels_root: ET.Element) -> str:
             try:
                 existing.append(int(rid[3:]))
             except Exception:
-                pass
+                logger.warning("Suppressed exception in _ensure_document_rels_comment_rel.", exc_info=True)
     next_id = max(existing, default=0) + 1
     rid = f"rId{next_id}"
 
@@ -251,7 +254,7 @@ def _next_comment_id(comments_root: ET.Element) -> int:
         try:
             ids.append(int(str(cid)))
         except Exception:
-            pass
+            logger.warning("Suppressed exception in _next_comment_id.", exc_info=True)
     return max(ids, default=-1) + 1
 
 

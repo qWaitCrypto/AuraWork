@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 
 import json
 from typing import Any, Iterator
@@ -13,6 +14,8 @@ from .secrets import resolve_credential
 from .trace import LLMTrace
 from .types import CanonicalRequest, LLMResponse, LLMStreamEvent, LLMStreamEventKind, ProviderKind, ToolCall
 
+
+logger = logging.getLogger(__name__)
 
 def _resolve_auth_header(*, profile) -> str:
     if profile.credential_ref is None:
@@ -117,9 +120,9 @@ def complete_gemini(
                             },
                         )
                     except Exception:
-                        pass
+                        logger.warning("Suppressed exception in complete_gemini.", exc_info=True)
         except Exception:
-            pass
+            logger.warning("Suppressed exception in complete_gemini.", exc_info=True)
         raise _wrap_httpx_like_exception(
             e,
             provider_kind=profile.provider_kind,
@@ -331,9 +334,9 @@ def stream_gemini(
                             },
                         )
                     except Exception:
-                        pass
+                        logger.warning("Suppressed exception in stream_gemini.", exc_info=True)
         except Exception:
-            pass
+            logger.warning("Suppressed exception in stream_gemini.", exc_info=True)
         raise _wrap_httpx_like_exception(
             e,
             provider_kind=profile.provider_kind,
@@ -366,7 +369,7 @@ def stream_gemini(
                 try:
                     wd_tick()
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in stream_gemini.", exc_info=True)
 
             text, thinking, tool_calls, finish, model_version, usage = _extract_chunk(
                 chunk, tool_call_index_offset=len(accumulated_tool_calls)
@@ -418,23 +421,23 @@ def stream_gemini(
     finally:
         if wd_stop is not None:
             try:
-                wd_stop()
+                wd_stop.set()
             except Exception:
-                pass
+                logger.warning("Suppressed exception in stream_gemini.", exc_info=True)
         if stop_closer is not None:
             try:
-                stop_closer()
+                stop_closer.set()
             except Exception:
-                pass
+                logger.warning("Suppressed exception in stream_gemini.", exc_info=True)
         _maybe_close_stream(resp)
         try:
             stream_ctx.__exit__(None, None, None)
         except Exception:
-            pass
+            logger.warning("Suppressed exception in stream_gemini.", exc_info=True)
         try:
             client.close()
         except Exception:
-            pass
+            logger.warning("Suppressed exception in stream_gemini.", exc_info=True)
 
     response = gemini_to_response(
         profile_id=profile.profile_id,

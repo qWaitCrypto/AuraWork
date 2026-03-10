@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from hashlib import sha256
 from pathlib import Path
@@ -9,7 +10,11 @@ from typing import Any, Iterator
 from ..approval import ApprovalRecord, ApprovalStatus
 from ..ids import new_id, now_ts_ms
 from ..protocol import ArtifactRef, EVENT_SCHEMA_VERSION, Event, EventKind
+from ..tool_status import normalize_tool_end_status_with_legacy
 from .base import ApprovalStore, ArtifactStore, EventLogStore, SessionStore
+
+
+logger = logging.getLogger(__name__)
 
 
 def _replace_surrogates(text: str) -> str:
@@ -80,6 +85,7 @@ class FileSessionStore(SessionStore):
             try:
                 meta = json.loads(path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
+                logger.warning("Failed to parse session metadata JSON: %s", path, exc_info=True)
                 continue
             if _matches_filters(meta, filters):
                 out.append(meta)
@@ -152,35 +158,6 @@ class FileEventLogStore(EventLogStore):
         self._artifact_store = artifact_store
         self._session_store = session_store
 
-    @staticmethod
-    def _normalize_tool_end_status(status: str | None) -> tuple[str, str | None]:
-        raw = str(status or "").strip()
-        if not raw:
-            return ("unknown", None)
-        key = raw.lower()
-        mapping = {
-            "ok": "succeeded",
-            "success": "succeeded",
-            "succeeded": "succeeded",
-            "completed": "succeeded",
-            "done": "succeeded",
-            "error": "failed",
-            "failed": "failed",
-            "cancelled": "cancelled",
-            "canceled": "cancelled",
-            "denied": "blocked",
-            "blocked": "blocked",
-            "needs_approval": "needs_approval",
-            "require_approval": "needs_approval",
-            "requires_approval": "needs_approval",
-            "pending_approval": "needs_approval",
-            "running": "running",
-        }
-        normalized = mapping.get(key, "unknown")
-        if normalized == key:
-            return (normalized, None)
-        return (normalized, raw)
-
     def _normalize_event_for_read(self, event: Event) -> Event:
         payload = dict(event.payload or {})
         if not isinstance(payload.get("source"), str) or not payload.get("source"):
@@ -188,7 +165,9 @@ class FileEventLogStore(EventLogStore):
 
         if event.kind == EventKind.TOOL_CALL_END.value:
             status = payload.get("status")
-            normalized, legacy = self._normalize_tool_end_status(str(status) if status is not None else None)
+            normalized, legacy = normalize_tool_end_status_with_legacy(
+                str(status) if status is not None else None
+            )
             if legacy and legacy.lower() != normalized:
                 payload.setdefault("status_legacy", legacy)
             payload["status"] = normalized
@@ -203,6 +182,12 @@ class FileEventLogStore(EventLogStore):
                         data = self._artifact_store.get(ref)
                         payload["final_text"] = data.decode("utf-8", errors="replace")
                     except Exception:
+                        logger.warning(
+                            "Failed to resolve final_text from output_ref for event_id=%s session_id=%s",
+                            event.event_id,
+                            event.session_id,
+                            exc_info=True,
+                        )
                         payload["final_text"] = ""
                 else:
                     payload["final_text"] = ""
@@ -246,6 +231,12 @@ class FileEventLogStore(EventLogStore):
                 try:
                     raw = json.loads(line)
                 except json.JSONDecodeError:
+                    logger.warning(
+                        "Failed to parse event JSON line for session_id=%s at store=%s",
+                        session_id,
+                        path,
+                        exc_info=True,
+                    )
                     continue
                 event = Event.from_dict(raw)
                 seq = event.sequence
@@ -352,10 +343,12 @@ class FileApprovalStore(ApprovalStore):
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
+                logger.warning("Failed to parse approval JSON: %s", path, exc_info=True)
                 continue
             try:
                 rec = ApprovalRecord.from_dict(raw)
             except Exception:
+                logger.warning("Failed to decode approval record: %s", path, exc_info=True)
                 continue
             if rec.session_id != session_id:
                 continue
@@ -392,7 +385,7 @@ def _scan_for_artifact_refs(value: Any) -> Iterator[ArtifactRef]:
             try:
                 yield ArtifactRef.from_dict(value)
             except Exception:
-                pass
+                logger.warning("Failed to parse artifact reference while scanning event payload.", exc_info=True)
         for v in value.values():
             yield from _scan_for_artifact_refs(v)
     elif isinstance(value, list):

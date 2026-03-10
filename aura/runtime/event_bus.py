@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass
 from typing import Callable
@@ -12,6 +13,7 @@ from .protocol import EVENT_SCHEMA_VERSION
 from .stores import EventLogStore
 
 EventHandler = Callable[[Event], None]
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,7 +198,11 @@ class EventBus:
                 try:
                     handler(emergency)
                 except Exception:
-                    pass
+                    logger.warning(
+                        "EventBus emergency handler raised during append-failure notify for event_id=%s",
+                        emergency.event_id,
+                        exc_info=True,
+                    )
 
 
 @dataclass(frozen=True, slots=True)

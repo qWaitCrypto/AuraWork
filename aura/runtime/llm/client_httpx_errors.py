@@ -1,8 +1,11 @@
 from __future__ import annotations
+import logging
 
 from .errors import LLMErrorCode, LLMRequestError
 from .types import ProviderKind
 
+
+logger = logging.getLogger(__name__)
 
 def _wrap_httpx_like_exception(
     exc: BaseException,
@@ -65,7 +68,7 @@ def _wrap_httpx_like_exception(
         if "body_snippet" in locals() and isinstance(body_snippet, str) and body_snippet:
             message = f"{message}\n\nProvider response (truncated):\n{body_snippet}"
     except Exception:
-        pass
+        logger.warning("Suppressed exception in _wrap_httpx_like_exception.", exc_info=True)
     return LLMRequestError(
         message,
         code=code,

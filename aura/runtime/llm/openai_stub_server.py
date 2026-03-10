@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 
 import json
 import threading
@@ -7,6 +8,8 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+
+logger = logging.getLogger(__name__)
 
 def _read_json_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     length_raw = handler.headers.get("content-length")
@@ -222,11 +225,11 @@ class OpenAIStubServer:
         try:
             self._server.shutdown()
         except Exception:
-            pass
+            logger.warning("Suppressed exception in stop.", exc_info=True)
         try:
             self._server.server_close()
         except Exception:
-            pass
+            logger.warning("Suppressed exception in stop.", exc_info=True)
         self._server = None
         self._thread = None
 

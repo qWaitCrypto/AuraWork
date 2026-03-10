@@ -1,15 +1,11 @@
 import React, { useState, useEffect } from "react";
+import { CheckCircle, AlertCircle } from "lucide-react";
 import { Modal } from "./Modal";
 import { Button } from "./Button";
 import { isDesktop } from "../lib/backendBase";
-import { apiRegisterWorkspace, apiCreateSession, apiBootstrap } from "../lib/api";
+import { apiRegisterWorkspace, apiCreateSession, apiBootstrap, apiGetModelSettings } from "../lib/api";
 import type { Bootstrap, WorkspaceRecord } from "../lib/types";
-
-function basename(p: string) {
-    const s = String(p || "");
-    const parts = s.split(/[/\\\\]/).filter(Boolean);
-    return parts[parts.length - 1] || s || "workspace";
-}
+import { basename } from "../lib/path";
 
 function fmtTs(ts: number | null | undefined) {
     if (typeof ts !== "number") return "";
@@ -34,10 +30,12 @@ export function WorkspacePickerModal({
     const [pathDraft, setPathDraft] = useState("");
     const [busy, setBusy] = useState(false);
     const [err, setErr] = useState<string | null>(null);
+    const [apiConfigured, setApiConfigured] = useState<boolean | null>(null);
 
     useEffect(() => {
         if (!open) return;
         refreshBootstrap().catch(() => { });
+        apiGetModelSettings().then((s) => setApiConfigured(s.configured)).catch(() => setApiConfigured(null));
     }, [open, refreshBootstrap]);
 
     async function createInWorkspace(workspaceId: string) {
@@ -122,7 +120,21 @@ export function WorkspacePickerModal({
                 </div>
 
                 <div className="rounded-xl border border-surface-200 bg-surface-50 p-3">
-                    <div className="text-xs font-semibold text-ink-700">Register New Directory</div>
+                    <div className="flex items-center justify-between">
+                        <div className="text-xs font-semibold text-ink-700">Register New Directory</div>
+                        {apiConfigured === true && (
+                            <div className="flex items-center gap-1 text-[10px] font-medium text-green-600">
+                                <CheckCircle className="h-3 w-3" />
+                                Global API configured
+                            </div>
+                        )}
+                        {apiConfigured === false && (
+                            <div className="flex items-center gap-1 text-[10px] font-medium text-amber-600">
+                                <AlertCircle className="h-3 w-3" />
+                                No global API — configure in Settings
+                            </div>
+                        )}
+                    </div>
                     <div className="mt-2 flex items-center gap-2">
                         <input
                             className="w-full rounded-lg border border-surface-200 bg-surface-0 px-3 py-2 text-sm font-mono"

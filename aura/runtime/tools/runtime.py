@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ipaddress
+import hashlib
 import json
+import logging
 import shlex
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
@@ -16,11 +18,15 @@ from ..event_bus import EventBus
 from ..protocol import ArtifactRef
 from ..error_codes import ErrorCode
 from ..models import WorkSpec
+from ..tool_status import normalize_tool_end_status
 
 from ..stores import ArtifactStore
 from .builtins import _resolve_in_project
 from .registry import ToolRegistry
 from .browser_steps import parse_browser_steps
+
+
+logger = logging.getLogger(__name__)
 
 
 class ToolRuntimeError(RuntimeError):
@@ -445,35 +451,114 @@ class ToolRuntime:
                     return True
             return False
 
+        def _extract_step_host(step: list[str]) -> str | None:
+            url = next((t for t in step[1:] if isinstance(t, str) and "://" in t), None)
+            if not isinstance(url, str) or not url:
+                return None
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"}:
+                return None
+            return parsed.hostname
+
         if planned.tool_name == "browser__run" and domains_raw:
             try:
                 steps = parse_browser_steps(planned.arguments.get("steps"))
             except Exception:
                 return None
+            domain_bound = False
+            interactive_steps = {
+                "click",
+                "dblclick",
+                "focus",
+                "press",
+                "fill",
+                "type",
+                "select",
+                "check",
+                "uncheck",
+                "keydown",
+                "keyup",
+                "drag",
+                "upload",
+                "eval",
+            }
             for step in steps:
                 if not step:
                     continue
-                if step[0] != "open":
-                    continue
-                url = next((t for t in step[1:] if isinstance(t, str) and "://" in t), None)
-                if not isinstance(url, str) or not url:
-                    continue
-                parsed = urlparse(url)
-                if parsed.scheme not in {"http", "https"}:
-                    continue
-                host = parsed.hostname
+                cmd = str(step[0] or "").strip().lower()
+                host = _extract_step_host(step)
                 if isinstance(host, str) and host and not _domain_allowed(host):
                     diff_ref = self._build_args_preview(planned, summary="Preview for blocked browser__run (WorkSpec)")
                     return InspectionResult(
-                        decision=InspectionDecision.REQUIRE_APPROVAL,
+                        decision=InspectionDecision.DENY,
                         action_summary="Blocked browser automation outside domain allowlist",
                         risk_level="high",
                         reason=f"WorkSpec scope violation: domain not in allowlist: {host}",
                         error_code=ErrorCode.PERMISSION,
                         diff_ref=diff_ref,
                     )
+                if isinstance(host, str) and host:
+                    domain_bound = True
+                if cmd in interactive_steps and not domain_bound:
+                    diff_ref = self._build_args_preview(planned, summary="Preview for blocked browser__run (WorkSpec)")
+                    return InspectionResult(
+                        decision=InspectionDecision.DENY,
+                        action_summary="Blocked browser step without verified allowlisted origin",
+                        risk_level="high",
+                        reason=(
+                            "WorkSpec scope violation: interactive browser steps require a prior open/tab navigation "
+                            "to an allowlisted domain in the same browser__run call."
+                        ),
+                        error_code=ErrorCode.PERMISSION,
+                        diff_ref=diff_ref,
+                    )
+                if cmd in interactive_steps and domain_bound:
+                    diff_ref = self._build_args_preview(
+                        planned,
+                        summary="Preview for browser__run requiring approval (WorkSpec domain_allowlist)",
+                    )
+                    return InspectionResult(
+                        decision=InspectionDecision.REQUIRE_APPROVAL,
+                        action_summary="Browser interaction under domain allowlist",
+                        risk_level="high",
+                        reason=(
+                            "WorkSpec domain_allowlist is enforced for explicit URLs, but interactive browser "
+                            "steps can trigger navigation that cannot be statically verified."
+                        ),
+                        error_code=None,
+                        diff_ref=diff_ref,
+                    )
 
         if not allowed_roots:
+            path_scoped_tools = {
+                "project__read_text",
+                "project__read_text_many",
+                "project__text_stats",
+                "project__list_dir",
+                "project__search_text",
+                "project__glob",
+                "project__apply_edits",
+                "project__apply_patch",
+                "project__patch",
+                "shell__run",
+            }
+            if planned.tool_name in path_scoped_tools:
+                logger.warning(
+                    "WorkSpec for tool=%s has no workspace_roots; path scope checks are disabled.",
+                    planned.tool_name,
+                )
+                diff_ref = self._build_args_preview(planned, summary="Preview for WorkSpec missing workspace_roots")
+                return InspectionResult(
+                    decision=InspectionDecision.REQUIRE_APPROVAL,
+                    action_summary="WorkSpec missing workspace_roots",
+                    risk_level="high",
+                    reason=(
+                        "WorkSpec scope warning: workspace_roots is empty/null, so path scope cannot be "
+                        "enforced for this tool."
+                    ),
+                    error_code=None,
+                    diff_ref=diff_ref,
+                )
             return None
 
         def _path_allowed(rel: str) -> bool:
@@ -548,12 +633,105 @@ class ToolRuntime:
                 target_paths.extend(file_paths)
             except Exception:
                 return None
+        elif planned.tool_name == "shell__run":
+            cwd_raw = planned.arguments.get("cwd")
+            if not isinstance(cwd_raw, str) or not cwd_raw.strip():
+                diff_ref = self._build_args_preview(planned, summary="Preview for blocked shell__run (WorkSpec)")
+                return InspectionResult(
+                    decision=InspectionDecision.DENY,
+                    action_summary="Blocked shell command without explicit cwd",
+                    risk_level="high",
+                    reason="WorkSpec scope violation: shell__run must set an explicit cwd under workspace_roots.",
+                    error_code=ErrorCode.PERMISSION,
+                    diff_ref=diff_ref,
+                )
+
+            cwd_rel = cwd_raw.strip()
+            target_paths.append(cwd_rel)
+
+            command_raw = planned.arguments.get("command")
+            if not isinstance(command_raw, str) or not command_raw.strip():
+                diff_ref = self._build_args_preview(planned, summary="Preview for blocked shell__run (WorkSpec)")
+                return InspectionResult(
+                    decision=InspectionDecision.DENY,
+                    action_summary="Blocked invalid shell command",
+                    risk_level="high",
+                    reason="WorkSpec scope violation: shell__run.command must be a non-empty string.",
+                    error_code=ErrorCode.BAD_REQUEST,
+                    diff_ref=diff_ref,
+                )
+
+            command = " ".join(command_raw.strip().splitlines())
+            uninspectable_markers = ("&&", "||", ";", "|", "&", ">", "<", "`", "$(", "${")
+            if any(marker in command for marker in uninspectable_markers):
+                diff_ref = self._build_args_preview(planned, summary="Preview for blocked shell__run (WorkSpec)")
+                return InspectionResult(
+                    decision=InspectionDecision.DENY,
+                    action_summary="Blocked shell command with unsupported control operators",
+                    risk_level="high",
+                    reason=(
+                        "WorkSpec scope violation: shell__run command uses control operators or redirection "
+                        "that cannot be safely scope-checked."
+                    ),
+                    error_code=ErrorCode.PERMISSION,
+                    diff_ref=diff_ref,
+                )
+
+            try:
+                parts = shlex.split(command)
+            except Exception:
+                diff_ref = self._build_args_preview(planned, summary="Preview for blocked shell__run (WorkSpec)")
+                return InspectionResult(
+                    decision=InspectionDecision.DENY,
+                    action_summary="Blocked unparsable shell command",
+                    risk_level="high",
+                    reason="WorkSpec scope violation: shell__run command could not be parsed safely.",
+                    error_code=ErrorCode.PERMISSION,
+                    diff_ref=diff_ref,
+                )
+            if not parts:
+                diff_ref = self._build_args_preview(planned, summary="Preview for blocked shell__run (WorkSpec)")
+                return InspectionResult(
+                    decision=InspectionDecision.DENY,
+                    action_summary="Blocked empty shell command",
+                    risk_level="high",
+                    reason="WorkSpec scope violation: shell__run command is empty.",
+                    error_code=ErrorCode.BAD_REQUEST,
+                    diff_ref=diff_ref,
+                )
+
+            for tok in parts[1:]:
+                token = str(tok).strip()
+                if not token or token.startswith("-"):
+                    continue
+                if token.startswith("~"):
+                    diff_ref = self._build_args_preview(planned, summary="Preview for blocked shell__run (WorkSpec)")
+                    return InspectionResult(
+                        decision=InspectionDecision.DENY,
+                        action_summary="Blocked shell path outside workspace scope",
+                        risk_level="high",
+                        reason=f"WorkSpec scope violation: shell command uses home-relative path token: {token}",
+                        error_code=ErrorCode.PERMISSION,
+                        diff_ref=diff_ref,
+                    )
+                normalized = token.replace("\\", "/")
+                token_path = Path(normalized)
+                if token_path.is_absolute() or any(part == ".." for part in token_path.parts):
+                    diff_ref = self._build_args_preview(planned, summary="Preview for blocked shell__run (WorkSpec)")
+                    return InspectionResult(
+                        decision=InspectionDecision.DENY,
+                        action_summary="Blocked shell path outside workspace scope",
+                        risk_level="high",
+                        reason=f"WorkSpec scope violation: shell command uses out-of-scope path token: {token}",
+                        error_code=ErrorCode.PERMISSION,
+                        diff_ref=diff_ref,
+                    )
 
         for rel in target_paths:
             if not _path_allowed(rel):
                 diff_ref = self._build_args_preview(planned, summary="Preview for blocked path (WorkSpec)")
                 return InspectionResult(
-                    decision=InspectionDecision.REQUIRE_APPROVAL,
+                    decision=InspectionDecision.DENY,
                     action_summary="Blocked path outside workspace scope",
                     risk_level="high",
                     reason=f"WorkSpec scope violation: path not in workspace_roots: {rel}",
@@ -565,7 +743,7 @@ class ToolRuntime:
             if not _file_type_allowed(rel):
                 diff_ref = self._build_args_preview(planned, summary="Preview for blocked file type (WorkSpec)")
                 return InspectionResult(
-                    decision=InspectionDecision.REQUIRE_APPROVAL,
+                    decision=InspectionDecision.DENY,
                     action_summary="Blocked file type outside allowlist",
                     risk_level="high",
                     reason=f"WorkSpec scope violation: file type not in allowlist: {rel}",
@@ -1102,45 +1280,18 @@ def _classify_tool_exception(exc: BaseException) -> ErrorCode:
     return ErrorCode.UNKNOWN
 
 
-_TOOL_END_STATUS_MAP: dict[str, str] = {
-    "ok": "succeeded",
-    "success": "succeeded",
-    "succeeded": "succeeded",
-    "completed": "succeeded",
-    "done": "succeeded",
-    "error": "failed",
-    "failed": "failed",
-    "cancelled": "cancelled",
-    "canceled": "cancelled",
-    "denied": "blocked",
-    "blocked": "blocked",
-    "needs_approval": "needs_approval",
-    "require_approval": "needs_approval",
-    "requires_approval": "needs_approval",
-    "pending_approval": "needs_approval",
-    "running": "running",
-}
-
-
-def _normalize_tool_end_status(status: str | None) -> str:
-    raw = str(status or "").strip().lower()
-    if not raw:
-        return "unknown"
-    return _TOOL_END_STATUS_MAP.get(raw, "unknown")
-
-
 def _status_from_error_code(*, error_code: str | None, fallback: str = "failed") -> str:
     code = str(error_code or "").strip().lower()
     if code == ErrorCode.PERMISSION.value:
         return "blocked"
     if code == ErrorCode.APPROVAL_PENDING.value:
         return "needs_approval"
-    return _normalize_tool_end_status(fallback)
+    return normalize_tool_end_status(fallback)
 
 
 def _tool_result_needs_approval(raw: dict[str, Any]) -> bool:
     status = raw.get("status")
-    if _normalize_tool_end_status(str(status) if isinstance(status, str) else None) == "needs_approval":
+    if normalize_tool_end_status(str(status) if isinstance(status, str) else None) == "needs_approval":
         return True
     blocked = raw.get("blocked_approval")
     if isinstance(blocked, (dict, list)) and blocked:
@@ -1153,7 +1304,7 @@ def _tool_result_needs_approval(raw: dict[str, Any]) -> bool:
         for v in node_results.values():
             if not isinstance(v, dict):
                 continue
-            if _normalize_tool_end_status(str(v.get("status") or "")) == "needs_approval":
+            if normalize_tool_end_status(str(v.get("status") or "")) == "needs_approval":
                 return True
     return False
 
@@ -1243,20 +1394,27 @@ def _is_under_spec_dir(path: str) -> bool:
     return normalized == "spec" or normalized.startswith("spec/")
 
 
-def _tool_approval_policy_path(project_root: Path) -> Path:
-    # Keep this in the author-visible policy dir so users can audit/edit it.
+def _legacy_tool_approval_policy_path(project_root: Path) -> Path:
     return project_root / ".aura" / "policy" / "tool_approvals.json"
 
 
+def _tool_approval_policy_path(project_root: Path) -> Path:
+    root_norm = str(project_root.expanduser().resolve())
+    key = hashlib.sha256(root_norm.encode("utf-8")).hexdigest()[:24]
+    return Path.home() / ".aura" / "policy" / "tool_approvals" / f"{key}.json"
+
+
 def _load_tool_approval_policy(project_root: Path) -> dict[str, Any]:
-    path = _tool_approval_policy_path(project_root)
-    if not path.exists():
-        return {}
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return raw if isinstance(raw, dict) else {}
+    for path in (_tool_approval_policy_path(project_root), _legacy_tool_approval_policy_path(project_root)):
+        if not path.exists():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(raw, dict):
+            return raw
+    return {}
 
 
 def _save_tool_approval_policy(project_root: Path, policy: dict[str, Any]) -> None:
@@ -1295,9 +1453,20 @@ def _normalize_shell_command(command: Any) -> str | None:
     return one_line if one_line else None
 
 
+def _shell_argv(command: str) -> list[str] | None:
+    try:
+        parts = shlex.split(command)
+    except Exception:
+        return None
+    return [str(part) for part in parts if isinstance(part, str) and part]
+
+
 def _shell_run_is_allowlisted(project_root: Path, args: dict[str, Any]) -> bool:
     cmd = _normalize_shell_command(args.get("command"))
     if not cmd:
+        return False
+    cmd_argv = _shell_argv(cmd)
+    if not cmd_argv:
         return False
     cwd = args.get("cwd")
     cwd_s = str(cwd).strip() if isinstance(cwd, str) else None
@@ -1312,7 +1481,12 @@ def _shell_run_is_allowlisted(project_root: Path, args: dict[str, Any]) -> bool:
         prefix = rule.get("command_prefix")
         if not isinstance(prefix, str) or not prefix.strip():
             continue
-        if not cmd.startswith(prefix.strip()):
+        prefix_argv = _shell_argv(prefix.strip())
+        if not prefix_argv:
+            continue
+        if len(cmd_argv) < len(prefix_argv):
+            continue
+        if cmd_argv[: len(prefix_argv)] != prefix_argv:
             continue
         rule_cwd = rule.get("cwd")
         if isinstance(rule_cwd, str) and rule_cwd.strip():

@@ -5,6 +5,7 @@ Apply a PPTX plan.json (aura_plan_spec) to a PPTX package.
 Produces a plan-aware apply_report.json with engine and touched_parts for Gate A.
 """
 from __future__ import annotations
+import logging
 
 import argparse
 import json
@@ -20,6 +21,8 @@ import plan as planmod
 import pptx_create
 import pptx_ooxml
 
+
+logger = logging.getLogger(__name__)
 
 def _zip_dir(src_dir: Path, out_file: Path) -> None:
     out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -97,7 +100,7 @@ def _derive_touched_parts(pptx_path: Path) -> list[str]:
                     if rels in zf.namelist():
                         touched.add(rels)
     except Exception:
-        pass
+        logger.warning("Suppressed exception in _derive_touched_parts.", exc_info=True)
     return sorted(touched)
 
 

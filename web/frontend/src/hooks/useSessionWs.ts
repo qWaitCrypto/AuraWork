@@ -12,6 +12,7 @@ const SESSION_WS_PONG_TIMEOUT_MS = 10000;
 const SESSION_WS_RECONNECT_BASE_MS = 800;
 const SESSION_WS_RECONNECT_MAX_MS = 12000;
 const SESSION_WS_RECONNECT_JITTER_MS = 400;
+const SESSION_WS_STABLE_OPEN_MS = 1500;
 
 function uiDebugEnabled() {
     try {
@@ -214,6 +215,9 @@ export function useSessionWs() {
         let heartbeatTimer: number | null = null;
         let pongTimeoutTimer: number | null = null;
         let lastPongAt = Date.now();
+        let openedAt = 0;
+        let sawServerTraffic = false;
+        const intentionalClose = new WeakSet<WebSocket>();
 
         const clearReconnectTimer = () => {
             if (reconnectTimer != null) {
@@ -233,6 +237,15 @@ export function useSessionWs() {
             }
         };
 
+        const closeWs = (ws: WebSocket, code?: number, reason?: string) => {
+            intentionalClose.add(ws);
+            try {
+                if (typeof code === "number") ws.close(code, reason);
+                else ws.close();
+            } catch {
+            }
+        };
+
         const startHeartbeat = (ws: WebSocket) => {
             clearHeartbeatTimers();
             lastPongAt = Date.now();
@@ -248,10 +261,10 @@ export function useSessionWs() {
                 pongTimeoutTimer = window.setTimeout(() => {
                     if (cancelled || ws.readyState !== WebSocket.OPEN) return;
                     if (lastPongAt < sentAt) {
-                        try {
-                            ws.close(4001, "heartbeat_timeout");
-                        } catch {
-                        }
+                        // Do NOT use closeWs() here — that marks the close as intentional and
+                        // suppresses the reconnect in the 'close' handler. A heartbeat timeout
+                        // should always trigger a reconnect.
+                        try { ws.close(4001, "heartbeat_timeout"); } catch { /* ignore */ }
                     }
                 }, SESSION_WS_PONG_TIMEOUT_MS);
             }, SESSION_WS_HEARTBEAT_MS);
@@ -279,16 +292,14 @@ export function useSessionWs() {
             if (currentSessionIdRef.current !== currentSessionId) return;
 
             if (wsRef.current) {
-                try {
-                    wsRef.current.close();
-                } catch {
-                }
+                closeWs(wsRef.current);
                 wsRef.current = null;
             }
 
             const ws = connectSessionWs(currentSessionId, (msg: ServerMsg) => {
+                lastPongAt = Date.now();
+                sawServerTraffic = true;
                 if (msg.type === "pong") {
-                    lastPongAt = Date.now();
                     if (pongTimeoutTimer != null) {
                         window.clearTimeout(pongTimeoutTimer);
                         pongTimeoutTimer = null;
@@ -319,15 +330,13 @@ export function useSessionWs() {
 
             ws.addEventListener("open", () => {
                 if (cancelled || currentSessionIdRef.current !== currentSessionId) {
-                    try {
-                        ws.close();
-                    } catch {
-                    }
+                    closeWs(ws);
                     return;
                 }
 
                 const wasReconnect = reconnectAttempts > 0;
-                reconnectAttempts = 0;
+                openedAt = Date.now();
+                sawServerTraffic = false;
                 clearReconnectTimer();
                 setConnected(true);
                 startHeartbeat(ws);
@@ -342,19 +351,23 @@ export function useSessionWs() {
                 refreshApprovals().catch(() => { });
             });
 
-            ws.addEventListener("close", () => {
+            ws.addEventListener("close", (event) => {
                 clearHeartbeatTimers();
                 if (wsRef.current === ws) wsRef.current = null;
+                if (intentionalClose.has(ws)) return;
                 if (cancelled || currentSessionIdRef.current !== currentSessionId) return;
                 setConnected(false);
+                if (event.code === 1008) return;
+                if (sawServerTraffic && openedAt > 0 && Date.now() - openedAt >= SESSION_WS_STABLE_OPEN_MS) {
+                    reconnectAttempts = 0;
+                }
                 scheduleReconnect();
             });
 
             ws.addEventListener("error", () => {
-                try {
-                    ws.close();
-                } catch {
-                }
+                // A WebSocket error is always followed by the 'close' event, which
+                // will handle reconnect. Do NOT call closeWs() here — that would mark
+                // the socket as an intentional close and suppress the reconnect.
             });
         };
 
@@ -365,10 +378,7 @@ export function useSessionWs() {
             clearReconnectTimer();
             clearHeartbeatTimers();
             if (wsRef.current) {
-                try {
-                    wsRef.current.close();
-                } catch {
-                }
+                closeWs(wsRef.current);
                 wsRef.current = null;
             }
         };
@@ -386,17 +396,34 @@ export function useSessionWs() {
         return ok;
     }, [connected]);
 
+    const sendCompact = useCallback((): boolean => {
+        if (!connected) return false;
+        return wsSend(wsRef.current, { type: "compact" });
+    }, [connected]);
+
     // ── Approval decision ───────────────────────────────────────────────
 
-    const decideApprovalById = useCallback((approvalId: string, decision: "approve" | "deny", note?: string): boolean => {
+    const decideApprovalById = useCallback((
+        approvalId: string,
+        decision: "approve" | "deny" | "edit" | "dry_run",
+        note?: string,
+        editedArguments?: Record<string, unknown>,
+    ): boolean => {
         const id = String(approvalId || "").trim();
         if (!id) return false;
-        const payload: { type: "approval"; approval_id: string; decision: "approve" | "deny"; note?: string } = {
+        const payload: {
+            type: "approval";
+            approval_id: string;
+            decision: "approve" | "deny" | "edit" | "dry_run";
+            note?: string;
+            edited_arguments?: Record<string, unknown>;
+        } = {
             type: "approval",
             approval_id: id,
             decision,
         };
         if (typeof note === "string" && note.trim()) payload.note = note.trim();
+        if (editedArguments && typeof editedArguments === "object") payload.edited_arguments = editedArguments;
 
         const ok = wsSend(wsRef.current, payload);
         if (!ok) return false;
@@ -406,7 +433,7 @@ export function useSessionWs() {
         return true;
     }, [activeApproval, popApproval, refreshApprovals]);
 
-    const decideApproval = useCallback((decision: "approve" | "deny") => {
+    const decideApproval = useCallback((decision: "approve" | "deny" | "edit" | "dry_run") => {
         if (!activeApproval) return false;
         return decideApprovalById(activeApproval.approval_id, decision);
     }, [activeApproval, decideApprovalById]);
@@ -431,6 +458,7 @@ export function useSessionWs() {
 
         // Actions
         sendChat,
+        sendCompact,
         decideApproval,
         decideApprovalById,
         deleteSession,

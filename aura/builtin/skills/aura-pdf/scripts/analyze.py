@@ -5,12 +5,15 @@ Analyze a PDF file for basic structure/risk signals.
 This is best-effort: if optional dependencies are missing, analysis is partial.
 """
 from __future__ import annotations
+import logging
 
 import argparse
 import json
 from pathlib import Path
 from typing import Any
 
+
+logger = logging.getLogger(__name__)
 
 def _try_import_pypdf():
     try:
@@ -43,7 +46,7 @@ def _extract_metadata(reader: Any) -> dict[str, str]:
             for k, v in dict(obj).items():
                 meta[_safe_str(k)] = _safe_str(v)
     except Exception:
-        pass
+        logger.warning("Suppressed exception in _extract_metadata.", exc_info=True)
     return meta
 
 
@@ -60,7 +63,7 @@ def _count_images_pypdf(reader: Any, *, max_pages: int = 5) -> int:
             count += len(images)
             continue
         except Exception:
-            pass
+            logger.warning("Suppressed exception in _count_images_pypdf.", exc_info=True)
 
         # Fallback: best-effort resource scan
         try:
@@ -156,7 +159,7 @@ def analyze_pdf(pdf_path: Path) -> dict[str, Any]:
                 try:
                     reader.decrypt("")  # best-effort
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in analyze_pdf.", exc_info=True)
             pages = len(reader.pages)
             metadata = _extract_metadata(reader)
             has_images = _count_images_pypdf(reader)

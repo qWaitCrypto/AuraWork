@@ -1,6 +1,6 @@
 ---
 name: aura-docx
-description: Microsoft Word / DOCX (.docx) analysis and editing via a plan-driven pipeline (analyze → plan → apply → Gate A validate → report). Use for Word/DOCX documents, contracts, reports, template filling, tracked changes, and comments when you must preserve package structure.
+description: Microsoft Word / DOCX processing via a plan-driven pipeline (analyze → plan → apply → Gate A validate → report). Use this skill whenever the user mentions Word documents, .docx files, contracts, reports, proposals, templates, tracked changes, redlining, or comments — whether creating from scratch, reading, editing, filling placeholders, or performing legal-grade redlines. Always prefer this skill over ad-hoc python-docx scripts for any .docx task.
 ---
 
 # Aura DOCX (Tutorial-style)

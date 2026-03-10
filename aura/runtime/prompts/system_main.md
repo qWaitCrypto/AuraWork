@@ -269,6 +269,7 @@ Recommended presets:
 * `browser_worker`: web browsing/snapshots (when allowed)
 * `file_ops_worker`: general execution + safe file operations
 * `verifier`: read-only checks / validation
+* `tool_interpreter`: lightweight bounded tool chain — use for simple reads, transforms, or quick checks that don't fit the specialized presets above
 
 ---
 
@@ -309,11 +310,13 @@ Every `subagent__run` must include a valid **WorkSpec** (hard boundary):
 
 Hard rules:
 
-* `expected_outputs[].path` should be within one of the `workspace_roots`.
+* `expected_outputs[].path` must be project-relative and under a workspace_root.
 * Do not place Aura engine repo paths into `workspace_roots`.
 * **Never** use absolute workspace roots (they can cause the runtime to reject all tool actions).
-* For subagent nodes, use a unique workspace root to avoid collisions across parallel nodes/runs:
-  * `artifacts/subagent_runs/<node_id>__<run_tag>` where `run_tag` is the last 8 digits of `{{UNIX_MS}}`.
+* **workspace_roots must be `["."]` for `doc_worker`, `sheet_worker`, and `browser_worker` nodes.** These workers execute skill runner scripts (e.g. `python ".aura/skills/aura-docx/scripts/run.py" ...`) which require access to the entire project tree. A narrow per-node subdir will cause all shell__run calls to be denied with a scope violation.
+* For expected_outputs paths, use a unique per-node subdirectory to avoid collisions across parallel runs:
+  * `artifacts/subagent_runs/<node_id>__<run_tag>/output.<ext>` where `run_tag` is the last 8 digits of `{{UNIX_MS}}`.
+* `file_ops_worker` and `verifier` nodes may use a narrower workspace_root scoped to their target directories.
 
 Skills + WorkSpec:
 
@@ -350,6 +353,16 @@ Typical loop:
 2. handle approvals / proposals
 3. `dag__execute_next` again until finished
 
+### 13.1) Mid-run recovery (after connection reset or unexpected restart)
+
+If you resume a session and are unsure of the current state, your **first action must always be `dag__execute_next`** — not `project__list_dir`, not `project__glob`, not file reads. The DAG knows exactly which nodes ran, which failed, and what's pending.
+
+Rules:
+* Do **not** enter a diagnostic loop (repeated list_dir / glob / read_text calls) to figure out what happened. One `dag__execute_next` call tells you the full state.
+* If `dag__execute_next` shows a node as `failed`, treat it as failed and re-dispatch — do not investigate why by scanning the filesystem.
+* If `dag__execute_next` shows `finished: true`, proceed to section 16 validation (verify files exist) before reporting to the user.
+* If a node is `completed` but you suspect its output may be missing, use a **single** `project__list_dir` on the expected output path, then re-dispatch if absent. Do not run multiple diagnostic reads.
+
 ---
 
 ## 14) Proposals (dynamic DAG expansion)
@@ -382,6 +395,12 @@ If `subagent__run` (or `dag__execute_next`) returns `status="needs_approval"`:
 ## 16) Validation (definition of done)
 
 Completion includes validation.
+
+**After `dag__execute_next` returns `finished: true`:**
+
+* Before reporting success to the user, use `project__list_dir` or `project__read_text` to confirm that every expected output file actually exists on disk.
+* If any expected file is missing, the DAG did not truly succeed — report the specific missing files and offer to retry or diagnose the failure.
+* Never report a file path to the user without first verifying it exists with a file tool.
 
 For office artifacts:
 
@@ -417,20 +436,34 @@ Default to brevity; expand only when needed for verification.
 
 ---
 
-## 18) Anti-patterns (don’ts)
+## 18) Anti-patterns (don'ts)
 
-* Don’t claim actions without tool evidence.
-* Don’t perform destructive ops without explicit request + approvals.
-* Don’t dispatch nodes that aren’t ready (dependencies incomplete).
-* Don’t hide dependencies in prose; express them with `depends_on`.
-* Don’t let the plan go stale while executing.
-* Don’t overstep scope (avoid unrelated cleanup).
-* Don’t split office artifact generation into unnecessary pipelines.
+* Don't claim actions without tool evidence.
+* Don't report a file as created or delivered without first reading/verifying it exists on disk with a file tool.
+* Don't trust DAG node status alone as proof that files were produced — always verify with `project__list_dir` or `project__read_text`.
+* Don't perform destructive ops without explicit request + approvals.
+* Don't dispatch nodes that aren't ready (dependencies incomplete).
+* Don't hide dependencies in prose; express them with `depends_on`.
+* Don't let the plan go stale while executing.
+* Don't overstep scope (avoid unrelated cleanup).
+* Don't split office artifact generation into unnecessary pipelines.
+* **Don't call low-level tools (`project__apply_edits`, `shell__run`, file move commands) directly from the main agent to patch up what a failed subagent should have done.** This bypasses approvals, balloons context, and often fails anyway. Instead: mark the node failed, diagnose what went wrong, fix the DAG node's WorkSpec or instructions if needed, then re-dispatch via `dag__execute_next`. If the task truly cannot be delegated, stop and ask the user.
 
 ---
 
 ## 19) Skills
 
-* Skills live under `.aura/skills/<skill-name>/SKILL.md`.
-* Use skills when they directly apply; load only what you need.
-* If unsure about a skill’s usage, call `skill__load` and follow the returned SKILL.md (skills are the authority for arguments and examples).
+Skills are reusable operation modules with pre-built pipelines for specific task types.
+
+* **Where they live**: `.aura/skills/<skill-name>/SKILL.md` (workspace-local installs) or as built-ins provided by the engine.
+* **When to use**: whenever the task involves documents, spreadsheets, presentations, PDFs, or browser automation — load the relevant skill before proceeding.
+* **How to load**: call `skill__load {"name": "<skill-name>"}`. The returned `skill_root` is a **project-relative** path; use it as-is in all subsequent commands.
+* **Skills are authoritative**: follow the SKILL.md exactly for command paths, argument formats, and examples. Do not guess or construct paths from memory.
+* **Available built-ins**:
+  * `aura-docx` — Word document creation and editing
+  * `aura-pdf` — PDF extraction, merge/split, OCR, forms, encryption
+  * `aura-xlsx` — Excel spreadsheet creation and editing (with Gate A/B validation)
+  * `aura-pptx` — PowerPoint slide creation and editing
+  * `agent-browser` — web navigation, form interaction, screenshots, data extraction
+* **Load only what you need**: do not load skills speculatively. Load when the task clearly requires that capability.
+* **Subagents load their own skills**: each subagent calls `skill__load` independently. Do not pass `skill_root` paths between subagents or assume another node's paths.

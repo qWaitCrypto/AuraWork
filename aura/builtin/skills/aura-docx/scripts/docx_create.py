@@ -5,11 +5,15 @@ Apply DOCX creation/append plan using python-docx.
 Supports creating new documents from scratch with tables, headings, paragraphs, and styles.
 """
 from __future__ import annotations
+import logging
 
 from collections import Counter
 from copy import copy
 from pathlib import Path
 from typing import Any, Dict, List
+
+
+logger = logging.getLogger(__name__)
 
 _TC_PR_ORDER = [
     "w:tcW",
@@ -158,7 +162,7 @@ def apply_create_plan(in_docx: Path | None, plan: Dict[str, Any], out_docx: Path
             style.font.name = 'Microsoft YaHei'
             style._element.rPr.rFonts.set(qn('w:eastAsia'), 'Microsoft YaHei')
         except Exception:
-            pass
+            logger.warning("Suppressed exception in apply_create_plan.", exc_info=True)
     
     change_log: List[Dict[str, Any]] = []
     
@@ -213,7 +217,7 @@ def apply_create_plan(in_docx: Path | None, plan: Dict[str, Any], out_docx: Path
             try:
                 table.style = style
             except Exception:
-                pass  # Style may not exist
+                logger.warning("Suppressed exception in apply_create_plan.", exc_info=True)
             
             # Set column widths
             if col_widths:

@@ -1,20 +1,16 @@
 from __future__ import annotations
 
 import json
-import os
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from aura.runtime.ids import now_ts_ms
+from .io_utils import atomic_write_text
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
-
+logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class SessionIndexRecord:
@@ -45,12 +41,14 @@ class SessionIndex:
             self._sessions = {}
             return
         except Exception:
+            logger.warning("Failed to read session index: %s", self._path, exc_info=True)
             self._sessions = {}
             return
 
         try:
             data = json.loads(raw)
         except Exception:
+            logger.warning("Failed to parse session index JSON: %s", self._path, exc_info=True)
             self._sessions = {}
             return
 
@@ -77,7 +75,7 @@ class SessionIndex:
 
     def _save(self) -> None:
         payload = {"version": 1, "sessions": self._sessions}
-        _atomic_write_text(self._path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        atomic_write_text(self._path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
     def get_workspace_id(self, session_id: str) -> str | None:
         sid = str(session_id or "").strip()

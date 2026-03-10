@@ -736,6 +736,15 @@ def _profile_to_dict(profile: ModelProfile) -> dict[str, Any]:
         "model_name": profile.model_name,
     }
     if profile.credential_ref is not None:
+        if (
+            profile.credential_ref.kind in {"inline", "plaintext"}
+            and profile.credential_ref.identifier
+            and profile.credential_ref.identifier != "aura"
+        ):
+            raise ModelConfigError(
+                "Refusing to serialize inline/plaintext credential_ref to disk for "
+                f"profile '{profile.profile_id}'. Use credential_ref kind 'env' or 'codex_cli' instead."
+            )
         out["credential_ref"] = {
             "kind": profile.credential_ref.kind,
             "identifier": profile.credential_ref.identifier,

@@ -1,6 +1,6 @@
 ---
 name: aura-pptx
-description: Microsoft PowerPoint / PPTX (.pptx) template-safe filling and editing for office slides, including text replace, placeholder fill, adding/deleting/reordering slides, plus OOXML structure validation (Gate A). Use when the user mentions PowerPoint/PPTX slides/decks/template filling.
+description: Microsoft PowerPoint / PPTX processing via a plan-driven pipeline with OOXML structure validation (Gate A). Use this skill whenever the user mentions PowerPoint, PPTX, slide decks, presentations, pitch decks, template filling, or needs to create slides from scratch, edit existing decks, replace text, fill placeholders, reorder/delete slides, or generate thumbnails. Always use this skill for any .pptx task.
 ---
 
 # Aura PPTX (Tutorial-style)
@@ -42,6 +42,32 @@ It writes a unique run folder under `artifacts/`:
 - `plan.json`, `analysis.json`, `apply_report.json`, `gate_a.json`, `report.json`
 
 Read the printed JSON summary and only treat it as done when `ok: true`.
+
+---
+
+## 📖 Flow 0: Create from scratch
+Use this when there is no input deck or when you need a fully new design.
+This flow requires `python-pptx` to be available in the environment.
+
+### Step 1) Write `plan.json` with create ops:
+```json
+{
+  "meta": {"id": "pptx-create-001", "notes": "Create a clean pitch deck"},
+  "operations": [
+    {"op": "create_deck", "slide_size": {"width_in": 13.333, "height_in": 7.5}},
+    {"op": "add_slide", "after_slide_id": 0, "layout": "Title Slide"},
+    {"op": "add_title", "slide_id": 1, "text": "Product Strategy 2026", "font_size": 40, "bold": true},
+    {"op": "add_textbox", "slide_id": 1, "text": "Confidential", "x": 0.8, "y": 5.8, "w": 4.0, "h": 0.6, "font_size": 16},
+    {"op": "add_slide", "after_slide_id": 1, "layout": "Title and Content"},
+    {"op": "add_title", "slide_id": 2, "text": "Key Themes", "font_size": 32, "bold": true}
+  ]
+}
+```
+
+### Step 2) Run (no input file; use `-`):
+`python "$SKILL_ROOT/scripts/run.py" - plan.json --artifacts-dir artifacts`
+
+Return: `output.pptx` and `artifacts/.../report.json`.
 
 ---
 
@@ -168,28 +194,3 @@ Return:
 - Return the final `.pptx`.
 - Return `artifacts/.../report.json` (the run folder path is printed by `run.py`).
 - Summarize: operations, touched parts, Gate A status, and any risks.
-## 📖 Flow 0: Create from scratch (create-from-scratch)
-Use this when there is no input deck or when you need a fully new design.
-This flow requires `python-pptx` to be available in the environment.
-
-Step 1) Write `plan.json` with create ops:
-```json
-{
-  "meta": {"id": "pptx-create-001", "notes": "Create a clean pitch deck"},
-  "operations": [
-    {"op": "create_deck", "slide_size": {"width_in": 13.333, "height_in": 7.5}},
-    {"op": "add_slide", "after_slide_id": 0, "layout": "Title Slide"},
-    {"op": "add_title", "slide_id": 1, "text": "Product Strategy 2026", "font_size": 40, "bold": true},
-    {"op": "add_textbox", "slide_id": 1, "text": "Confidential", "x": 0.8, "y": 5.8, "w": 4.0, "h": 0.6, "font_size": 16},
-    {"op": "add_slide", "after_slide_id": 1, "layout": "Title and Content"},
-    {"op": "add_title", "slide_id": 2, "text": "Key Themes", "font_size": 32, "bold": true}
-  ]
-}
-```
-
-Step 2) Run:
-`python "$SKILL_ROOT/scripts/run.py" - plan.json --artifacts-dir artifacts`
-
-Return:
-- `output.pptx`
-- `artifacts/.../report.json`

@@ -1,7 +1,9 @@
 from __future__ import annotations
+import logging
 
 import asyncio
 import json
+import os
 import threading
 import time
 from copy import deepcopy
@@ -59,6 +61,7 @@ from .skills import SkillStore
 from .snapshots import GitSnapshotBackend
 from .spec_workflow import SpecProposalStore, SpecStateStore, SpecStore
 from .stores import ApprovalStore, ArtifactStore, EventLogStore, SessionStore
+from .tool_status import normalize_tool_end_status
 from .mcp.config import load_mcp_config
 from .tools import (
     DAGExecuteNextTool,
@@ -99,13 +102,14 @@ from .tools.runtime import (
     ToolRuntime,
     _classify_tool_exception,
     _classify_tool_result,
-    _normalize_tool_end_status,
     _status_from_error_code,
     file_edit_ui_details,
 )
 from .prompts.template import render_prompt_template
 
 from .engine import PendingToolCall, RunResult, ToolDecision
+
+logger = logging.getLogger(__name__)
 
 
 def _load_default_system_prompt() -> str:
@@ -284,6 +288,29 @@ _DEFAULT_EXPOSED_TOOL_NAMES: set[str] = {
 }
 
 _EMPTY_FINAL_RESPONSE_FALLBACK_TEXT = "Model returned an empty final response. Please retry."
+_EDITABLE_APPROVAL_TOOLS: set[str] = {"project__apply_edits", "project__apply_patch", "project__patch"}
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except Exception:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _env_float(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except Exception:
+        return default
+    return max(minimum, min(maximum, value))
 
 
 @dataclass(slots=True)
@@ -323,6 +350,9 @@ class AgnoAsyncEngine:
     _auto_compact_seen_turn_ids: set[str] = field(default_factory=set, init=False, repr=False)
     _event_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     _dag_runner: DAGPlanRunner | None = field(default=None, init=False, repr=False)
+    _llm_network_retry_attempts: int = field(default=2, init=False, repr=False)
+    _llm_network_retry_base_delay_s: float = field(default=0.75, init=False, repr=False)
+    _llm_network_retry_max_delay_s: float = field(default=4.0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.project_root = self.project_root.expanduser().resolve()
@@ -334,6 +364,24 @@ class AgnoAsyncEngine:
         self.spec_state_store = SpecStateStore(project_root=self.project_root)
         self.spec_proposal_store = SpecProposalStore(project_root=self.project_root)
         self.snapshot_backend = GitSnapshotBackend(project_root=self.project_root)
+        self._llm_network_retry_attempts = _env_int(
+            "AURA_LLM_NETWORK_RETRY_ATTEMPTS",
+            2,
+            minimum=1,
+            maximum=8,
+        )
+        self._llm_network_retry_base_delay_s = _env_float(
+            "AURA_LLM_NETWORK_RETRY_BASE_DELAY_S",
+            0.75,
+            minimum=0.0,
+            maximum=30.0,
+        )
+        self._llm_network_retry_max_delay_s = _env_float(
+            "AURA_LLM_NETWORK_RETRY_MAX_DELAY_S",
+            4.0,
+            minimum=0.0,
+            maximum=60.0,
+        )
 
         if self.max_tool_turns < 1:
             raise ValueError("max_tool_turns must be >= 1")
@@ -691,7 +739,7 @@ class AgnoAsyncEngine:
             try:
                 self.set_chat_model_profile(snapshot.model_profile_id)
             except Exception:
-                pass
+                logger.warning("Suppressed exception in continue_run.", exc_info=True)
         self._history = list(snapshot.messages)
         turn_id = snapshot.turn_id
 
@@ -723,7 +771,7 @@ class AgnoAsyncEngine:
                     approval_event_decision = "approve" if status is ApprovalStatus.GRANTED else "deny"
                     approval_event_details = record_decision
             except Exception:
-                pass
+                logger.warning("Suppressed exception in _public_work_spec_from_args.", exc_info=True)
 
         if approval_record is not None and approval_event_kind is not None and approval_id:
             await self._emit(
@@ -838,6 +886,32 @@ class AgnoAsyncEngine:
             return
 
         executed: list[dict[str, Any]] = []
+
+        # The snapshot's history may end with an ASSISTANT message whose tool_calls were never
+        # acknowledged (e.g. dag__execute_next was still in-flight when the run was paused for
+        # approval). Without a synthetic TOOL result for each such call, the conversation is
+        # malformed and the main LLM will produce stale output (e.g. still saying "please approve"
+        # even though approval was granted and the browser already ran).
+        if self._history:
+            last_hist_msg = self._history[-1]
+            if last_hist_msg.role == CanonicalMessageRole.ASSISTANT and last_hist_msg.tool_calls:
+                for tc in last_hist_msg.tool_calls:
+                    if tc.tool_call_id:
+                        self._history.append(
+                            CanonicalMessage(
+                                role=CanonicalMessageRole.TOOL,
+                                content=json.dumps({
+                                    "status": "resumed",
+                                    "note": (
+                                        "A tool call within this subagent required user approval. "
+                                        "Approval was granted. The approved tool call is now being "
+                                        "executed and the subagent will be re-dispatched with the result."
+                                    ),
+                                }),
+                                tool_call_id=tc.tool_call_id,
+                                tool_name=tc.name,
+                            )
+                        )
 
         async with AsyncExitStack() as stack:
             mcp_functions, _mcp_specs = await self._load_mcp_tooling(stack=stack)
@@ -972,6 +1046,29 @@ class AgnoAsyncEngine:
         if not isinstance(run_args, dict):
             run_args = {}
 
+        # Same orphaned-tool-call fix as in _auto_resume_subagent_after_approval: the snapshot
+        # history may end with an unresolved ASSISTANT tool_call. Inject a synthetic TOOL result
+        # before appending the new dag__execute_next call so the conversation stays well-formed.
+        if self._history:
+            last_hist_msg = self._history[-1]
+            if last_hist_msg.role == CanonicalMessageRole.ASSISTANT and last_hist_msg.tool_calls:
+                for tc in last_hist_msg.tool_calls:
+                    if tc.tool_call_id:
+                        self._history.append(
+                            CanonicalMessage(
+                                role=CanonicalMessageRole.TOOL,
+                                content=json.dumps({
+                                    "status": "resumed",
+                                    "note": (
+                                        "The browser session was handed over to the user (e.g. for CAPTCHA/login). "
+                                        "User completed the handover. Resuming DAG execution now."
+                                    ),
+                                }),
+                                tool_call_id=tc.tool_call_id,
+                                tool_name=tc.name,
+                            )
+                        )
+
         async with AsyncExitStack() as stack:
             mcp_functions, _mcp_specs = await self._load_mcp_tooling(stack=stack)
 
@@ -1089,6 +1186,7 @@ class AgnoAsyncEngine:
 
         tool_calls = record.resume_payload.get("tool_calls") if isinstance(record.resume_payload, dict) else None
         pending_ids: list[str] = []
+        pending_by_id: dict[str, dict[str, Any]] = {}
         if isinstance(tool_calls, list):
             for c in tool_calls:
                 if not isinstance(c, dict):
@@ -1096,11 +1194,95 @@ class AgnoAsyncEngine:
                 tid = c.get("tool_call_id")
                 if isinstance(tid, str) and tid:
                     pending_ids.append(tid)
+                    pending_by_id[tid] = dict(c)
 
         if decision is ApprovalDecision.APPROVE:
             decisions = [ToolDecision(tool_call_id=tid, decision="approve") for tid in pending_ids]
-        else:
+        elif decision is ApprovalDecision.DENY:
             decisions = [ToolDecision(tool_call_id=tid, decision="deny", note=str(note) if note is not None else None) for tid in pending_ids]
+        else:
+            # edit / dry_run are only supported for a single pending editable tool call.
+            if len(pending_ids) != 1:
+                return RunResult(
+                    status="failed",
+                    run_id=record.request_id,
+                    session_id=self.session_id,
+                    error="approval_decision_unsupported_for_batch",
+                )
+
+            target_id = pending_ids[0]
+            target_call = pending_by_id.get(target_id) or {}
+            tool_name = str(target_call.get("tool_name") or "")
+            if tool_name not in _EDITABLE_APPROVAL_TOOLS:
+                return RunResult(
+                    status="failed",
+                    run_id=record.request_id,
+                    session_id=self.session_id,
+                    error="approval_decision_unsupported_tool",
+                )
+
+            edited_arguments_raw = op.payload.get("edited_arguments")
+            if decision is ApprovalDecision.EDIT:
+                if not isinstance(edited_arguments_raw, dict):
+                    return RunResult(
+                        status="failed",
+                        run_id=record.request_id,
+                        session_id=self.session_id,
+                        error="approval_edit_arguments_missing",
+                    )
+                edited_arguments = dict(edited_arguments_raw)
+            else:
+                # dry_run: start from current args and force dry_run=true.
+                edited_arguments = {}
+                try:
+                    snapshot = read_run_snapshot(project_root=self.project_root, run_id=record.request_id)
+                    for pending in snapshot.pending_tools:
+                        if pending.tool_call_id == target_id:
+                            edited_arguments = dict(pending.args or {})
+                            break
+                except Exception:
+                    logger.warning("Failed to read run snapshot while building dry_run edited arguments.", exc_info=True)
+                    edited_arguments = {}
+                edited_arguments["dry_run"] = True
+
+            try:
+                snapshot = read_run_snapshot(project_root=self.project_root, run_id=record.request_id)
+            except Exception:
+                logger.warning("Failed to read run snapshot for approval edit/dry_run.", exc_info=True)
+                return RunResult(
+                    status="failed",
+                    run_id=record.request_id,
+                    session_id=self.session_id,
+                    error="approval_snapshot_not_found",
+                )
+
+            updated_pending: list[SnapshotPendingToolCall] = []
+            for pending in snapshot.pending_tools:
+                if pending.tool_call_id == target_id:
+                    updated_pending.append(
+                        SnapshotPendingToolCall(
+                            tool_call_id=pending.tool_call_id,
+                            tool_name=pending.tool_name,
+                            args=edited_arguments,
+                        )
+                    )
+                else:
+                    updated_pending.append(pending)
+
+            write_run_snapshot(
+                project_root=self.project_root,
+                snapshot=replace(snapshot, pending_tools=updated_pending),
+            )
+            edit_note = str(note).strip() if note is not None else ""
+            if decision is ApprovalDecision.DRY_RUN:
+                note_text = "dry_run requested via approval UI."
+                if edit_note:
+                    note_text = f"{note_text} {edit_note}"
+            else:
+                note_text = "arguments edited via approval UI."
+                if edit_note:
+                    note_text = f"{note_text} {edit_note}"
+            decisions = [ToolDecision(tool_call_id=target_id, decision="approve", note=note_text)]
 
         return await self.continue_run(run_id=record.request_id, decisions=decisions, timeout_s=timeout_s, cancel=cancel)
 
@@ -1198,7 +1380,7 @@ class AgnoAsyncEngine:
                             return RunResult(status="failed", run_id=request_id, session_id=self.session_id, error="compact_failed")
                         continue
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _public_work_spec_from_args.", exc_info=True)
 
                 break
 
@@ -1307,7 +1489,7 @@ class AgnoAsyncEngine:
                     if note_clean:
                         self._history.append(CanonicalMessage(role=CanonicalMessageRole.USER, content=note_clean))
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _public_work_spec_from_args.", exc_info=True)
 
                 # Tool messages were appended to history; rebuild request and token estimates before resuming the loop.
                 request = self._build_request(profile=profile, extra_tools=mcp_specs)
@@ -1347,25 +1529,16 @@ class AgnoAsyncEngine:
                 )
 
                 try:
-                    if use_stream:
-                        resp = await self._run_agent_stream(
-                            request=request,
-                            profile=profile,
-                            request_id=request_id,
-                            turn_id=turn_id,
-                            step_id=step_id,
-                            timeout_s=timeout_s,
-                            cancel=cancel,
-                        )
-                    else:
-                        resp = await self._run_agent_once(
-                            request=request,
-                            profile=profile,
-                            request_id=request_id,
-                            turn_id=turn_id,
-                            timeout_s=timeout_s,
-                            cancel=cancel,
-                        )
+                    resp = await self._run_main_model_request_with_retry(
+                        use_stream=use_stream,
+                        request=request,
+                        profile=profile,
+                        request_id=request_id,
+                        turn_id=turn_id,
+                        step_id=step_id,
+                        timeout_s=timeout_s,
+                        cancel=cancel,
+                    )
                 except LLMRequestError as e:
                     await self._emit(
                         kind=EventKind.LLM_REQUEST_FAILED,
@@ -1846,7 +2019,7 @@ class AgnoAsyncEngine:
                                     try:
                                         self._dag_runner.release_running(node_id)
                                     except Exception:
-                                        pass
+                                        logger.warning("Suppressed exception in _public_work_spec_from_args.", exc_info=True)
 
                             # Serialize concurrent approvals/takeovers: focus one request at a time.
                             focus_idx = 0
@@ -2291,7 +2464,7 @@ class AgnoAsyncEngine:
                 patch["last_compaction_context_stats"] = dict(context_stats)
             self.session_store.update_session(self.session_id, patch)
         except Exception:
-            pass
+            logger.warning("Suppressed exception in _public_work_spec_from_args.", exc_info=True)
 
         post_request = self._build_request(profile=profile, extra_tools=extra_tools)
         post_estimated_input_tokens = approx_tokens_from_json(canonical_request_to_dict(post_request))
@@ -2327,6 +2500,86 @@ class AgnoAsyncEngine:
         )
 
         return True
+
+    def _llm_retry_delay_s(self, *, attempt: int) -> float:
+        if attempt <= 0:
+            return 0.0
+        delay = self._llm_network_retry_base_delay_s * float(2 ** max(0, attempt - 1))
+        return max(0.0, min(self._llm_network_retry_max_delay_s, delay))
+
+    def _should_retry_llm_request_error(self, *, error: LLMRequestError, attempt: int) -> bool:
+        if attempt >= self._llm_network_retry_attempts:
+            return False
+        if not bool(error.retryable):
+            return False
+        if error.code not in {
+            ErrorCode.NETWORK_ERROR,
+            ErrorCode.TIMEOUT,
+            ErrorCode.SERVER_ERROR,
+            ErrorCode.RATE_LIMIT,
+        }:
+            return False
+        details = error.details if isinstance(error.details, dict) else {}
+        # Streaming retries after deltas are unsafe (UI may show duplicated partial output).
+        if details.get("had_output") is True:
+            return False
+        return True
+
+    async def _run_main_model_request_with_retry(
+        self,
+        *,
+        use_stream: bool,
+        request: CanonicalRequest,
+        profile: ModelProfile,
+        request_id: str,
+        turn_id: str | None,
+        step_id: str | None,
+        timeout_s: float | None,
+        cancel: CancellationToken | None,
+    ) -> LLMResponse:
+        attempt = 1
+        while True:
+            try:
+                if use_stream:
+                    return await self._run_agent_stream(
+                        request=request,
+                        profile=profile,
+                        request_id=request_id,
+                        turn_id=turn_id,
+                        step_id=step_id,
+                        timeout_s=timeout_s,
+                        cancel=cancel,
+                    )
+                return await self._run_agent_once(
+                    request=request,
+                    profile=profile,
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    timeout_s=timeout_s,
+                    cancel=cancel,
+                )
+            except LLMRequestError as e:
+                if not self._should_retry_llm_request_error(error=e, attempt=attempt):
+                    raise
+                delay_s = self._llm_retry_delay_s(attempt=attempt)
+                logger.warning(
+                    "Retrying model request after transient failure: "
+                    "attempt=%s/%s code=%s provider=%s model=%s delay_s=%.2f error=%s",
+                    attempt,
+                    self._llm_network_retry_attempts,
+                    e.code.value,
+                    profile.provider_kind.value,
+                    profile.model_name,
+                    delay_s,
+                    str(e),
+                )
+                if cancel is not None and cancel.cancelled:
+                    raise
+                if delay_s > 0:
+                    await asyncio.sleep(delay_s)
+                if cancel is not None and cancel.cancelled:
+                    raise
+                attempt += 1
 
     async def _run_agent_once(
         self,
@@ -2463,23 +2716,34 @@ class AgnoAsyncEngine:
         text_parts: list[str] = []
         thinking_parts: list[str] = []
         streamed_tool_calls: list[ToolCall] = []
+        had_stream_output = False
         while True:
             item = await q.get()
             if item is None:
                 break
             if isinstance(item, BaseException):
                 if isinstance(item, LLMRequestError):
+                    if had_stream_output:
+                        details = dict(item.details) if isinstance(item.details, dict) else {}
+                        details["had_output"] = True
+                        item.details = details
                     raise item
-                raise wrap_provider_exception(
+                wrapped = wrap_provider_exception(
                     item,
                     provider_kind=profile.provider_kind,
                     profile_id=profile.profile_id,
                     model=profile.model_name,
                     operation="stream",
-                ) from item
+                )
+                if had_stream_output:
+                    details = dict(wrapped.details) if isinstance(wrapped.details, dict) else {}
+                    details["had_output"] = True
+                    wrapped.details = details
+                raise wrapped from item
             ev = item
             if ev.kind == LLMStreamEventKind.THINKING_DELTA:
                 if ev.thinking_delta:
+                    had_stream_output = True
                     thinking_parts.append(ev.thinking_delta)
                     await self._emit(
                         kind=EventKind.LLM_THINKING_DELTA,
@@ -2490,6 +2754,7 @@ class AgnoAsyncEngine:
                     )
             elif ev.kind == LLMStreamEventKind.TEXT_DELTA:
                 if ev.text_delta:
+                    had_stream_output = True
                     text_parts.append(ev.text_delta)
                     await self._emit(
                         kind=EventKind.LLM_RESPONSE_DELTA,
@@ -2502,6 +2767,7 @@ class AgnoAsyncEngine:
                 # Some providers (or gateways) stream tool calls but omit them from the final `response.completed`.
                 # Preserve them so the normal tool-loop can proceed after streaming finishes.
                 if ev.tool_call is not None:
+                    had_stream_output = True
                     streamed_tool_calls.append(ev.tool_call)
             elif ev.kind == LLMStreamEventKind.COMPLETED:
                 if ev.response is not None:
@@ -2530,7 +2796,7 @@ class AgnoAsyncEngine:
             try:
                 trace.record_response(final)
             except Exception:
-                pass
+                logger.warning("Suppressed exception in _public_work_spec_from_args.", exc_info=True)
         return final
 
     def _adapt_tool_specs_for_profile(self, *, tools: list[ToolSpec], profile: ModelProfile) -> list[ToolSpec]:
@@ -2556,7 +2822,7 @@ class AgnoAsyncEngine:
             try:
                 tools = self._adapt_tool_specs_for_profile(tools=tools, profile=profile)
             except Exception:
-                pass
+                logger.warning("Suppressed exception in _build_request.", exc_info=True)
         skills = self.skill_store.list()
         dag_plan = self.plan_store.get().plan
         todo = self.todo_store.get().todo
@@ -2784,7 +3050,7 @@ class AgnoAsyncEngine:
             try:
                 fn._run_context = RunContext(run_id=request_id, session_id=self.session_id, metadata={"aura_request_id": request_id, "aura_turn_id": turn_id})
             except Exception:
-                pass
+                logger.warning("Suppressed exception in _public_work_spec_from_args.", exc_info=True)
             fc = FunctionCall(function=fn, arguments=dict(planned.arguments), call_id=planned.tool_call_id)
             res = await fc.aexecute()
             if res.status != "success":
@@ -2999,7 +3265,7 @@ class AgnoAsyncEngine:
             try:
                 self.session_store.update_session(self.session_id, {"last_usage": usage, "last_context_stats": merged_stats})
             except Exception:
-                pass
+                logger.warning("Suppressed exception in _public_work_spec_from_args.", exc_info=True)
 
     async def _pause_run(
         self,
@@ -3038,7 +3304,7 @@ class AgnoAsyncEngine:
                     except Exception:
                         diff_ref = None
             except Exception:
-                pass
+                logger.warning("Suppressed exception in _pause_run.", exc_info=True)
 
         record = ApprovalRecord(
             approval_id=approval_id,
@@ -3049,7 +3315,11 @@ class AgnoAsyncEngine:
             turn_id=turn_id,
             action_summary=action_summary,
             risk_level=risk_level,
-            options=["approve", "deny"],
+            options=(
+                ["approve", "deny", "edit", "dry_run"]
+                if len(planned_calls) == 1 and planned_calls[0].tool_name in _EDITABLE_APPROVAL_TOOLS
+                else ["approve", "deny"]
+            ),
             reason=reason,
             diff_ref=diff_ref,
             resume_kind="run_continue",
@@ -3281,7 +3551,7 @@ class AgnoAsyncEngine:
                     step_id=planned.tool_execution_id,
                 )
             except Exception:
-                pass
+                logger.warning("Suppressed exception in _public_work_spec_from_args.", exc_info=True)
         return tool_message
 
     async def _tool_result_denied(
@@ -3338,7 +3608,7 @@ class AgnoAsyncEngine:
         error_message: str,
         status: str = "failed",
     ) -> str:
-        normalized_status = _normalize_tool_end_status(status)
+        normalized_status = normalize_tool_end_status(status)
         if normalized_status == "unknown":
             normalized_status = _status_from_error_code(error_code=error_code, fallback="failed")
         output_ref = self.artifact_store.put(
@@ -3413,7 +3683,7 @@ class AgnoAsyncEngine:
                         {"last_request_id": request_id, "last_event_id": published.event_id, "last_event_sequence": seq},
                     )
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _emit.", exc_info=True)
             else:
                 try:
                     self.session_store.update_session(
@@ -3421,7 +3691,7 @@ class AgnoAsyncEngine:
                         {"last_request_id": request_id, "last_event_id": published.event_id},
                     )
                 except Exception:
-                    pass
+                    logger.warning("Suppressed exception in _emit.", exc_info=True)
             return published
 
     # Agno-backed execution is still used by subagents (see `aura/runtime/subagents/runner.py`),
