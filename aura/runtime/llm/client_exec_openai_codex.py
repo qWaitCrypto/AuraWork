@@ -722,7 +722,7 @@ def complete_openai_codex(
         payload = OpenAICodexAdapter().prepare_request(profile, request).json
         if not (isinstance(payload.get("instructions"), str) and payload["instructions"].strip()):
             payload["instructions"] = "You are a helpful assistant."
-        payload["store"] = False
+        # store is set by the adapter (True by default to enable previous_response_id caching)
         use_httpx = _should_use_httpx_for_responses(
             base_url=profile.base_url,
             credential_ref_kind=getattr(profile.credential_ref, "kind", None),
@@ -1196,7 +1196,7 @@ def stream_openai_codex(
         payload = OpenAICodexAdapter().prepare_request(profile, request).json
         if not (isinstance(payload.get("instructions"), str) and payload["instructions"].strip()):
             payload["instructions"] = "You are a helpful assistant."
-        payload["store"] = False
+        # store is set by the adapter (True by default to enable previous_response_id caching)
         use_httpx = _should_use_httpx_for_responses(
             base_url=profile.base_url,
             credential_ref_kind=getattr(profile.credential_ref, "kind", None),

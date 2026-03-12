@@ -985,6 +985,10 @@ def build_app(*, project_root: Path) -> FastAPI:
         await ws.accept()
         hub = _hub(session_id, rt)
         await hub.add(ws)
+        try:
+            rt.approval_manager_for_session(session_id).reopen()
+        except Exception:
+            logger.debug("Failed to reopen approval manager for session_id=%s", session_id, exc_info=True)
         asyncio.create_task(rt.warm_engine_for_session(session_id=session_id))
 
         async def send(msg: dict[str, Any]) -> bool:
@@ -1141,6 +1145,26 @@ def build_app(*, project_root: Path) -> FastAPI:
                                 ):
                                     break
                                 continue
+
+                            # First try in-place subagent approval waits (thread-blocked tool approvals).
+                            try:
+                                am = rt.approval_manager_for_session(session_id)
+                            except Exception:
+                                am = None
+                            if am is not None and decision in {"approve", "deny"} and am.resolve(approval_id, decision):
+                                if not (
+                                    await send(
+                                        {
+                                            "type": "ack",
+                                            "op": "approval",
+                                            "approval_id": approval_id,
+                                            "decision": decision,
+                                        }
+                                    )
+                                ):
+                                    break
+                                continue
+
                             payload: dict[str, Any] = {"approval_id": approval_id, "decision": decision}
                             note = msg.get("note")
                             if isinstance(note, str) and note.strip():
@@ -1200,6 +1224,10 @@ def build_app(*, project_root: Path) -> FastAPI:
         except WebSocketDisconnect:
             return
         finally:
+            try:
+                rt.approval_manager_for_session(session_id).deny_all()
+            except Exception:
+                logger.debug("Failed to deny pending in-place approvals for session_id=%s", session_id, exc_info=True)
             await hub.remove(ws)
 
     @app.websocket("/ws/{session_id}/browser")

@@ -138,6 +138,9 @@ class CanonicalRequest:
     messages: list[CanonicalMessage]
     tools: list[ToolSpec] = field(default_factory=list)
     params: dict[str, Any] = field(default_factory=dict)
+    # When set, the Responses API adapter sends only the incremental messages and
+    # lets the provider reuse the stored KV cache from the previous response.
+    previous_response_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -169,6 +172,8 @@ class LLMResponse:
     stop_reason: str | None = None
     request_id: str | None = None
     thinking: str | None = None
+    # Populated by the Responses API adapter; used as previous_response_id on the next turn.
+    response_id: str | None = None
 
 
 class LLMStreamEventKind(StrEnum):

@@ -48,6 +48,8 @@ class EventKind(str, Enum):
     TOOL_CALL_START = "tool_call_start"
     TOOL_CALL_PROGRESS = "tool_call_progress"
     TOOL_CALL_END = "tool_call_end"
+    TOOL_APPROVAL_REQUESTED = "tool_approval_requested"
+    TOOL_APPROVAL_RESOLVED = "tool_approval_resolved"
 
     SUBAGENT_APPROVER_STARTED = "subagent_approver_started"
     SUBAGENT_APPROVER_COMPLETED = "subagent_approver_completed"

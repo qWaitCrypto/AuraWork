@@ -71,15 +71,11 @@ class DAGExecuteNextTool:
         if isinstance(max_nodes, int):
             original_max_parallel = self.dag_runner.max_parallel
             self.dag_runner.max_parallel = max_nodes
-            if self.dag_runner._scheduler is not None:
-                self.dag_runner._scheduler.max_parallel = max_nodes
         try:
             nodes = self.dag_runner.get_dispatchable_nodes()
         finally:
             if original_max_parallel is not None:
                 self.dag_runner.max_parallel = original_max_parallel
-                if self.dag_runner._scheduler is not None:
-                    self.dag_runner._scheduler.max_parallel = original_max_parallel
 
         if not nodes:
             try:
@@ -227,10 +223,9 @@ class DAGExecuteNextTool:
                     "receipts_count": len(action.receipts),
                 }
             elif action.action == "pause_for_approval":
-                # Release the node from scheduler._running so it can be
-                # re-dispatched once approval is granted.  Without this the
-                # node stays stuck in _running forever and the DAG deadlocks.
-                self.dag_runner.release_running(node_id)
+                # Release the node from in-memory dispatched state so it can
+                # be redispatched after approval.
+                self.dag_runner.release_dispatched(node_id)
                 blocked_nodes.append(node_id)
                 if isinstance(action.approval_request, dict):
                     req_copy = dict(action.approval_request)
@@ -441,13 +436,13 @@ class DAGExecuteNextTool:
 
         by_id: dict[str, PlanItem] = {it.id: it for it in plan_state.plan}
 
-        # Scheduler state is more accurate for "running" than PlanStore, because PlanStore may keep nodes as "pending"
-        # while they are actively executing.
+        # PlanStore may keep nodes as pending while they are actively executing.
+        # `_dispatched` tracks in-memory in-flight dispatches in this process.
         running_nodes: list[str] = []
         try:
-            sched = getattr(self.dag_runner, "_scheduler", None)
-            if sched is not None:
-                running_nodes = sorted(list(sched.running_nodes()))
+            dispatched = set(getattr(self.dag_runner, "_dispatched", set()))
+            in_progress = {it.id for it in plan_state.plan if it.status.value == "in_progress"}
+            running_nodes = sorted({n for n in (dispatched | in_progress) if isinstance(n, str) and n})
         except Exception:
             running_nodes = []
 

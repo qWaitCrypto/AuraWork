@@ -15,7 +15,7 @@ from ..error_codes import ErrorCode
 from ..llm.router import ModelRouter
 from ..llm.types import ModelRequirements, ModelRole, ToolSpec
 from ..llm.tool_schema_compat import adapt_tool_specs_for_profile
-from ..models import WorkSpec
+from ..models import ApprovalRequest, SubagentArtifact, SubagentReceipt as ResultReceipt, SubagentResult, WorkSpec
 from ..orchestrator_helpers import _summarize_text, _summarize_tool_for_ui
 from ..protocol import Event, EventKind, EVENT_SCHEMA_VERSION
 from ..prompts.template import render_prompt_template
@@ -222,7 +222,7 @@ def _is_safe_skill_runner_shell_command(
 
 
 @dataclass(frozen=True, slots=True)
-class SubagentReceipt:
+class ToolCallReceipt:
     tool_execution_id: str | None
     tool_name: str
     tool_call_id: str
@@ -300,6 +300,58 @@ def _report_requests_user_takeover(report: Any) -> bool:
             return True
 
     return False
+
+
+def _extract_proposals_from_report(report: Any) -> list[dict[str, Any]]:
+    if not isinstance(report, dict):
+        return []
+    proposals = report.get("proposals")
+    if not isinstance(proposals, list):
+        return []
+    return [dict(p) for p in proposals if isinstance(p, dict)]
+
+
+def _extract_artifacts_from_report(report: Any) -> list[SubagentArtifact]:
+    if not isinstance(report, dict):
+        return []
+    raw = report.get("artifacts")
+    if not isinstance(raw, list):
+        return []
+    out: list[SubagentArtifact] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        art_type = str(item.get("type") or "").strip()
+        path = str(item.get("path") or "").strip()
+        if not art_type or not path:
+            continue
+        fmt_raw = item.get("format")
+        fmt = str(fmt_raw).strip() if isinstance(fmt_raw, str) and fmt_raw.strip() else None
+        out.append(SubagentArtifact(type=art_type, path=path, format=fmt))
+    return out
+
+
+def _takeover_approval_request_from_report(report: Any, *, fallback_error: str | None = None) -> ApprovalRequest:
+    next_step = report.get("next_step_suggestion") if isinstance(report, dict) and isinstance(report.get("next_step_suggestion"), dict) else {}
+    action_summary = str(
+        (report.get("action_summary") if isinstance(report, dict) else None)
+        or next_step.get("action_summary")
+        or "Please complete browser verification/login, then approve to resume."
+    ).strip()
+    reason = str(
+        (report.get("reason") if isinstance(report, dict) else None)
+        or next_step.get("reason")
+        or next_step.get("message")
+        or fallback_error
+        or "Browser task requires user takeover (CAPTCHA/login/2FA)."
+    ).strip()
+    return ApprovalRequest(
+        kind="user_takeover",
+        action_summary=action_summary,
+        risk_level="medium",
+        reason=reason,
+        tool_name=None,
+    )
 
 
 def _work_spec_public_payload(work_spec: WorkSpec | None) -> dict[str, Any] | None:
@@ -412,7 +464,7 @@ def run_subagent(
     This runner:
     - Restricts tools via a per-run allowlist (glob patterns).
     - Uses Aura ToolRuntime inspection for deny/approval decisions.
-    - Never nests interactive approvals: if a tool needs approval, stop and return a report.
+    - Supports in-place approval waits when an ApprovalManager is available in context.
     """
 
     project_root = Path(project_root).expanduser().resolve()
@@ -422,13 +474,15 @@ def run_subagent(
     request_id = exec_context.request_id if exec_context is not None else None
     turn_id = exec_context.turn_id if exec_context is not None else None
     event_bus = exec_context.event_bus if exec_context is not None else None
+    approval_manager = exec_context.approval_manager if exec_context is not None else None
+    event_loop = exec_context.event_loop if exec_context is not None else None
     browser_agent_session = (
         agent_browser_session_for_subagent_run(aura_session_id=session_id, subagent_run_id=subagent_run_id)
         if isinstance(session_id, str) and session_id.strip()
         else None
     )
 
-    receipts: list[SubagentReceipt] = []
+    receipts: list[ToolCallReceipt] = []
     executed_tool_calls = 0
     needs_approval: dict[str, Any] | None = None
     work_spec_payload = _work_spec_public_payload(work_spec)
@@ -445,7 +499,7 @@ def run_subagent(
             tool_call_id = payload.get("tool_call_id")
             if isinstance(tool_name, str) and tool_name and isinstance(tool_call_id, str) and tool_call_id:
                 receipts.append(
-                    SubagentReceipt(
+                    ToolCallReceipt(
                         tool_execution_id=payload.get("tool_execution_id") if isinstance(payload.get("tool_execution_id"), str) else None,
                         tool_name=tool_name,
                         tool_call_id=tool_call_id,
@@ -850,6 +904,75 @@ def run_subagent(
                     "reason": inspection.reason,
                     "approver_trace": approver_trace,
                 }
+                if approval_manager is not None and event_loop is not None:
+                    approval_id = f"tool-{subagent_run_id}-{tool_call_id}"
+                    approval_request = {
+                        "tool_name": planned.tool_name,
+                        "action_summary": inspection.action_summary,
+                        "risk_level": inspection.risk_level or "high",
+                        "reason": inspection.reason,
+                        "diff_ref": inspection.diff_ref.to_dict() if inspection.diff_ref is not None else None,
+                    }
+                    pending = approval_manager.register(approval_id, approval_request)
+                    _emit_event(
+                        kind=EventKind.TOOL_APPROVAL_REQUESTED,
+                        payload={
+                            "approval_id": approval_id,
+                            "tool_execution_id": planned.tool_execution_id,
+                            "tool_call_id": planned.tool_call_id,
+                            "tool_name": planned.tool_name,
+                            "action_summary": inspection.action_summary,
+                            "risk_level": inspection.risk_level or "high",
+                            "reason": inspection.reason,
+                            "diff_ref": approval_request["diff_ref"],
+                        },
+                    )
+
+                    got_decision = pending.event.wait(timeout=300)
+                    approval_manager.unregister(approval_id)
+                    decision = pending.decision[0] if got_decision else "deny"
+                    _emit_event(
+                        kind=EventKind.TOOL_APPROVAL_RESOLVED,
+                        payload={
+                            "approval_id": approval_id,
+                            "tool_execution_id": planned.tool_execution_id,
+                            "tool_call_id": planned.tool_call_id,
+                            "tool_name": planned.tool_name,
+                            "decision": decision,
+                        },
+                    )
+
+                    allow = decision == "approve"
+                    try:
+                        tool.requires_confirmation = True
+                    except Exception:
+                        logger.warning("Failed to set requires_confirmation for resolved subagent approval.", exc_info=True)
+                    try:
+                        tool.confirmed = allow
+                    except Exception:
+                        logger.warning("Failed to set confirmed for resolved subagent approval.", exc_info=True)
+                    try:
+                        tool.confirmation_note = (
+                            "User approved."
+                            if allow
+                            else "Denied or timed out."
+                        )
+                    except Exception:
+                        logger.warning("Failed to set confirmation_note for resolved subagent approval.", exc_info=True)
+
+                    # This approval was resolved in-place; do not leak stale pending flag.
+                    needs_approval = None
+                    _update_system_message_in_run(out, system_message=system_message)
+                    out = agent.continue_run(
+                        run_response=out,
+                        stream=False,
+                        session_id=session_id,
+                        metadata=metadata,
+                    )
+                    assistant_text = _extract_text(out)
+                    report = _json_or_text(assistant_text)
+                    continue
+
                 _emit_event(
                     kind=EventKind.TOOL_CALL_END,
                     payload={
@@ -997,6 +1120,65 @@ def run_subagent(
         meta={"summary": f"Subagent transcript ({preset.name})", "text_summary": _summarize_text(assistant_text)},
     )
 
+    typed_receipts = [
+        ResultReceipt(
+            tool=r.tool_name,
+            args_summary=r.summary or "",
+            result_summary=r.error or (r.status or ""),
+        )
+        for r in receipts
+    ]
+    typed_artifacts = _extract_artifacts_from_report(report)
+    typed_proposals = _extract_proposals_from_report(report)
+
+    approval_request_model: ApprovalRequest | None = None
+    if status == "needs_approval" and isinstance(needs_approval, dict):
+        approval_request_model = ApprovalRequest(
+            kind="tool_approval",
+            action_summary=str(needs_approval.get("action_summary") or "Subagent requested approval").strip(),
+            risk_level=str(needs_approval.get("risk_level") or "high").strip() or "high",
+            reason=str(needs_approval.get("reason") or "").strip(),
+            tool_name=str(needs_approval.get("tool_name") or "").strip() or None,
+        )
+    elif status == "needs_user_takeover":
+        approval_request_model = _takeover_approval_request_from_report(report, fallback_error="User takeover required.")
+
+    error_text: str | None = None
+    if status == "failed":
+        if isinstance(report, dict):
+            error_text = str(report.get("error") or report.get("summary") or report.get("message") or "").strip() or None
+        elif isinstance(report, str):
+            error_text = report.strip() or None
+
+    typed_data: dict[str, Any] = {
+        "ok": status == "completed",
+        "subagent_run_id": subagent_run_id,
+        "browser_agent_session": browser_agent_session,
+        "preset": preset.name,
+        "selected_role": selected_role.value,
+        "selected_profile_id": selected_profile_id,
+        "fallback_used": fallback_used,
+        "tool_allowlist": list(tool_allowlist),
+        "limits": {"max_turns": int(max_turns), "max_tool_calls": int(max_tool_calls)},
+        "executed_tool_calls": executed_tool_calls,
+        "report": report,
+        "transcript_ref": transcript_ref.to_dict(),
+        "warnings": list(warnings),
+        "error_code": error_code,
+    }
+    if needs_approval is not None:
+        typed_data["needs_approval"] = [dict(needs_approval)]
+
+    typed_result = SubagentResult(
+        status=status,
+        receipts=typed_receipts,
+        artifacts=typed_artifacts,
+        proposals=typed_proposals,
+        approval_request=approval_request_model,
+        error=error_text,
+        data=typed_data,
+    ).model_dump()
+
     return {
         "ok": status == "completed",
         "subagent_run_id": subagent_run_id,
@@ -1012,7 +1194,8 @@ def run_subagent(
         "tool_allowlist": list(tool_allowlist),
         "limits": {"max_turns": int(max_turns), "max_tool_calls": int(max_tool_calls)},
         "executed_tool_calls": executed_tool_calls,
-        "receipts": [r.to_dict() for r in receipts],
+        "receipts": typed_result.get("receipts", []),
         "report": report,
         "transcript_ref": transcript_ref.to_dict(),
+        **typed_result,
     }

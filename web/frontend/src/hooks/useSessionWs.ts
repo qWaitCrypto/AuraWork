@@ -77,8 +77,13 @@ export function useSessionWs() {
 
         const stream = liveStreamRef.current;
         const debug = uiDebugEnabled();
+        let shouldRefreshApprovals = false;
 
         for (const e of batch) {
+            if (e.kind === "tool_approval_requested" || e.kind === "tool_approval_resolved") {
+                shouldRefreshApprovals = true;
+                continue;
+            }
             if (e.kind === "llm_request_started") {
                 stream.open = true;
                 stream.startedAt = e.timestamp;
@@ -136,6 +141,13 @@ export function useSessionWs() {
 
         appendMany(batch);
 
+        if (shouldRefreshApprovals) {
+            const sid = currentSessionIdRef.current;
+            if (sid) {
+                apiGetApprovals(sid).then((rows) => setApprovals(rows)).catch(() => { });
+            }
+        }
+
         // Clear optimistic chat message when the server acknowledges a chat op
         for (const e of batch) {
             if (e.kind === "operation_started" && String(e.payload.op_kind || "") === "chat") {
@@ -143,7 +155,7 @@ export function useSessionWs() {
                 break;
             }
         }
-    }, [appendMany, primeArtifactText]);
+    }, [appendMany, primeArtifactText, setApprovals]);
 
     const enqueueWsEvent = useCallback((e: AuraEvent) => {
         wsEventQueueRef.current.push(e);

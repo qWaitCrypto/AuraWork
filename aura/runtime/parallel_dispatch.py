@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
+import dataclasses
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from pydantic import ValidationError
+
+from .models import SubagentResult
 from .plan import PlanItem
 from .tools.runtime import ToolExecutionContext
 
@@ -37,6 +42,27 @@ class NodeCompletionAction:
     receipts: tuple[dict[str, Any], ...] = ()
 
 
+_INVALID_SUBAGENT_RESULT_SCHEMA = "Invalid subagent result schema."
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except Exception:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+_SUBAGENT_DISPATCH_MAX_WORKERS = _env_int("AURA_SUBAGENT_DISPATCH_MAX_WORKERS", 32, minimum=4, maximum=256)
+_SUBAGENT_DISPATCH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_SUBAGENT_DISPATCH_MAX_WORKERS,
+    thread_name_prefix="aura-subagent-dispatch",
+)
+
+
 async def _dispatch_single_node(
     *,
     node: PlanItem,
@@ -59,6 +85,9 @@ async def _dispatch_single_node(
     else:
         enhanced_task = node.step
 
+    loop = asyncio.get_running_loop()
+    enriched_context = dataclasses.replace(context, event_loop=loop) if context is not None else None
+
     def _run_sync() -> dict[str, Any]:
         return subagent_tool.execute(
             args={
@@ -68,111 +97,48 @@ async def _dispatch_single_node(
                 "work_spec": work_spec,
             },
             project_root=project_root,
-            context=context,
+            context=enriched_context,
         )
 
     try:
-        result = await asyncio.to_thread(_run_sync)
+        raw_result = await loop.run_in_executor(_SUBAGENT_DISPATCH_EXECUTOR, _run_sync)
     except Exception as exc:
         return NodeDispatchResult(node_id=node.id, status="error", result=None, error=str(exc))
 
-    status = str(result.get("status") or "unknown")
-    status_norm = status.strip().lower()
-    report = _parse_report(result)
-    report_status_norm = str(report.get("status") or "").strip().lower()
-    # Text phrases an LLM may emit when it wants approval but didn't use the
-    # structured field.  We check the full serialized report so we catch prose
-    # buried in nested fields (e.g. "proposals", "receipts", "error" text).
-    _APPROVAL_TEXT_SIGNALS = (
-        "need confirmation",
-        "need your approval",
-        "need approval",
-        "needs your approval",
-        "awaiting approval",
-        "please approve",
-        "require confirmation",
-        "requires confirmation",
-        "waiting for confirmation",
-        "waiting for approval",
-        "requesting approval",
-    )
-    _report_text = json.dumps(report).lower() if report else ""
+    if not isinstance(raw_result, dict):
+        return NodeDispatchResult(
+            node_id=node.id,
+            status="failed",
+            result=None,
+            error=_INVALID_SUBAGENT_RESULT_SCHEMA,
+        )
 
-    if (
-        result.get("needs_approval")
-        or report.get("needs_approval")
-        or report_status_norm in {"needs_approval", "require_approval", "requires_approval", "pending_approval"}
-        or any(sig in _report_text for sig in _APPROVAL_TEXT_SIGNALS)
-    ):
-        status = "needs_approval"
-    elif status_norm in {"needs_user_takeover", "user_takeover_required", "needs_takeover"} or report_status_norm in {
-        "needs_user_takeover",
-        "user_takeover_required",
-        "needs_takeover",
-    }:
-        status = "needs_user_takeover"
-    elif result.get("error") or status_norm == "failed" or report_status_norm == "failed":
+    try:
+        typed = SubagentResult.model_validate(raw_result)
+    except ValidationError:
+        return NodeDispatchResult(
+            node_id=node.id,
+            status="failed",
+            result=raw_result,
+            error=_INVALID_SUBAGENT_RESULT_SCHEMA,
+        )
+
+    status = typed.status
+    error = None
+    if status == "completed" and len(typed.receipts) == 0:
         status = "failed"
+        error = "Subagent reported completion without receipts."
 
-    # If the subagent reported "completed" but executed zero tool calls, demote to
-    # "failed".  Any worker that meaningfully produces a deliverable (doc, sheet,
-    # research) must call at least one tool.  Zero receipts means the LLM either
-    # hallucinated success or bailed out without doing real work.  This catches
-    # both the "error signals in report" case and the silent false-completion case
-    # (LLM emits {"status":"completed","receipts":[]} with no error text).
-    if status not in {"failed", "needs_approval", "needs_user_takeover"}:
-        all_receipts = _extract_receipts(result)
-        if len(all_receipts) == 0:
-            status = "failed"
-
-    return NodeDispatchResult(node_id=node.id, status=status, result=result, error=None)
+    return NodeDispatchResult(node_id=node.id, status=status, result=typed.model_dump(), error=error)
 
 
-def _parse_report(result: dict[str, Any] | None) -> dict[str, Any]:
+def _parse_subagent_result(result: dict[str, Any] | None) -> SubagentResult | None:
     if result is None:
-        return {}
-
-    report = result.get("report")
-    if report is None:
-        return {}
-    if isinstance(report, dict):
-        return report
-    if isinstance(report, str):
-        try:
-            parsed = json.loads(report)
-        except (json.JSONDecodeError, TypeError):
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
-
-
-def _extract_proposals(report: dict[str, Any]) -> list[dict[str, Any]]:
-    proposals = report.get("proposals")
-    if isinstance(proposals, list):
-        return [p for p in proposals if isinstance(p, dict)]
-    return []
-
-
-def _extract_artifacts(report: dict[str, Any]) -> list[dict[str, Any]]:
-    artifacts = report.get("artifacts")
-    if isinstance(artifacts, list):
-        return [a for a in artifacts if isinstance(a, dict)]
-    return []
-
-
-def _extract_receipts(result: dict[str, Any] | None) -> list[dict[str, Any]]:
-    if result is None:
-        return []
-
-    receipts = result.get("receipts")
-    if isinstance(receipts, list):
-        return [r for r in receipts if isinstance(r, dict)]
-
-    report = _parse_report(result)
-    receipts = report.get("receipts")
-    if isinstance(receipts, list):
-        return [r for r in receipts if isinstance(r, dict)]
-    return []
+        return None
+    try:
+        return SubagentResult.model_validate(result)
+    except ValidationError:
+        return None
 
 
 def _non_empty_str(value: Any) -> str | None:
@@ -183,26 +149,17 @@ def _non_empty_str(value: Any) -> str | None:
     return None
 
 
-def _extract_failure_message(*, result: dict[str, Any] | None, report: dict[str, Any]) -> str:
-    direct_error = None
-    if isinstance(result, dict):
-        direct_error = _non_empty_str(result.get("error"))
-    if direct_error is None:
-        direct_error = _non_empty_str(report.get("error"))
+def _extract_failure_message(*, typed: SubagentResult, fallback_error: str | None = None) -> str:
+    if isinstance(fallback_error, str) and fallback_error.strip():
+        return fallback_error.strip()
+
+    direct_error = _non_empty_str(typed.error)
     if direct_error is not None:
         return direct_error
 
-    error_code = None
-    summary = None
-    if isinstance(result, dict):
-        error_code = _non_empty_str(result.get("error_code"))
-        summary = _non_empty_str(result.get("summary") or result.get("message"))
-
-    if error_code is None:
-        error_code = _non_empty_str(report.get("error_code"))
-    if summary is None:
-        summary = _non_empty_str(report.get("summary") or report.get("message"))
-
+    data = typed.data if isinstance(typed.data, dict) else {}
+    error_code = _non_empty_str(data.get("error_code"))
+    summary = _non_empty_str(data.get("summary") or data.get("message"))
     if error_code and summary:
         return f"{error_code}: {summary}"
     if summary:
@@ -212,20 +169,18 @@ def _extract_failure_message(*, result: dict[str, Any] | None, report: dict[str,
     return "Unknown failure"
 
 
-def _extract_takeover_request(*, result: dict[str, Any] | None, report: dict[str, Any]) -> dict[str, Any]:
-    next_step = report.get("next_step_suggestion") if isinstance(report.get("next_step_suggestion"), dict) else {}
+def _extract_takeover_request(*, typed: SubagentResult) -> dict[str, Any]:
+    data = typed.data if isinstance(typed.data, dict) else {}
 
-    reason = str(
-        report.get("reason")
-        or next_step.get("reason")
-        or next_step.get("message")
+    reason = (
+        _non_empty_str(data.get("reason"))
+        or _non_empty_str(typed.error)
         or "Browser task requires user takeover (CAPTCHA/login/2FA)."
-    ).strip()
-    action_summary = str(
-        report.get("action_summary")
-        or next_step.get("action_summary")
+    )
+    action_summary = (
+        _non_empty_str(data.get("action_summary"))
         or "Please complete browser verification/login, then approve to resume."
-    ).strip()
+    )
 
     out: dict[str, Any] = {
         "kind": "user_takeover",
@@ -237,31 +192,10 @@ def _extract_takeover_request(*, result: dict[str, Any] | None, report: dict[str
         "status": "needs_user_takeover",
     }
 
-    current_url = report.get("current_url") or next_step.get("current_url")
-    if isinstance(current_url, str) and current_url.strip():
-        out["current_url"] = current_url.strip()
-
-    screenshot = report.get("screenshot") or next_step.get("screenshot")
-    if isinstance(screenshot, str) and screenshot.strip():
-        out["screenshot"] = screenshot.strip()
-
-    next_hint = report.get("next_step") or next_step.get("next_step")
-    if isinstance(next_hint, str) and next_hint.strip():
-        out["next_step"] = next_hint.strip()
-
-    if isinstance(result, dict):
-        run_id = result.get("subagent_run_id")
-        if isinstance(run_id, str) and run_id.strip():
-            out["subagent_run_id"] = run_id.strip()
-
-        browser_session = result.get("browser_agent_session")
-        if isinstance(browser_session, str) and browser_session.strip():
-            out["browser_agent_session"] = browser_session.strip()
-
-    if "browser_agent_session" not in out:
-        browser_session_report = report.get("browser_agent_session") if isinstance(report, dict) else None
-        if isinstance(browser_session_report, str) and browser_session_report.strip():
-            out["browser_agent_session"] = browser_session_report.strip()
+    for key in ("current_url", "screenshot", "next_step", "subagent_run_id", "browser_agent_session"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            out[key] = value.strip()
 
     return out
 
@@ -279,25 +213,20 @@ class NodeCompletionHandler:
                 error=dispatch_result.error,
             )
 
-        result = dispatch_result.result
-        report = _parse_report(result)
-        proposals = tuple(_extract_proposals(report))
-        artifacts = tuple(_extract_artifacts(report))
-        receipts = tuple(_extract_receipts(result))
+        typed = _parse_subagent_result(dispatch_result.result)
+        if typed is None:
+            return NodeCompletionAction(
+                action="mark_failed",
+                node_id=node_id,
+                error=dispatch_result.error or _INVALID_SUBAGENT_RESULT_SCHEMA,
+            )
+
+        proposals = tuple(dict(p) for p in typed.proposals if isinstance(p, dict))
+        artifacts = tuple(a.model_dump() for a in typed.artifacts)
+        receipts = tuple(r.model_dump() for r in typed.receipts)
+        approval_request = typed.approval_request.model_dump() if typed.approval_request is not None else None
 
         if dispatch_result.status == "needs_approval":
-            approval_request: dict[str, Any] | None = None
-            if result is not None:
-                approval_raw = result.get("needs_approval")
-                if approval_raw is None:
-                    approval_raw = report.get("needs_approval")
-                if isinstance(approval_raw, dict):
-                    approval_request = approval_raw
-                elif isinstance(approval_raw, list):
-                    if len(approval_raw) == 1 and isinstance(approval_raw[0], dict):
-                        approval_request = approval_raw[0]
-                    else:
-                        approval_request = {"requests": [r for r in approval_raw if isinstance(r, dict)]}
             if approval_request is None:
                 approval_request = {"reason": "Subagent requested approval"}
 
@@ -311,7 +240,7 @@ class NodeCompletionHandler:
             )
 
         if dispatch_result.status == "needs_user_takeover":
-            approval_request = _extract_takeover_request(result=result, report=report)
+            approval_request = approval_request or _extract_takeover_request(typed=typed)
             return NodeCompletionAction(
                 action="pause_for_approval",
                 node_id=node_id,
@@ -322,7 +251,7 @@ class NodeCompletionHandler:
             )
 
         if dispatch_result.status == "failed":
-            error_msg = _extract_failure_message(result=result, report=report)
+            error_msg = _extract_failure_message(typed=typed, fallback_error=dispatch_result.error)
             return NodeCompletionAction(
                 action="mark_failed",
                 node_id=node_id,

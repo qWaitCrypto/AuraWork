@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import hashlib
 import json
@@ -10,7 +11,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from ..event_bus import EventBus
@@ -24,6 +25,9 @@ from ..stores import ArtifactStore
 from .builtins import _resolve_in_project
 from .registry import ToolRegistry
 from .browser_steps import parse_browser_steps
+
+if TYPE_CHECKING:
+    from ..subagents.approval_manager import ApprovalManager
 
 
 logger = logging.getLogger(__name__)
@@ -319,6 +323,8 @@ class ToolExecutionContext:
     tool_execution_id: str
     event_bus: EventBus | None = None
     metadata: dict[str, Any] | None = None
+    approval_manager: "ApprovalManager | None" = None
+    event_loop: "asyncio.AbstractEventLoop | None" = None
 
 
 class ToolRuntime:

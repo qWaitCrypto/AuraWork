@@ -26,6 +26,7 @@ from aura.runtime.api import (
     now_ts_ms,
     update_session_settings,
 )
+from aura.runtime.subagents.approval_manager import ApprovalManager
 
 
 logger = logging.getLogger(__name__)
@@ -83,6 +84,7 @@ class WebRuntime:
         self._model_layers = load_model_config_layers_for_dir(self.project_root, require_project=False)
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._engine_cache: dict[str, Engine] = {}
+        self._approval_managers: dict[str, ApprovalManager] = {}
 
     def lock_for_session(self, session_id: str) -> asyncio.Lock:
         lock = self._session_locks.get(session_id)
@@ -174,6 +176,9 @@ class WebRuntime:
         # Drop any cached engine/locks first.
         self._engine_cache.pop(sid, None)
         self._session_locks.pop(sid, None)
+        manager = self._approval_managers.pop(sid, None)
+        if manager is not None:
+            manager.deny_all()
 
         # Remove session meta + event log (main persistence).
         try:
@@ -235,7 +240,53 @@ class WebRuntime:
 
     def list_pending_approvals(self, *, session_id: str, request_id: str | None = None) -> list[dict[str, Any]]:
         recs = self.approval_store.list(session_id=session_id, status=ApprovalStatus.PENDING, request_id=request_id)
-        return [r.to_dict() for r in recs]
+        merged: list[dict[str, Any]] = [r.to_dict() for r in recs]
+
+        manager = self.approval_manager_for_session(session_id)
+        pending_live = manager.list_pending()
+        if pending_live:
+            seen_ids: set[str] = set()
+            for row in merged:
+                aid = row.get("approval_id")
+                if isinstance(aid, str) and aid.strip():
+                    seen_ids.add(aid.strip())
+            for row in pending_live:
+                aid = row.get("approval_id")
+                if isinstance(aid, str) and aid.strip() and aid.strip() in seen_ids:
+                    continue
+                aid_str = str(aid or "").strip()
+                if not aid_str:
+                    continue
+                merged.append(
+                    {
+                        "approval_id": aid_str,
+                        "session_id": session_id,
+                        "request_id": request_id,
+                        "created_at": self.now_ts_ms(),
+                        "status": "pending",
+                        "turn_id": None,
+                        "action_summary": row.get("action_summary"),
+                        "risk_level": row.get("risk_level"),
+                        "options": ["approve", "deny"],
+                        "reason": row.get("reason"),
+                        "diff_ref": row.get("diff_ref") if isinstance(row.get("diff_ref"), dict) else None,
+                        "resume_kind": None,
+                        "resume_payload": None,
+                        "decision": None,
+                    }
+                )
+
+        return merged
+
+    def approval_manager_for_session(self, session_id: str) -> ApprovalManager:
+        sid = str(session_id or "").strip()
+        if not sid:
+            raise ValueError("session_id must be non-empty.")
+        manager = self._approval_managers.get(sid)
+        if manager is None:
+            manager = ApprovalManager()
+            self._approval_managers[sid] = manager
+        return manager
 
     def _build_engine(self, *, session_id: str) -> Engine:
         meta = self.session_store.get_session(session_id)
@@ -273,6 +324,7 @@ class WebRuntime:
                 system_prompt=None,
                 tools_enabled=enable_tools,
                 max_tool_turns=30,
+                approval_manager=self.approval_manager_for_session(session_id),
             )
         except EngineBuildError as e:
             raise RuntimeError(str(e)) from e

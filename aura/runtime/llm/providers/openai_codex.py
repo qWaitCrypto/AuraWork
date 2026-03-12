@@ -45,16 +45,43 @@ class OpenAICodexAdapter:
         payload: dict = dict(profile.default_params)
         payload.update(request.params)
         payload["model"] = profile.model_name
-        payload["store"] = False
 
         instructions = request.system or ""
-        payload["instructions"] = instructions
 
         use_parts = _use_content_parts(profile)
+
+        if request.previous_response_id:
+            # Incremental mode: the provider already has the prior context stored.
+            # Collect every message that was appended AFTER the last ASSISTANT turn
+            # (can be USER messages, TOOL results, or both).
+            incremental: list[dict] = []
+            for msg in reversed(request.messages):
+                if msg.role is CanonicalMessageRole.ASSISTANT:
+                    break
+                if msg.role is CanonicalMessageRole.USER:
+                    if use_parts:
+                        incremental.insert(0, {"role": "user", "content": _content_parts(msg.role, msg.content)})
+                    else:
+                        incremental.insert(0, {"type": "message", "role": "user", "content": msg.content})
+                elif msg.role is CanonicalMessageRole.TOOL:
+                    if not msg.tool_call_id:
+                        raise ProviderAdapterError("Tool message is missing tool_call_id.")
+                    incremental.insert(0, {"type": "function_call_output", "call_id": msg.tool_call_id, "output": msg.content})
+            if incremental:
+                payload["previous_response_id"] = request.previous_response_id
+                payload["input"] = incremental
+                payload["store"] = True
+                payload["instructions"] = instructions
+                if request.tools:
+                    payload["tools"] = [_tool_spec_to_responses(t) for t in request.tools]
+                return PreparedRequest(method="POST", url=url, headers=headers, json=payload)
+            # Fall through to full-context mode if nothing to send incrementally.
+
+        # Full-context mode: send entire history and enable server-side storage
+        # so the next turn can use previous_response_id.
         input_items: list[dict] = []
         for msg in request.messages:
             if msg.role is CanonicalMessageRole.SYSTEM:
-                # Canonical system messages should be folded into `instructions`.
                 if msg.content:
                     instructions = (instructions + "\n\n" + msg.content).strip() if instructions else msg.content
                 continue
@@ -85,8 +112,9 @@ class OpenAICodexAdapter:
 
             raise ProviderAdapterError(f"Unsupported canonical message role: {msg.role}")
 
-        payload["instructions"] = instructions
         payload["input"] = input_items
+        payload["store"] = True
+        payload["instructions"] = instructions
 
         if request.tools:
             payload["tools"] = [_tool_spec_to_responses(t) for t in request.tools]

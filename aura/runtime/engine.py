@@ -151,6 +151,7 @@ def build_engine_for_session(
     system_prompt: str | None = None,
     tools_enabled: bool = False,
     max_tool_turns: int | None = None,
+    approval_manager: Any | None = None,
 ) -> Engine:
     """
     Factory for constructing the current Aura engine.
@@ -177,4 +178,5 @@ def build_engine_for_session(
         system_prompt=system_prompt,
         tools_enabled=tools_enabled,
         max_tool_turns=30 if max_tool_turns is None else int(max_tool_turns),
+        approval_manager=approval_manager,
     )

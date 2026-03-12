@@ -330,6 +330,7 @@ class AgnoAsyncEngine:
     tool_registry: ToolRegistry | None = None
     tool_runtime: ToolRuntime | None = None
     memory_summary: str | None = None
+    approval_manager: Any | None = None
     schema_version: str = EVENT_SCHEMA_VERSION
 
     model_router: ModelRouter = field(init=False)
@@ -342,6 +343,10 @@ class AgnoAsyncEngine:
     snapshot_backend: GitSnapshotBackend = field(init=False)
 
     _history: list[CanonicalMessage] | None = field(default=None, init=False)
+    # Tracks the last Responses API response id so the next turn can pass
+    # previous_response_id instead of re-sending the full history.
+    # Reset to None whenever history is cleared/compacted.
+    _last_response_id: str | None = field(default=None, init=False, repr=False)
     # Knowledge / RAG is implemented as an optional module and is not enabled by default.
     _knowledge: Any | None = field(default=None, init=False, repr=False)
     # ========== Multi-Surface extension point ==========
@@ -638,6 +643,7 @@ class AgnoAsyncEngine:
     def apply_memory_summary_retention(self) -> None:
         if self._history is None:
             self._history = []
+            self._last_response_id = None
         if not (isinstance(self.memory_summary, str) and self.memory_summary.strip()):
             return
         profile = self.model_config.get_profile_for_role(ModelRole.MAIN)
@@ -660,6 +666,7 @@ class AgnoAsyncEngine:
         )
         self.memory_summary = retained.memory_summary
         self._history = list(retained.retained_history)
+        self._last_response_id = None  # compacted; prior response id is no longer valid
 
     async def arun(
         self,
@@ -741,6 +748,7 @@ class AgnoAsyncEngine:
             except Exception:
                 logger.warning("Suppressed exception in continue_run.", exc_info=True)
         self._history = list(snapshot.messages)
+        self._last_response_id = None  # restored from snapshot; prior response id is no longer valid
         turn_id = snapshot.turn_id
 
         decision_map: dict[str, ToolDecision] = {d.tool_call_id: d for d in decisions if d.tool_call_id}
@@ -877,6 +885,7 @@ class AgnoAsyncEngine:
             return
         if self._history is None:
             self._history = []
+            self._last_response_id = None
 
         sub_payload = approval_record.resume_payload.get("subagent") if isinstance(approval_record.resume_payload, dict) else None
         if not isinstance(sub_payload, dict):
@@ -1032,6 +1041,7 @@ class AgnoAsyncEngine:
             return
         if self._history is None:
             self._history = []
+            self._last_response_id = None
 
         payload = approval_record.resume_payload if isinstance(approval_record.resume_payload, dict) else None
         if not isinstance(payload, dict):
@@ -1125,6 +1135,7 @@ class AgnoAsyncEngine:
 
         if self._history is None:
             self._history = []
+            self._last_response_id = None
 
         repair_info = self._maybe_repair_interrupted_turn()
         input_ref = self.artifact_store.put(user_text, kind="chat_user", meta={"summary": _summarize_text(user_text)})
@@ -1309,6 +1320,7 @@ class AgnoAsyncEngine:
 
         if self._history is None:
             self._history = []
+            self._last_response_id = None
 
         if self.tool_registry is None or self.tool_runtime is None:
             raise RuntimeError("Tool runtime not initialized.")
@@ -1600,6 +1612,10 @@ class AgnoAsyncEngine:
                     return RunResult(status="failed", run_id=request_id, session_id=self.session_id, error="llm_request_failed")
                 tool_calls = _normalize_tool_calls(resp.tool_calls)
                 normalized_resp = replace(resp, tool_calls=tool_calls)
+                # Save the Responses API response id so the next turn can use
+                # previous_response_id instead of re-sending the full history.
+                if resp.response_id:
+                    self._last_response_id = resp.response_id
 
                 planned_calls: list[PlannedToolCall] = []
                 if tool_calls:
@@ -2017,7 +2033,7 @@ class AgnoAsyncEngine:
                                         release_nodes.add(req_node.strip())
                                 for node_id in sorted(release_nodes):
                                     try:
-                                        self._dag_runner.release_running(node_id)
+                                        self._dag_runner.release_dispatched(node_id)
                                     except Exception:
                                         logger.warning("Suppressed exception in _public_work_spec_from_args.", exc_info=True)
 
@@ -2288,6 +2304,7 @@ class AgnoAsyncEngine:
 
         if self._history is None:
             self._history = []
+            self._last_response_id = None
 
         is_auto = trigger == "auto"
         has_summary = isinstance(self.memory_summary, str) and self.memory_summary.strip()
@@ -2438,6 +2455,7 @@ class AgnoAsyncEngine:
 
         self.memory_summary = retained.memory_summary
         self._history = list(retained.retained_history)
+        self._last_response_id = None  # compacted; prior response id is no longer valid
         after_count = len(self._history)
 
         summary_ref = self.artifact_store.put(
@@ -2838,7 +2856,12 @@ class AgnoAsyncEngine:
             parts.append("Session memory summary:\n\n" + self.memory_summary.strip())
         parts.append(surface)
         system = render_prompt_template("\n\n".join(parts))
-        return CanonicalRequest(system=system, messages=list(self._history or []), tools=tools)
+        return CanonicalRequest(
+            system=system,
+            messages=list(self._history or []),
+            tools=tools,
+            previous_response_id=self._last_response_id,
+        )
 
     async def _load_mcp_tooling(self, *, stack: AsyncExitStack) -> tuple[dict[str, Any], list[ToolSpec]]:
         """
@@ -3414,6 +3437,8 @@ class AgnoAsyncEngine:
             tool_execution_id=planned.tool_execution_id,
             event_bus=self.event_bus,
             metadata={"aura_request_id": request_id, "aura_turn_id": turn_id},
+            approval_manager=self.approval_manager,
+            event_loop=asyncio.get_running_loop(),
         )
 
         started = time.monotonic()

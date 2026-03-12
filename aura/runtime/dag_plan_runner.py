@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from typing import Any
@@ -13,153 +12,61 @@ from .plan import PlanItem, PlanState, PlanStore, StepStatus
 @dataclass
 class DAGPlanRunner:
     """
-    DAG plan runner: manages PlanStore → Scheduler conversion and state synchronization.
+    DAG plan runner with a stateless scheduler.
 
-    Responsibilities:
-    - Build the DAG from PlanStore items and initialize the Scheduler
-    - Track completed/running nodes and keep PlanStore statuses in sync
-    - Provide an interface to query dispatchable (ready) nodes
+    Holds:
+    - `_dag`: topology cache (rebuild only when plan structure changes)
+    - `_dispatched`: in-flight dispatched nodes (runtime-memory only)
     """
 
     plan_store: PlanStore
     max_parallel: int = 3
 
-    _scheduler: Scheduler[str] | None = field(default=None, init=False, repr=False)
+    _dag: DAG[str] | None = field(default=None, init=False, repr=False)
     _last_plan_hash: str | None = field(default=None, init=False, repr=False)
-
-    def refresh_from_store(self) -> None:
-        """
-        Rebuild the DAG and Scheduler from PlanStore.
-
-        When to call:
-        - The first call to get_dispatchable_nodes()
-        - After PlanStore is modified externally (e.g., the main agent accepts a proposal and calls update_plan)
-        """
-
-        plan_state = self.plan_store.get()
-        current_hash = self._compute_plan_hash(plan_state)
-        if self._scheduler is None or current_hash != self._last_plan_hash:
-            dag = self._build_dag_from_items(plan_state.plan)
-            self._scheduler = Scheduler(dag=dag, max_parallel=self.max_parallel)
-            self._last_plan_hash = current_hash
-
-        self._sync_scheduler_state(plan_state)
+    _dispatched: set[str] = field(default_factory=set, init=False, repr=False)
 
     def get_dispatchable_nodes(self) -> list[PlanItem]:
-        """
-        Return the list of nodes that are ready to be dispatched.
-
-        Returns:
-            list[PlanItem]: nodes that are ready and not already running
-        """
-
-        self.refresh_from_store()
-        if self._scheduler is None:
-            return []
-
-        next_node_ids = self._scheduler.get_next_nodes()
-        if not next_node_ids:
-            return []
-
         plan_state = self.plan_store.get()
+        self._maybe_rebuild_dag(plan_state)
+        if self._dag is None:
+            return []
+
+        scheduler = Scheduler(dag=self._dag, max_parallel=self.max_parallel)
+        ready_node_ids = scheduler.get_ready_nodes(plan_state, frozenset(self._dispatched))
+        if not ready_node_ids:
+            return []
+
         items_by_id = {item.id: item for item in plan_state.plan}
-        dispatchable: list[PlanItem] = []
-        for node_id in next_node_ids:
+        out: list[PlanItem] = []
+        for node_id in ready_node_ids:
             item = items_by_id.get(node_id)
             if item is None:
                 continue
             if item.status is StepStatus.PENDING:
-                dispatchable.append(item)
-
-        return dispatchable
+                out.append(item)
+        if out:
+            self._dispatched.update(item.id for item in out)
+        return out
 
     def mark_completed(self, node_id: str, *, node_result: dict[str, Any] | None = None) -> None:
-        """
-        Mark a node as completed and update both the Scheduler and PlanStore.
-        """
-
-        if self._scheduler is None:
-            self.refresh_from_store()
-        if self._scheduler is None:
-            raise RuntimeError("Scheduler not initialized.")
-
-        self._scheduler.mark_completed(node_id)
-
-        plan_state = self.plan_store.get()
-        updated_items: list[PlanItem] = []
-        found = False
-        for item in plan_state.plan:
-            if item.id == node_id:
-                found = True
-                new_meta = dict(item.metadata)
-                if node_result is not None:
-                    new_meta["node_result"] = node_result
-                if item.status is StepStatus.COMPLETED and new_meta == item.metadata:
-                    updated_items.append(item)
-                else:
-                    updated_items.append(replace(item, status=StepStatus.COMPLETED, metadata=new_meta))
-            else:
-                updated_items.append(item)
-        if not found:
-            raise KeyError(f"PlanItem not found: {node_id}")
-
-        self.plan_store.set(updated_items, goal=plan_state.goal, explanation=plan_state.explanation)
-        self._last_plan_hash = self._compute_plan_hash(
-            PlanState(plan=updated_items, goal=plan_state.goal, explanation=plan_state.explanation, updated_at=plan_state.updated_at)
-        )
+        self._dispatched.discard(node_id)
+        self._update_plan_item(node_id, status=StepStatus.COMPLETED, node_result=node_result)
 
     def mark_failed(self, node_id: str, error: str, *, node_result: dict[str, Any] | None = None) -> None:
         """Mark a node as failed while preserving error information."""
-        if self._scheduler is None:
-            self.refresh_from_store()
-        if self._scheduler is None:
-            raise RuntimeError("Scheduler not initialized.")
+        self._dispatched.discard(node_id)
+        self._update_plan_item(node_id, status=StepStatus.FAILED, error=error, node_result=node_result)
 
-        self._scheduler.mark_completed(node_id)  # Remove from scheduler
-
-        plan_state = self.plan_store.get()
-        updated_items: list[PlanItem] = []
-        found = False
-        for item in plan_state.plan:
-            if item.id == node_id:
-                found = True
-                new_trace = list(item.error_trace) + [{"error": error}]
-                new_meta = dict(item.metadata)
-                if node_result is not None:
-                    new_meta["node_result"] = node_result
-                updated_items.append(replace(item, status=StepStatus.FAILED, error_trace=new_trace, metadata=new_meta))
-            else:
-                updated_items.append(item)
-        if not found:
-            raise KeyError(f"PlanItem not found: {node_id}")
-
-        self.plan_store.set(updated_items, goal=plan_state.goal, explanation=plan_state.explanation)
-        self._last_plan_hash = self._compute_plan_hash(
-            PlanState(plan=updated_items, goal=plan_state.goal, explanation=plan_state.explanation, updated_at=plan_state.updated_at)
-        )
-
-    def release_running(self, node_id: str) -> bool:
+    def release_dispatched(self, node_id: str) -> bool:
         """
-        Release a node from scheduler running-state without marking it completed/failed.
+        Release a dispatched node without marking it completed/failed.
 
-        This is used when a dispatched node pauses for approval: the node should be
-        redispatchable after approval instead of staying stuck in `_running` forever.
+        Used when a node pauses for approval and should re-enter ready pool.
         """
-        if self._scheduler is None:
-            self.refresh_from_store()
-        if self._scheduler is None:
-            raise RuntimeError("Scheduler not initialized.")
-
-        if node_id not in self._scheduler._running:
+        if node_id not in self._dispatched:
             return False
-
-        self._scheduler._running.discard(node_id)
-        if (
-            node_id not in self._scheduler._completed
-            and self._scheduler._in_degree.get(node_id, 0) == 0
-            and node_id not in self._scheduler._ready
-        ):
-            self._scheduler._ready.appendleft(node_id)
+        self._dispatched.discard(node_id)
         return True
 
     def get_goal(self) -> str | None:
@@ -179,12 +86,11 @@ class DAGPlanRunner:
         return "\n".join(lines)
 
     def is_all_done(self) -> bool:
-        """
-        Check whether the DAG is fully completed (completed or failed).
-        """
-
         plan_state = self.plan_store.get()
-        return all(item.status in (StepStatus.COMPLETED, StepStatus.FAILED) for item in plan_state.plan)
+        self._maybe_rebuild_dag(plan_state)
+        if self._dag is None:
+            return True
+        return Scheduler(dag=self._dag).is_all_done(plan_state)
 
     def _build_dag_from_items(self, items: list[PlanItem]) -> DAG[str]:
         dag: DAG[str] = DAG()
@@ -205,40 +111,63 @@ class DAGPlanRunner:
         signature = "|".join(node_ids) + "||" + "|".join(edges)
         return sha256(signature.encode("utf-8")).hexdigest()
 
-    def _sync_scheduler_state(self, plan_state: PlanState) -> None:
-        if self._scheduler is None:
+    def _update_plan_item(
+        self,
+        node_id: str,
+        *,
+        status: StepStatus,
+        error: str | None = None,
+        node_result: dict[str, Any] | None = None,
+    ) -> None:
+        plan_state = self.plan_store.get()
+        updated_items: list[PlanItem] = []
+        found = False
+        for item in plan_state.plan:
+            if item.id != node_id:
+                updated_items.append(item)
+                continue
+
+            found = True
+            new_meta = dict(item.metadata)
+            if node_result is not None:
+                new_meta["node_result"] = node_result
+
+            if status is StepStatus.COMPLETED:
+                if item.status is StepStatus.COMPLETED and new_meta == item.metadata:
+                    updated_items.append(item)
+                else:
+                    updated_items.append(replace(item, status=StepStatus.COMPLETED, metadata=new_meta))
+                continue
+
+            if status is StepStatus.FAILED:
+                new_trace = list(item.error_trace)
+                if isinstance(error, str) and error:
+                    new_trace.append({"error": error})
+                updated_items.append(replace(item, status=StepStatus.FAILED, error_trace=new_trace, metadata=new_meta))
+                continue
+
+            updated_items.append(replace(item, status=status, metadata=new_meta))
+
+        if not found:
+            raise KeyError(f"PlanItem not found: {node_id}")
+
+        self.plan_store.set(updated_items, goal=plan_state.goal, explanation=plan_state.explanation)
+        self._last_plan_hash = self._compute_plan_hash(self.plan_store.get())
+
+    def _maybe_rebuild_dag(self, plan_state: PlanState) -> None:
+        current_hash = self._compute_plan_hash(plan_state)
+        if self._dag is not None and self._last_plan_hash == current_hash:
             return
 
-        dag = self._scheduler.dag
+        self._dag = self._build_dag_from_items(plan_state.plan)
+        self._last_plan_hash = current_hash
 
-        # Both COMPLETED and FAILED nodes are "done" for scheduling — neither should
-        # re-enter the ready/running queue.  Only COMPLETED nodes unblock successors
-        # (a failed node keeps its dependents blocked for the main agent to handle).
-        completed = {item.id for item in plan_state.plan if item.status is StepStatus.COMPLETED}
-        failed = {item.id for item in plan_state.plan if item.status is StepStatus.FAILED}
-        done = completed | failed
-
-        running = {item.id for item in plan_state.plan if item.status is StepStatus.IN_PROGRESS}
-        running |= set(self._scheduler._running)
-        if done & running:
-            running = running - done
-
-        in_degree = {node: 0 for node in dag.nodes()}
-        for src in dag.nodes():
-            for dst in dag.successors(src):
-                if src in completed:
-                    continue
-                in_degree[dst] = in_degree.get(dst, 0) + 1
-
-        ready = [
-            node
-            for node in dag.nodes()
-            if in_degree.get(node, 0) == 0 and node not in done and node not in running
-        ]
-
-        # Sync scheduler internal state with PlanStore statuses.
-        # _completed here means "scheduler should not dispatch this node again".
-        self._scheduler._completed = set(done)
-        self._scheduler._running = set(running)
-        self._scheduler._in_degree = in_degree
-        self._scheduler._ready = deque(ready)
+        # Plan structure changed: keep still-valid in-flight nodes so they are
+        # not redispatched during topology updates.
+        statuses = {item.id: item.status for item in plan_state.plan}
+        valid_statuses = {StepStatus.PENDING, StepStatus.IN_PROGRESS}
+        self._dispatched = {
+            node_id
+            for node_id in self._dispatched
+            if statuses.get(node_id) in valid_statuses
+        }

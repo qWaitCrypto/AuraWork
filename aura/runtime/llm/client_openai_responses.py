@@ -27,7 +27,17 @@ def _responses_to_usage(resp: Any) -> LLMUsage | None:
     input_tokens = getattr(usage, "input_tokens", None)
     output_tokens = getattr(usage, "output_tokens", None)
     total_tokens = getattr(usage, "total_tokens", None)
-    return LLMUsage(input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens)
+    # Responses API reports cached tokens under usage.input_tokens_details.cached_tokens
+    cache_read: int | None = None
+    details = getattr(usage, "input_tokens_details", None)
+    if details is not None:
+        cache_read = getattr(details, "cached_tokens", None)
+    return LLMUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        cache_read_input_tokens=cache_read,
+    )
 
 
 def _responses_to_response(*, provider_kind: ProviderKind, profile_id: str, resp: Any) -> LLMResponse:
@@ -74,6 +84,7 @@ def _responses_to_response(*, provider_kind: ProviderKind, profile_id: str, resp
         if isinstance(output_text, str) and output_text:
             text_parts.append(output_text)
 
+    response_id = str(getattr(resp, "id", None) or "") or None
     return LLMResponse(
         provider_kind=provider_kind,
         profile_id=profile_id,
@@ -82,7 +93,8 @@ def _responses_to_response(*, provider_kind: ProviderKind, profile_id: str, resp
         tool_calls=tool_calls,
         usage=_responses_to_usage(resp),
         stop_reason=str(getattr(resp, "status", None) or "") or None,
-        request_id=str(getattr(resp, "id", None) or "") or None,
+        request_id=response_id,
+        response_id=response_id,
     )
 
 
