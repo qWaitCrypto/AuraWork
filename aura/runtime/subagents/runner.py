@@ -282,6 +282,49 @@ def _json_or_text(text: str) -> Any:
         return text
 
 
+def _normalize_status_value(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    raw = value.strip().lower()
+    if not raw:
+        return None
+    if raw in {"completed", "complete", "done", "ok", "success", "succeeded"}:
+        return "completed"
+    if raw in {"failed", "fail", "error", "errored", "failure"}:
+        return "failed"
+    if raw in {"needs_approval", "require_approval", "requires_approval", "pending_approval"}:
+        return "needs_approval"
+    if raw in {"needs_user_takeover", "user_takeover_required", "needs_takeover"}:
+        return "needs_user_takeover"
+    return None
+
+
+def _status_from_report(report: Any) -> str | None:
+    if not isinstance(report, dict):
+        return None
+    return _normalize_status_value(report.get("status"))
+
+
+def _resolve_status_from_report(
+    *,
+    current_status: str,
+    report: Any,
+    needs_approval: dict[str, Any] | None,
+) -> tuple[str, str | None]:
+    report_status = _status_from_report(report)
+    if report_status is None or report_status == current_status:
+        return current_status, None
+
+    if report_status == "needs_approval" and needs_approval is None:
+        return "failed", "Subagent report requested approval without a pending approval payload."
+
+    if current_status in {"needs_approval", "needs_user_takeover"} and report_status == "completed":
+        # Keep unresolved control-flow states authoritative.
+        return current_status, None
+
+    return report_status, None
+
+
 def _report_requests_user_takeover(report: Any) -> bool:
     if not isinstance(report, dict):
         return False
@@ -716,7 +759,9 @@ def run_subagent(
         else:
             assistant_text = _extract_text(out)
             report = _json_or_text(assistant_text)
-            status = "needs_user_takeover" if _report_requests_user_takeover(report) else "completed"
+            status = _status_from_report(report) or (
+                "needs_user_takeover" if _report_requests_user_takeover(report) else "completed"
+            )
 
         # Handle agno confirmation pauses. Aura decides allow/deny/approval; subagent never creates approvals.
         pause_guard = 0
@@ -1060,10 +1105,23 @@ def run_subagent(
             assistant_text = _extract_text(out)
             report = _json_or_text(assistant_text)
 
+    status, status_mismatch_error = _resolve_status_from_report(
+        current_status=status,
+        report=report,
+        needs_approval=needs_approval,
+    )
+    if status_mismatch_error is not None:
+        if isinstance(report, dict):
+            report = dict(report)
+            report.setdefault("status", "failed")
+            report.setdefault("error", status_mismatch_error)
+        else:
+            report = {"status": "failed", "error": status_mismatch_error}
+
     if status == "completed" and _report_requests_user_takeover(report):
         status = "needs_user_takeover"
 
-    error_code: str | None = None
+    error_code: str | None = "invalid_subagent_report" if status_mismatch_error is not None and status == "failed" else None
     if status == "needs_user_takeover":
         error_code = "approval_pending"
         if isinstance(report, dict):
@@ -1171,6 +1229,7 @@ def run_subagent(
 
     typed_result = SubagentResult(
         status=status,
+        report=report,
         receipts=typed_receipts,
         artifacts=typed_artifacts,
         proposals=typed_proposals,

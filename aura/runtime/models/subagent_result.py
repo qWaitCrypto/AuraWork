@@ -27,10 +27,10 @@ class ApprovalRequest(BaseModel):
 
 class SubagentResult(BaseModel):
     status: Literal["completed", "failed", "needs_approval", "needs_user_takeover"]
+    report: dict[str, Any] | str | None = None
     receipts: list[SubagentReceipt] = Field(default_factory=list)
     artifacts: list[SubagentArtifact] = Field(default_factory=list)
     proposals: list[dict[str, Any]] = Field(default_factory=list)
     approval_request: ApprovalRequest | None = None
     error: str | None = None
     data: dict[str, Any] = Field(default_factory=dict)
-

@@ -268,10 +268,24 @@ class DAGExecuteNextTool:
         }
 
     @staticmethod
-    def _parse_report(result: dict[str, Any] | None) -> dict[str, Any]:
+    def _extract_raw_report(result: dict[str, Any] | None) -> Any:
+        if not isinstance(result, dict):
+            return None
+        report = result.get("report")
+        if report is not None:
+            return report
+        data = result.get("data")
+        if isinstance(data, dict):
+            nested = data.get("report")
+            if nested is not None:
+                return nested
+        return None
+
+    @classmethod
+    def _parse_report(cls, result: dict[str, Any] | None) -> dict[str, Any]:
         if result is None:
             return {}
-        report = result.get("report")
+        report = cls._extract_raw_report(result)
         if report is None:
             return {}
         if isinstance(report, dict):
@@ -295,7 +309,7 @@ class DAGExecuteNextTool:
     ) -> dict[str, Any]:
         # Keep this record small; it is persisted in PlanStore metadata and used as DAG dependency input.
         report = self._parse_report(dispatch_result)
-        raw_report = dispatch_result.get("report") if isinstance(dispatch_result, dict) else None
+        raw_report = self._extract_raw_report(dispatch_result)
         report_text_preview = ""
         if isinstance(raw_report, str):
             report_text_preview = raw_report.strip()

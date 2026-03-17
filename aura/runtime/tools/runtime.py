@@ -567,7 +567,34 @@ class ToolRuntime:
                 )
             return None
 
+        skill_browse_tools = {
+            "project__read_text",
+            "project__read_text_many",
+            "project__text_stats",
+            "project__list_dir",
+            "project__search_text",
+            "project__glob",
+        }
+        try:
+            project_skills_root = _resolve_in_project(self._project_root, ".aura/skills")
+        except Exception:
+            project_skills_root = None
+
+        def _is_project_skill_path(rel: str) -> bool:
+            if project_skills_root is None:
+                return False
+            try:
+                candidate = _resolve_in_project(self._project_root, rel)
+            except Exception:
+                return False
+            return candidate == project_skills_root or project_skills_root in candidate.parents
+
+        def _skill_resource_read_allowed(rel: str) -> bool:
+            return planned.tool_name in skill_browse_tools and _is_project_skill_path(rel)
+
         def _path_allowed(rel: str) -> bool:
+            if _skill_resource_read_allowed(rel):
+                return True
             try:
                 candidate = _resolve_in_project(self._project_root, rel)
             except Exception:
@@ -578,6 +605,8 @@ class ToolRuntime:
             return False
 
         def _file_type_allowed(rel: str) -> bool:
+            if _skill_resource_read_allowed(rel):
+                return True
             if not allowed_file_suffixes:
                 return True
             suffix = Path(rel).suffix.lower()

@@ -25,12 +25,15 @@ Notes:
 ## Key workflow (must understand)
 ### A) Generate/edit `.docx` → use `aura-docx`
 1) Call `skill__load` to load `aura-docx` (DocWorker is only allowed to use `aura-docx` / `aura-pdf`). Use the returned `skill.skill_root` as a **project-relative path** (e.g., `.aura/skills/aura-docx`).
+   - Use the returned `skill.entrypoints` / `skill.recommended_reads` / `skill.access_hints` instead of reconstructing commands from memory.
+   - For files inside the skill directory, prefer `skill__read_file`; do not use `project__read_text` / `project__read_text_many` unless you are reading project inputs outside the skill tree.
 2) Write `plan.json` following `aura-docx`'s `SKILL.md` (use `project__apply_edits` to write to `{{PLAN_JSON_PATH}}`; directories will be created automatically; no `mkdir` needed).
    - If you need to rewrite/update the same plan file: use `project__apply_edits(overwrite=true)`; do not switch to a different path.
    - `plan.json` MUST be strict JSON (no trailing commas). JSON strings MUST NOT contain literal newlines/tabs; use `\\n`/`\\t` escapes or split into multiple operations (e.g., multiple `add_paragraph` ops).
 3) Run via `shell__run` (example; build the path using the `skill_root` you obtained; do not `cd` outside the project, and do not use absolute engine-source paths):
    - `python "<skill_root>/scripts/run.py" input.docx "{{PLAN_JSON_PATH}}" --out "<OUTPUT_PATH>" --artifacts-dir "{{RUN_ARTIFACTS_DIR}}"`
    - **REQUIRED**: always include `"cwd": "."` in the `shell__run` arguments. Omitting `cwd` causes an immediate scope-violation denial. The `"."` runs the script from the project root, where the skill paths resolve correctly.
+   - Never wrap the runner in `python - <<'PY'`, shell heredocs, redirection, or helper one-off scripts. Invoke `scripts/run.py` directly as a single command.
    - Notes:
      - `<OUTPUT_PATH>`: prefer the `path` in `WorkSpec.expected_outputs` (project-relative); do not additionally `cp/mv` artifacts around.
      - To overwrite an existing output: add `--overwrite`.
@@ -50,7 +53,8 @@ Same flow: `skill__load("aura-pdf")` → write `plan.json` → `python "<skill_r
      - DAG dependency passing may provide upstream outputs as `connector_object dag://<node_id>` entries.
      - The connector description may contain JSON for an upstream `node_result` record; parse and use its `report` data as source material.
      - If a `file` input path is provided, read it via `project__read_text`.
-   - Use `project__read_text` / `project__read_text_many` to load the source materials.
+   - Use `project__read_text` / `project__read_text_many` to load project source materials.
+   - Use `skill__read_file` to inspect `docs/plan_spec.md`, `scripts/run.py`, or any other file inside the loaded skill.
    - Use `project__search_text` to locate relevant definitions/terms inside the repo.
 3. **Build an outline**
    - Produce a section list that matches the task (e.g., Overview / Analysis / Conclusion).

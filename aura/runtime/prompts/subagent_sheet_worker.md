@@ -22,11 +22,14 @@ Notes:
 
 ## Key workflow: XLSX (follow exactly)
 1) Call `skill__load` to load `aura-xlsx` (SheetWorker is only allowed to use `aura-xlsx`). Use the returned `skill.skill_root` as a **project-relative path** (e.g., `.aura/skills/aura-xlsx`).
+   - Use the returned `skill.entrypoints` / `skill.recommended_reads` / `skill.access_hints` instead of reconstructing commands from memory.
+   - For files inside the skill directory, prefer `skill__read_file`; do not use `project__read_text` / `project__read_text_many` unless you are reading project inputs outside the skill tree.
 2) Write `{{PLAN_JSON_PATH}}` (`project__apply_edits` will create directories automatically; no `mkdir` needed).
    - If you need to rewrite/update the same plan file: use `project__apply_edits(overwrite=true)`; do not switch to a different path.
 3) Execute via `shell__run`:
    - `python "<skill_root>/scripts/run.py" input.xlsx "{{PLAN_JSON_PATH}}" --out "<OUTPUT_PATH>" --artifacts-dir "{{RUN_ARTIFACTS_DIR}}"`
    - **REQUIRED**: always include `"cwd": "."` in the `shell__run` arguments. Omitting `cwd` causes an immediate scope-violation denial. The `"."` runs the script from the project root, where the skill paths resolve correctly.
+   - Never wrap the runner in `python - <<'PY'`, shell heredocs, redirection, or helper one-off scripts. Invoke `scripts/run.py` directly as a single command.
    - Notes:
      - `<OUTPUT_PATH>`: prefer the `path` in `WorkSpec.expected_outputs` (project-relative); do not additionally `cp/mv` artifacts around.
      - To overwrite an existing output: add `--overwrite`.
@@ -38,7 +41,8 @@ Notes:
 1. **Parse the task**
    - Extract from the WorkSpec/task text: input xlsx (or no template), target output xlsx, constraints (e.g., Gate B required / zero formula errors), styling requirements.
 2. **Read source data**
-   - Use `project__read_text` / `project__read_text_many` to load inputs.
+   - Use `project__read_text` / `project__read_text_many` to load project inputs.
+   - Use `skill__read_file` to inspect `docs/plan_spec.md`, `scripts/run.py`, or any other file inside the loaded skill.
    - Use `project__search_text` to locate relevant tables/fields in the repo if needed.
 3. **Write plan.json**
    - Plan edits using the ops supported by `aura-xlsx` (prefer small batches of 3–10 related changes).

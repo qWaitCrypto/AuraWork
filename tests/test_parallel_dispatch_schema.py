@@ -58,6 +58,33 @@ def test_dispatch_completed_without_receipts_demotes_to_failed() -> None:
     assert results[0].error == "Subagent reported completion without receipts."
 
 
+def test_dispatch_respects_report_status_and_preserves_report_payload() -> None:
+    node = PlanItem(id="n1", step="do work", status=StepStatus.PENDING, depends_on=[])
+    tool = _DummySubagentTool(
+        result={
+            "status": "completed",
+            "report": {"status": "failed", "error": "upstream result missing"},
+            "receipts": [{"tool": "project__list_dir", "args_summary": "path=.", "result_summary": "ok"}],
+        }
+    )
+
+    results = asyncio.run(
+        dispatch_nodes_parallel(
+            nodes=[node],
+            subagent_tool=tool,
+            preset_selector=lambda _n: "file_ops_worker",
+            work_spec_selector=lambda _n: {},
+            project_root=Path(".").resolve(),
+        )
+    )
+
+    assert len(results) == 1
+    assert results[0].status == "failed"
+    assert isinstance(results[0].result, dict)
+    assert isinstance(results[0].result.get("report"), dict)
+    assert results[0].result["report"].get("status") == "failed"
+
+
 def test_completion_handler_reads_typed_approval_request() -> None:
     typed = SubagentResult(
         status="needs_approval",

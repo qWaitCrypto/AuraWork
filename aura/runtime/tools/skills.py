@@ -62,9 +62,13 @@ class SkillLoadTool:
         if not isinstance(name, str) or not name.strip():
             raise ValueError("Missing or invalid 'name' (expected non-empty string).")
         loaded = self.store.load(name.strip())
+        skill_payload = loaded.to_public_dict()
+        skill_payload["access_hints"] = _skill_access_hints(loaded.meta)
+        skill_payload["entrypoints"] = _skill_entrypoints(loaded.meta)
+        skill_payload["recommended_reads"] = _recommended_skill_reads(loaded.meta)
         return {
             "ok": True,
-            "skill": loaded.to_public_dict(),
+            "skill": skill_payload,
         }
 
 
@@ -126,3 +130,47 @@ class SkillReadFileTool:
             "truncated": truncated,
             "content": text,
         }
+
+
+def _recommended_skill_reads(meta: SkillMetadata) -> list[str]:
+    candidates = [
+        "docs/plan_spec.md",
+        "docs/cli_reference.md",
+        "docs/python_docx_guide.md",
+        "docs/safety.md",
+        "reference_ooxml.md",
+        "scripts/run.py",
+    ]
+    out: list[str] = []
+    for rel in candidates:
+        if (meta.skill_dir / rel).is_file():
+            out.append(rel)
+    return out
+
+
+def _skill_access_hints(meta: SkillMetadata) -> dict[str, Any]:
+    return {
+        "skill_root": meta.public_skill_dir,
+        "preferred_read_tool": "skill__read_file",
+        "path_style": "Use paths relative to the skill root.",
+        "notes": [
+            "Prefer skill__read_file for files inside this skill directory; it stays inside the skill sandbox.",
+            "If this skill exposes scripts/run.py, execute that runner directly via shell__run as one command.",
+            "Do not wrap skill runners in inline Python, shell heredocs, or shell redirection.",
+        ],
+    }
+
+
+def _skill_entrypoints(meta: SkillMetadata) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if (meta.skill_dir / "scripts" / "run.py").is_file():
+        out["runner_script"] = "scripts/run.py"
+        out["cwd"] = "."
+        out["run_command_template"] = (
+            'python "<skill_root>/scripts/run.py" <INPUT_PATH_OR_-> <PLAN_JSON_PATH> '
+            '--out <OUTPUT_PATH> --artifacts-dir <RUN_ARTIFACTS_DIR>'
+        )
+    plan_spec = meta.skill_dir / "docs" / "plan_spec.md"
+    if plan_spec.is_file():
+        out["plan_spec"] = "docs/plan_spec.md"
+    return out

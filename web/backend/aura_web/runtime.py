@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,8 @@ from aura.runtime.api import (
     now_ts_ms,
     update_session_settings,
 )
+from aura.runtime.error_codes import ErrorCode
+from aura.runtime.protocol import EVENT_SCHEMA_VERSION, Event, EventKind, Op
 from aura.runtime.subagents.approval_manager import ApprovalManager
 
 
@@ -52,6 +54,30 @@ class SessionSummary:
             "tool_approval_mode": self.tool_approval_mode,
             "llm_streaming": self.llm_streaming,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveSessionOp:
+    session_id: str
+    op_kind: str
+    request_id: str
+    turn_id: str | None
+    started_at: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "op_kind": self.op_kind,
+            "request_id": self.request_id,
+            "turn_id": self.turn_id,
+            "started_at": self.started_at,
+        }
+
+
+@dataclass(slots=True)
+class _ActiveSessionOpTask:
+    info: ActiveSessionOp
+    task: asyncio.Task[Any] = field(repr=False)
 
 
 class WebRuntime:
@@ -85,6 +111,7 @@ class WebRuntime:
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._engine_cache: dict[str, Engine] = {}
         self._approval_managers: dict[str, ApprovalManager] = {}
+        self._active_ops: dict[str, _ActiveSessionOpTask] = {}
 
     def lock_for_session(self, session_id: str) -> asyncio.Lock:
         lock = self._session_locks.get(session_id)
@@ -92,6 +119,121 @@ class WebRuntime:
             lock = asyncio.Lock()
             self._session_locks[session_id] = lock
         return lock
+
+    def active_op_for_session(self, session_id: str) -> ActiveSessionOp | None:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return None
+        active = self._active_ops.get(sid)
+        if active is None:
+            return None
+        if active.task.done():
+            self._active_ops.pop(sid, None)
+            return None
+        return active.info
+
+    def start_op_for_session(self, *, session_id: str, op: Op) -> tuple[bool, ActiveSessionOp]:
+        sid = str(session_id or "").strip()
+        if not sid:
+            raise ValueError("session_id must be non-empty.")
+
+        existing = self._active_ops.get(sid)
+        if existing is not None and not existing.task.done():
+            return False, existing.info
+        if existing is not None and existing.task.done():
+            self._active_ops.pop(sid, None)
+
+        info = ActiveSessionOp(
+            session_id=sid,
+            op_kind=str(op.kind or "").strip() or "unknown",
+            request_id=str(op.request_id or "").strip(),
+            turn_id=str(op.turn_id or "").strip() or None,
+            started_at=self.now_ts_ms(),
+        )
+        task = asyncio.create_task(self._run_session_op(session_id=sid, op=op, info=info))
+        self._active_ops[sid] = _ActiveSessionOpTask(info=info, task=task)
+        return True, info
+
+    async def _run_session_op(self, *, session_id: str, op: Op, info: ActiveSessionOp) -> None:
+        try:
+            async with self.lock_for_session(session_id):
+                engine = self.engine_for_session(session_id=session_id)
+                await engine.arun(op)
+                try:
+                    self.event_bus.flush(session_id=session_id)
+                except Exception:
+                    logger.warning("Failed to flush event bus for session_id=%s", session_id, exc_info=True)
+        except asyncio.CancelledError:
+            self._emit_runtime_operation_failed(
+                session_id=session_id,
+                request_id=info.request_id,
+                turn_id=info.turn_id,
+                op_kind=info.op_kind,
+                error_code=ErrorCode.CANCELLED.value,
+                error_message="Operation cancelled.",
+            )
+            raise
+        except Exception:
+            logger.warning(
+                "Background session op crashed for session_id=%s request_id=%s op_kind=%s",
+                session_id,
+                info.request_id,
+                info.op_kind,
+                exc_info=True,
+            )
+            self._emit_runtime_operation_failed(
+                session_id=session_id,
+                request_id=info.request_id,
+                turn_id=info.turn_id,
+                op_kind=info.op_kind,
+                error_code=ErrorCode.UNKNOWN.value,
+                error_message="Operation crashed before completion.",
+            )
+        finally:
+            active = self._active_ops.get(session_id)
+            current = asyncio.current_task()
+            if active is not None and active.task is current:
+                self._active_ops.pop(session_id, None)
+
+    def _emit_runtime_operation_failed(
+        self,
+        *,
+        session_id: str,
+        request_id: str | None,
+        turn_id: str | None,
+        op_kind: str,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        try:
+            event = Event(
+                kind=EventKind.OPERATION_FAILED.value,
+                payload={
+                    "op_kind": op_kind,
+                    "error": error_message,
+                    "error_code": error_code,
+                    "source": "web_runtime",
+                },
+                session_id=session_id,
+                event_id=new_id("evt"),
+                timestamp=now_ts_ms(),
+                sequence=None,
+                request_id=request_id,
+                turn_id=turn_id,
+                step_id=None,
+                schema_version=EVENT_SCHEMA_VERSION,
+            )
+            published = self.event_bus.publish(event)
+            try:
+                seq = int(published.sequence) if isinstance(published.sequence, int) else None
+            except Exception:
+                seq = None
+            patch: dict[str, Any] = {"last_request_id": request_id, "last_event_id": published.event_id}
+            if seq is not None:
+                patch["last_event_sequence"] = seq
+            self.session_store.update_session(session_id, patch)
+        except Exception:
+            logger.warning("Failed to emit runtime operation failure for session_id=%s", session_id, exc_info=True)
 
     def now_ts_ms(self) -> int:
         return now_ts_ms()
@@ -174,6 +316,9 @@ class WebRuntime:
         _ = self.session_store.get_session(sid)
 
         # Drop any cached engine/locks first.
+        active = self._active_ops.pop(sid, None)
+        if active is not None:
+            active.task.cancel()
         self._engine_cache.pop(sid, None)
         self._session_locks.pop(sid, None)
         manager = self._approval_managers.pop(sid, None)

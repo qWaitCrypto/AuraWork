@@ -156,6 +156,8 @@ class UpdatePlanTool:
             raise ValueError("Invalid 'explanation' (expected string).")
 
         goal = raw_goal.strip()
+        existing_state = self.store.get()
+        existing_by_id = {item.id: item for item in existing_state.plan}
 
         items: list[PlanItem] = []
         for i, raw in enumerate(raw_plan):
@@ -184,10 +186,15 @@ class UpdatePlanTool:
             else:
                 raise ValueError("Invalid depends_on (expected list of strings).")
 
+            item_id = raw_id.strip()
+            existing_item = existing_by_id.get(item_id)
+
             metadata_raw = raw.get("metadata")
             if not isinstance(metadata_raw, dict):
                 raise ValueError("Invalid metadata (expected object).")
-            metadata = dict(metadata_raw)
+            metadata = dict(existing_item.metadata) if existing_item is not None else {}
+            incoming_metadata = dict(metadata_raw)
+            metadata.update(incoming_metadata)
 
             preset_raw = metadata.get("preset")
             if not isinstance(preset_raw, str) or not preset_raw.strip():
@@ -206,7 +213,25 @@ class UpdatePlanTool:
                 raise ValueError(f"Invalid metadata.work_spec: {e}") from e
             metadata["work_spec"] = ws.model_dump(mode="json")
 
-            items.append(PlanItem(id=raw_id.strip(), step=step.strip(), status=st, depends_on=depends_on, metadata=metadata))
+            # Reset runtime execution payload when a node is moved back to a runnable state,
+            # unless caller explicitly provides node_result in metadata.
+            if st in {StepStatus.PENDING, StepStatus.IN_PROGRESS} and "node_result" not in incoming_metadata:
+                metadata.pop("node_result", None)
+
+            error_trace = list(existing_item.error_trace) if existing_item is not None else []
+            if st is StepStatus.PENDING:
+                error_trace = []
+
+            items.append(
+                PlanItem(
+                    id=item_id,
+                    step=step.strip(),
+                    status=st,
+                    depends_on=depends_on,
+                    metadata=metadata,
+                    error_trace=error_trace,
+                )
+            )
 
         validate_plan(items)
         self.store.set(items, goal=goal, explanation=explanation)

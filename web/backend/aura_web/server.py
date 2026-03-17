@@ -1007,49 +1007,6 @@ def build_app(*, project_root: Path) -> FastAPI:
 
         replay_cap = _env_int("AURA_WEB_WS_REPLAY_CAP", 400)
 
-        async def run_with_ping_pump(coro: Any) -> bool:
-            """Run an engine coroutine as a task while still responding to client pings.
-
-            The WS receive loop cannot process messages while awaiting engine.arun(), so the
-            client's heartbeat ping goes unanswered and triggers a reconnect. This helper runs
-            the engine as a background task and polls receive_text() with a short timeout,
-            responding to any ping that arrives during the wait.
-
-            Returns True if the engine completed normally, False if the WS failed mid-run
-            (caller should break out of the receive loop).
-            """
-            task = asyncio.create_task(coro)
-            ws_ok = True
-            while not task.done():
-                try:
-                    raw_inner = await asyncio.wait_for(ws.receive_text(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    continue  # engine still running, no message yet
-                except Exception:
-                    # WebSocketDisconnect or transport error — cancel and signal failure
-                    ws_ok = False
-                    task.cancel()
-                    break
-                try:
-                    inner_msg = json.loads(raw_inner)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(inner_msg, dict) and str(inner_msg.get("type") or "") == "ping":
-                    if not (await send({"type": "pong"})):
-                        ws_ok = False
-                        task.cancel()
-                        break
-                # Other message types (hello, settings, etc.) during an engine run are
-                # silently dropped — the engine holds the session lock anyway.
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.warning("Engine task raised during ping pump for session_id=%s", session_id, exc_info=True)
-                raise
-            return ws_ok
-
         if not (await send({"type": "session_meta", "meta": rt.get_session_meta(session_id=session_id)})):
             return
         if not (
@@ -1098,97 +1055,125 @@ def build_app(*, project_root: Path) -> FastAPI:
                     continue
 
                 if mtype in {"chat", "approval", "compact"}:
-                    async with rt.lock_for_session(session_id):
-                        engine = rt.engine_for_session(session_id=session_id)
-                        if mtype == "chat":
-                            text = str(msg.get("text") or "").strip()
-                            if not text:
-                                if not (await send({"type": "error", "message": "Empty text"})):
-                                    break
-                                continue
-                            op = Op(
-                                kind=OpKind.CHAT.value,
-                                payload={"text": text},
-                                session_id=session_id,
-                                request_id=rt.new_request_id(),
-                                timestamp=rt.now_ts_ms(),
-                                turn_id=rt.new_turn_id(),
-                            )
-                            if not await run_with_ping_pump(engine.arun(op)):
+                    if mtype == "chat":
+                        text = str(msg.get("text") or "").strip()
+                        if not text:
+                            if not (await send({"type": "error", "message": "Empty text"})):
                                 break
-                            if not (await send({"type": "ack", "op": "chat", "request_id": op.request_id, "turn_id": op.turn_id})):
+                            continue
+                        op = Op(
+                            kind=OpKind.CHAT.value,
+                            payload={"text": text},
+                            session_id=session_id,
+                            request_id=rt.new_request_id(),
+                            timestamp=rt.now_ts_ms(),
+                            turn_id=rt.new_turn_id(),
+                        )
+                        started, active = rt.start_op_for_session(session_id=session_id, op=op)
+                        if not started:
+                            if not (
+                                await send(
+                                    {
+                                        "type": "error",
+                                        "message": "session_busy",
+                                        "active_op": active.to_dict(),
+                                    }
+                                )
+                            ):
                                 break
-                        elif mtype == "compact":
-                            op = Op(
-                                kind=OpKind.COMPACT.value,
-                                payload={},
-                                session_id=session_id,
-                                request_id=rt.new_request_id(),
-                                timestamp=rt.now_ts_ms(),
-                                turn_id=rt.new_turn_id(),
-                            )
-                            if not await run_with_ping_pump(engine.arun(op)):
-                                break
-                            if not (await send({"type": "ack", "op": "compact", "request_id": op.request_id, "turn_id": op.turn_id})):
-                                break
-                        else:
-                            approval_id = str(msg.get("approval_id") or "").strip()
-                            decision = str(msg.get("decision") or "").strip().lower()
-                            if not approval_id or decision not in {"approve", "deny", "edit", "dry_run"}:
-                                if not (
-                                    await send(
-                                        {
-                                            "type": "error",
-                                            "message": "approval requires approval_id + decision=approve|deny|edit|dry_run",
-                                        }
-                                    )
-                                ):
-                                    break
-                                continue
+                            continue
+                        if not (await send({"type": "ack", "op": "chat", "request_id": op.request_id, "turn_id": op.turn_id})):
+                            break
+                        continue
 
-                            # First try in-place subagent approval waits (thread-blocked tool approvals).
-                            try:
-                                am = rt.approval_manager_for_session(session_id)
-                            except Exception:
-                                am = None
-                            if am is not None and decision in {"approve", "deny"} and am.resolve(approval_id, decision):
-                                if not (
-                                    await send(
-                                        {
-                                            "type": "ack",
-                                            "op": "approval",
-                                            "approval_id": approval_id,
-                                            "decision": decision,
-                                        }
-                                    )
-                                ):
-                                    break
-                                continue
+                    if mtype == "compact":
+                        op = Op(
+                            kind=OpKind.COMPACT.value,
+                            payload={},
+                            session_id=session_id,
+                            request_id=rt.new_request_id(),
+                            timestamp=rt.now_ts_ms(),
+                            turn_id=rt.new_turn_id(),
+                        )
+                        started, active = rt.start_op_for_session(session_id=session_id, op=op)
+                        if not started:
+                            if not (
+                                await send(
+                                    {
+                                        "type": "error",
+                                        "message": "session_busy",
+                                        "active_op": active.to_dict(),
+                                    }
+                                )
+                            ):
+                                break
+                            continue
+                        if not (await send({"type": "ack", "op": "compact", "request_id": op.request_id, "turn_id": op.turn_id})):
+                            break
+                        continue
 
-                            payload: dict[str, Any] = {"approval_id": approval_id, "decision": decision}
-                            note = msg.get("note")
-                            if isinstance(note, str) and note.strip():
-                                payload["note"] = note.strip()
-                            edited_arguments = msg.get("edited_arguments")
-                            if isinstance(edited_arguments, dict):
-                                payload["edited_arguments"] = edited_arguments
-                            op = Op(
-                                kind=OpKind.APPROVAL_DECISION.value,
-                                payload=payload,
-                                session_id=session_id,
-                                request_id=rt.new_request_id(),
-                                timestamp=rt.now_ts_ms(),
-                                turn_id=rt.new_turn_id(),
+                    approval_id = str(msg.get("approval_id") or "").strip()
+                    decision = str(msg.get("decision") or "").strip().lower()
+                    if not approval_id or decision not in {"approve", "deny", "edit", "dry_run"}:
+                        if not (
+                            await send(
+                                {
+                                    "type": "error",
+                                    "message": "approval requires approval_id + decision=approve|deny|edit|dry_run",
+                                }
                             )
-                            if not await run_with_ping_pump(engine.arun(op)):
-                                break
-                            if not (await send({"type": "ack", "op": "approval", "approval_id": approval_id, "decision": decision})):
-                                break
+                        ):
+                            break
+                        continue
 
-                        try:
-                            rt.event_bus.flush(session_id=session_id)
-                        except Exception:
-                            logger.warning("Failed to flush event bus for session_id=%s", session_id, exc_info=True)
+                    try:
+                        am = rt.approval_manager_for_session(session_id)
+                    except Exception:
+                        am = None
+                    if am is not None and decision in {"approve", "deny"} and am.resolve(approval_id, decision):
+                        if not (
+                            await send(
+                                {
+                                    "type": "ack",
+                                    "op": "approval",
+                                    "approval_id": approval_id,
+                                    "decision": decision,
+                                }
+                            )
+                        ):
+                            break
+                        continue
+
+                    payload: dict[str, Any] = {"approval_id": approval_id, "decision": decision}
+                    note = msg.get("note")
+                    if isinstance(note, str) and note.strip():
+                        payload["note"] = note.strip()
+                    edited_arguments = msg.get("edited_arguments")
+                    if isinstance(edited_arguments, dict):
+                        payload["edited_arguments"] = edited_arguments
+                    op = Op(
+                        kind=OpKind.APPROVAL_DECISION.value,
+                        payload=payload,
+                        session_id=session_id,
+                        request_id=rt.new_request_id(),
+                        timestamp=rt.now_ts_ms(),
+                        turn_id=rt.new_turn_id(),
+                    )
+                    started, active = rt.start_op_for_session(session_id=session_id, op=op)
+                    if not started:
+                        if not (
+                            await send(
+                                {
+                                    "type": "error",
+                                    "message": "session_busy",
+                                    "active_op": active.to_dict(),
+                                }
+                            )
+                        ):
+                            break
+                        continue
+                    if not (await send({"type": "ack", "op": "approval", "approval_id": approval_id, "decision": decision})):
+                        break
                     continue
 
                 if mtype == "settings":
@@ -1224,10 +1209,6 @@ def build_app(*, project_root: Path) -> FastAPI:
         except WebSocketDisconnect:
             return
         finally:
-            try:
-                rt.approval_manager_for_session(session_id).deny_all()
-            except Exception:
-                logger.debug("Failed to deny pending in-place approvals for session_id=%s", session_id, exc_info=True)
             await hub.remove(ws)
 
     @app.websocket("/ws/{session_id}/browser")

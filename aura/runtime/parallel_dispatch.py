@@ -45,6 +45,43 @@ class NodeCompletionAction:
 _INVALID_SUBAGENT_RESULT_SCHEMA = "Invalid subagent result schema."
 
 
+def _normalize_status_value(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    raw = value.strip().lower()
+    if not raw:
+        return None
+    if raw in {"completed", "complete", "done", "ok", "success", "succeeded"}:
+        return "completed"
+    if raw in {"failed", "fail", "error", "errored", "failure"}:
+        return "failed"
+    if raw in {"needs_approval", "require_approval", "requires_approval", "pending_approval"}:
+        return "needs_approval"
+    if raw in {"needs_user_takeover", "user_takeover_required", "needs_takeover"}:
+        return "needs_user_takeover"
+    return None
+
+
+def _status_from_report(report: Any) -> str | None:
+    if not isinstance(report, dict):
+        return None
+    return _normalize_status_value(report.get("status"))
+
+
+def _resolve_status_from_report(*, current_status: str, typed: SubagentResult) -> tuple[str, str | None]:
+    report_status = _status_from_report(typed.report)
+    if report_status is None or report_status == current_status:
+        return current_status, None
+
+    if report_status == "needs_approval" and typed.approval_request is None:
+        return "failed", "Subagent status/report mismatch: needs_approval without approval_request."
+
+    if current_status in {"needs_approval", "needs_user_takeover"} and report_status == "completed":
+        return current_status, None
+
+    return report_status, None
+
+
 def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
     raw = str(os.environ.get(name, "")).strip()
     if not raw:
@@ -124,7 +161,7 @@ async def _dispatch_single_node(
         )
 
     status = typed.status
-    error = None
+    status, error = _resolve_status_from_report(current_status=status, typed=typed)
     if status == "completed" and len(typed.receipts) == 0:
         status = "failed"
         error = "Subagent reported completion without receipts."
@@ -156,6 +193,12 @@ def _extract_failure_message(*, typed: SubagentResult, fallback_error: str | Non
     direct_error = _non_empty_str(typed.error)
     if direct_error is not None:
         return direct_error
+
+    report = typed.report if isinstance(typed.report, dict) else {}
+    if isinstance(report, dict):
+        report_error = _non_empty_str(report.get("error") or report.get("summary") or report.get("message"))
+        if report_error is not None:
+            return report_error
 
     data = typed.data if isinstance(typed.data, dict) else {}
     error_code = _non_empty_str(data.get("error_code"))
