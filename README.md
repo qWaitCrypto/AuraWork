@@ -1,14 +1,52 @@
 # AuraWork
 
-A local-first office-workflow agent: clarify → plan (DAG) → execute, with parallel subagent dispatch and approval-gated actions.
+[![CI](https://github.com/qWaitCrypto/AuraWork/actions/workflows/ci.yml/badge.svg)](https://github.com/qWaitCrypto/AuraWork/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+**A local-first multi-agent framework for office workflows** — clarify requirements, plan as a DAG, execute with parallel subagents and human-in-the-loop approvals.
 
 Chinese version: [`README.zh.md`](./README.zh.md)
 
-AuraWork models an office task as three layers:
+### Why AuraWork?
 
-- **WorkSpec** — a clarified work specification (goals, inputs, constraints, scope, risk policy)
-- **Plan** — an explicit-dependency task graph (DAG) that supports parallel execution
-- **Execute** — execution with previews and approvals; artifacts, changes, and decisions are replayable
+- **Structured before execution** — every task starts with a clarified WorkSpec, not a raw prompt
+- **DAG-based parallel dispatch** — dependency-aware scheduling with concurrent subagents
+- **Human-in-the-loop approvals** — high-risk actions pause for review; low-risk actions proceed automatically
+- **Typed result contracts** — Pydantic-validated subagent results, not ad-hoc JSON parsing
+- **Office-native skills** — built-in Word, Excel, PowerPoint, PDF, and browser research capabilities
+
+---
+
+## Architecture
+
+```
+                         ┌─────────────┐
+                         │   User CLI  │
+                         │   / Web UI  │
+                         └──────┬──────┘
+                                │
+                         ┌──────▼──────┐
+                         │   Engine    │  Orchestrates the full lifecycle
+                         └──────┬──────┘
+                                │
+              ┌─────────────────┼─────────────────┐
+              │                 │                  │
+       ┌──────▼──────┐  ┌──────▼──────┐  ┌───────▼───────┐
+       │  WorkSpec   │  │   Planner   │  │   Executor    │
+       │  Clarify    │  │  (DAG plan) │  │  (Dispatch)   │
+       └─────────────┘  └──────┬──────┘  └───────┬───────┘
+                               │                  │
+                        ┌──────▼──────┐    ┌──────▼──────┐
+                        │  Scheduler  │    │  Subagents  │
+                        │ (stateless) │    │ (parallel)  │
+                        └─────────────┘    └──────┬──────┘
+                                                  │
+                         ┌────────┬────────┬──────┴───┐
+                         │        │        │          │
+                      FileOps   Doc    Sheet    Browser
+                      Worker   Worker  Worker   Worker
+```
 
 ---
 
@@ -202,6 +240,22 @@ aura/builtin/skills/*/ooxml/THIRD_PARTY_NOTICES.md
 ```
 
 Preserve these notices when redistributing.
+
+---
+
+## Testing
+
+```bash
+pytest tests/
+```
+
+Tests cover DAG scheduling, parallel dispatch schema validation, approval manager threading, and event bus semantics. No API keys or external services required.
+
+---
+
+## Contributing
+
+See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for development setup, testing, and commit conventions.
 
 ---
 

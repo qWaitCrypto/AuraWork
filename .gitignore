@@ -197,6 +197,7 @@ cython_debug/
 
 # Aura local project state (sessions, events, artifacts, approvals, snapshots)
 .aura/
+.tmp/
 dev/
 # Frontend dependencies and build outputs
 web/frontend/node_modules/

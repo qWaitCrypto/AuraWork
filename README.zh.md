@@ -1,14 +1,52 @@
 # AuraWork
 
-面向办公场景的本地优先异步并行 Agent：澄清需求 → DAG 规划 → 带审批的执行。
+[![CI](https://github.com/qWaitCrypto/AuraWork/actions/workflows/ci.yml/badge.svg)](https://github.com/qWaitCrypto/AuraWork/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+**面向办公场景的本地优先多 Agent 框架** — 澄清需求 → DAG 规划 → 并行子 Agent 执行 + 人工审批控制。
 
 English version: [`README.md`](./README.md)
 
-AuraWork 把一次办公任务的运行拆成三层：
+### 为什么选 AuraWork？
 
-- **WorkSpec** — 澄清后的工作规格（目标、输入/输出、约束、范围、风险策略）
-- **Plan** — 显式依赖的任务图（DAG），支持并行推进
-- **Execute** — 带预演与审批的执行过程（产物、变更、决策可回放）
+- **先澄清再执行** — 每个任务从结构化 WorkSpec 开始，不是直接丢 prompt
+- **DAG 并行调度** — 感知依赖的调度器，多个子 Agent 并发执行
+- **人工审批控制** — 高风险操作暂停等待审批，低风险自动放行
+- **类型化结果契约** — Pydantic 校验的子 Agent 返回值，不是随意 JSON 解析
+- **办公原生技能** — 内置 Word、Excel、PPT、PDF、浏览器调研能力
+
+---
+
+## 架构
+
+```
+                         ┌─────────────┐
+                         │   用户 CLI  │
+                         │   / Web UI  │
+                         └──────┬──────┘
+                                │
+                         ┌──────▼──────┐
+                         │    引擎     │  编排完整生命周期
+                         └──────┬──────┘
+                                │
+              ┌─────────────────┼─────────────────┐
+              │                 │                  │
+       ┌──────▼──────┐  ┌──────▼──────┐  ┌───────▼───────┐
+       │  WorkSpec   │  │   Planner   │  │   Executor    │
+       │   澄清     │  │  (DAG 规划) │  │   (调度派发)  │
+       └─────────────┘  └──────┬──────┘  └───────┬───────┘
+                               │                  │
+                        ┌──────▼──────┐    ┌──────▼──────┐
+                        │  Scheduler  │    │   子 Agent   │
+                        │  (无状态)   │    │   (并行)     │
+                        └─────────────┘    └──────┬──────┘
+                                                  │
+                         ┌────────┬────────┬──────┴───┐
+                         │        │        │          │
+                      FileOps   Doc    Sheet    Browser
+                      Worker   Worker  Worker   Worker
+```
 
 ---
 
@@ -202,6 +240,22 @@ aura/builtin/skills/*/ooxml/THIRD_PARTY_NOTICES.md
 ```
 
 再分发时请保留这些声明。
+
+---
+
+## 测试
+
+```bash
+pytest tests/
+```
+
+测试覆盖 DAG 调度、并行派发 schema 校验、审批管理器线程安全、事件总线语义等。不需要 API key 或外部服务。
+
+---
+
+## 贡献
+
+详见 [`CONTRIBUTING.md`](./CONTRIBUTING.md)：开发环境搭建、测试、commit 规范。
 
 ---
 
